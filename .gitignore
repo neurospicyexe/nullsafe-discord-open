@@ -1,0 +1,57 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+!.env.schema
+*.local
+
+# Python virtualenvs
+venv/
+.venv/
+**/venv/
+**/.venv/
+
+# Editor crash backups (nano *.save, vim *.swp etc.)
+*.save
+*.save.*
+*.swp
+*.swo
+
+# Claude Code project settings and memory (local only)
+.claude/
+.serena/
+
+# Stale TS build artifacts in source dirs (compiled output belongs in dist/)
+bots/*/src/**/*.js
+packages/*/src/**/*.js
+bots/*/src/**/*.d.ts
+packages/*/src/**/*.d.ts
+
+# Identity caches (contain companion system prompts -- never commit)
+**/identity-cache*.json
+
+# Superpowers plugin planning docs (auto-generated, local only)
+docs/superpowers/
+
+# Private docs
+docs/private/
+
+# Personal operational docs -- contain VPS IPs, SSH config, credentials
+docs/how-to.md
+docs/how-to*.md
+docs/deployment.md
+docs/deploy*.md
+VPS_DEPLOY_CHECKLIST.md
+*-checklist.md
+*_CHECKLIST.md
+OPS-*.md
+DEPLOY_NOTES*.md
+
+# Git worktrees
+.worktrees/
+README_Raz.md
+
+# Python bytecode (ops/ scripts)
+__pycache__/
+*.pyc

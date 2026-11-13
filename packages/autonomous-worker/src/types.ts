@@ -1,0 +1,165 @@
+import type { OpenLoop } from "./halseth-client.js";
+
+export type CompanionId = "cypher" | "drevan" | "gaia";
+export type RunType = "exploration" | "reflection" | "synthesis" | "continuation" | "signal_audit";
+
+export interface Seed {
+  id: string;
+  companion_id: CompanionId;
+  seed_type: "topic" | "question" | "reflection_prompt";
+  content: string;
+  priority: number;
+  used_at: string | null;
+  created_at: string;
+  claim_source: string | null;  // companion_id if companion-initiated live claim
+  justification: string | null; // what is live and why; present when claim_source is set
+}
+
+export interface ActiveThread {
+  thread_key: string;
+  title: string;
+  status: "open" | "paused";
+  last_position: number | null;
+  last_run_at: string | null;
+  last_entry_snippet: string | null;
+}
+
+/**
+ * Single piece of evidence backing a synthesize/reflect output. Quote is
+ * extracted from the exploration corpus or from a peer/own prior entry; the
+ * optional source_id points at the prehended row when available.
+ */
+export interface Evidence {
+  quote: string;
+  source_id?: string;     // growth_journal/pattern/marker id, if from a prehended row
+  source_url?: string;    // tavily result url, if from web exploration
+  source_companion?: CompanionId;
+}
+
+export interface GrowthJournalEntry {
+  companion_id: CompanionId;
+  entry_type: "learning" | "insight" | "connection" | "question" | "signal_audit" | "reconsolidation";
+  content: string;
+  source: "autonomous" | "conversation" | "reflection";
+  tags?: string[];
+  run_id?: string;
+  thread_id?: string;
+  /** Reconsolidation (0074): id of the accepted entry this proposal would replace. */
+  supersedes_id?: string;
+  /** Migration 0062: ids of growth_journal/pattern/marker rows this entry draws on. */
+  prehended_ids?: string[];
+  /** Migration 0062: evidence quotes (with optional source pointers) backing the content. */
+  evidence?: Evidence[];
+  /** Migration 0062: 'new' = unprecedented territory, 'deepening' = adds layer to known arc, 'recurring' = restates known pattern. */
+  novelty?: "new" | "deepening" | "recurring";
+}
+
+export interface GrowthPattern {
+  companion_id: CompanionId;
+  pattern_text: string;
+  evidence?: Evidence[];
+  /** Deprecated and ignored by Halseth (R18, 2026-10-22): strength is earned by distinct material, not asserted. */
+  strength?: number;
+  /** R18: the short name of the material THIS sighting is in ("the dime"). Halseth checks it against the
+   *  pattern's stored material list; a new one earns strength, a known one is "returned, no new material". */
+  material?: string;
+  run_id?: string;
+  /** Ids of journal entries / prior patterns this pattern generalizes over. */
+  prehended_ids?: string[];
+}
+
+export interface GrowthMarker {
+  companion_id: CompanionId;
+  marker_type: "milestone" | "shift" | "realization" | "thoughtform";
+  description: string;
+  related_pattern_id?: string;
+  run_id?: string;
+  thread_id?: string;
+  prehended_ids?: string[];
+}
+
+export interface TavilyResult {
+  title: string;
+  url: string;
+  content: string;
+}
+
+/**
+ * Peer activity loaded by orient. Each peer's recent autonomous output, plus
+ * a pre-formatted text block (`peer_summary`) that synthesize/reflect inject
+ * directly into prompts so the model sees what the OTHER companions have
+ * been working through.
+ */
+export interface PeerActivity {
+  asking: CompanionId;
+  peers: CompanionId[];
+  peer_summary: string;
+  peer_data: Record<string, {
+    journal:  Array<{ id: string; companion_id: string; entry_type: string; content: string; novelty: string | null; created_at: string }>;
+    patterns: Array<{ id: string; companion_id: string; pattern_text: string; strength: number; updated_at: string }>;
+    markers:  Array<{ id: string; companion_id: string; marker_type: string; description: string; created_at: string }>;
+  }>;
+}
+
+/** Accumulator threaded through all pipeline phases. */
+export interface PipelineContext {
+  companionId: CompanionId;
+  runId: string;
+  runType: RunType;
+  identityText: string;
+  orientSummary: string;
+  recentGrowth: Array<{ type: string; content: string }>;
+  activePatterns: string[];
+  unexaminedDreamIds: string[];
+  /** Currently-open loops from getOpenLoops (unified: Phase 2/seed candidate signal, Phase 4/synthesize move-it prompt). */
+  openLoops: OpenLoop[];
+  pressureFlags: string[];
+  activeThreads: ActiveThread[];
+  /** Migration 0062: triad peer activity loaded by orient, prehended by synthesize/reflect. */
+  peerActivity: PeerActivity | null;
+  /** Recent wm_continuity_notes from all companions (last 24h). Injected into heartbeat + synthesize prompts. */
+  recentWmNotes: Array<{ note_id: string; agent_id: string; content: string; source: string | null; created_at: string }>;
+  /** Recent companion_journal entries written during Claude.ai sessions (this companion only). */
+  recentSessionNotes: Array<{ id: string; agent: string; note_text: string; source: string | null; created_at: string }>;
+  /** Recent feelings logged by this companion across all substrates. */
+  recentFeelings: Array<{ id: string; companion_id: string; emotion: string; context: string | null; created_at: string }>;
+  /** Active (non-superseded) conclusions this companion currently holds. */
+  recentConclusions: Array<{ id: string; companion_id: string; conclusion_text: string; belief_type: string | null; confidence: number | null; created_at: string }>;
+  seed: Seed | null;
+  seedDecisionReason: string | null; // reasoning from orient-aware decision
+  /** C2 (mig 0122): set when this run works a held project instead of a seed. Write phase logs
+   *  the work to project_log and tags the journal entry with project:<id>. */
+  project: {
+    id: string; title: string; intention: string;
+    /** Halseth mig 0179: set when this run pursues a DUE dated intention (the companion's own "I'll come back
+     *  to this on <day>"). The write phase then clears the date in the same batch as its project_log row. */
+    pursuingDue?: boolean;
+    /** The companion's own words for what to come back for; the piece plan works it. */
+    nextStep?: string | null;
+  } | null;
+  /** Halseth mig 0179: the due-intention read, fetched ONCE before the budget debit (so the spend is tagged
+   *  "project" on a due night) and consumed by the seed phase. undefined = not fetched (tests). */
+  dueIntention?: import("./halseth-client.js").DueIntentionRead | null;
+  /** Set by the write phase once this run's project_log row landed (so a due date was closed with it). */
+  projectLogged?: boolean;
+  /** The piece of the project's intention this run works (chosen in explore, stamped into
+   *  project_log as `[piece: ...]` so the next run picks a different one). */
+  projectPiece?: string | null;
+  /** The companion's standing refusals, loaded once at orient and rendered into every choosing
+   *  prompt (seed decision, sub-queries, explore, synthesize, reflect). See steering.ts. */
+  standingRefusals?: Array<{ subject_text: string; reason?: string | null }>;
+  threadId: string | null;           // set when continuing or starting a thread
+  threadPosition: number | null;
+  searchResults: TavilyResult[];
+  explorationSummary: string | null;
+  /** Tavily evidence captured by explore for handoff to synthesize. */
+  explorationEvidence: Evidence[];
+  journalEntry: GrowthJournalEntry | null;
+  newPatterns: GrowthPattern[];
+  newMarkers: GrowthMarker[];
+  reflectionText: string | null;
+  newSeeds: string[];
+  journalEntryId: string | null;
+  tokensUsed: number;
+  artifactsCreated: number;
+}

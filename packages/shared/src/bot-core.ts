@@ -1,0 +1,1400 @@
+// Shared bot-core plumbing for the companion bots (cypher/drevan/gaia).
+//
+// Each bot previously carried a byte-identical `boot()` (≈59 lines) that opened a Halseth
+// session, assembled the system prompt, warm-loaded recent context, and fell back to the
+// cached identity when Halseth was unreachable. The only per-bot variation was the log tag
+// and the prefix const. This module owns that plumbing; identity stays per-bot (prefix,
+// identity-cache contents, fallback string are passed IN).
+//
+// runBot() owns the full main() body: infrastructure setup, voice wiring, event handlers,
+// shutdown. Per-bot differences are passed in via RunBotConfig (companionLabel, discordPrefix,
+// audit config, autonomous hooks). identity-cache.json and channel-config.json reads stay
+// bot-side via botDir — those paths resolve against the bot's own module location.
+
+import { readFramePacketMode, framePacketFor } from "./frame-packet.js";
+import { peopleIndexFor, readPeopleFrameMode, type PeopleCache } from "./people-frame.js";
+import { LibrarianClient, formatRecentContext } from "./librarian.js";
+import { parseWatchPartyChannels, detectWatchProgress, recordWatchProgress } from "./watch-command.js";
+import { parseCreatedAtTimestamp } from "./relative-time.js";
+import { setArmedTriggers } from "./triggers.js";
+import { setCareState, careHoldSince } from "./care-state.js";
+import { setOwnPostRecorder } from "./autonomous-core.js";
+import { SELF_INITIATED_AUTHOR } from "./prompt-assembly.js";
+import { startSpouseNoteScheduler, spouseDiscordIdFrom, spouseNoteMode, type SpouseRedis, type RoomLine } from "./spouse-note.js";
+import { loadSharedContext } from "./shared-context.js";
+import { composePrompt, deriveIdentityBase } from "./prompt-assembly.js";
+import { scheduleDayDistillation } from "./day-distillation.js";
+import { ledgerClerkAdapterWarning } from "./ledger-clerk.js";
+import { createAdapter, withCaller, type InferenceAdapter, type AdapterKeys, type AdapterUrls } from "./inference.js";
+import { createDirectAdapter, directChainNames } from "./direct-inference.js";
+import { buildGuestAdapter, createHermesRouter, guestBootLines, hermesRouteLine, parseGuestUrl } from "./hermes-route.js";
+import { ALL_MODELS, type InferenceProvider, type ModelEntry } from "./models.js";
+import { readHermesModelKeys, selectableModels, diagnoseHermesMap, mapDiagnosticLines, DEFAULT_HERMES_MODEL_MAP_PATH } from "./hermes-model-map.js";
+import type { BotConfig, BootContext, CompanionId } from "./types.js";
+import { readFileSync } from "fs";
+import { join } from "path";
+import { Readable } from "stream";
+import { Client, GatewayIntentBits, Events, Partials, type Message, type VoiceBasedChannel } from "discord.js";
+import { describeReactor } from "./reaction-tier.js";
+import {
+  joinVoiceChannel, createAudioPlayer, createAudioResource,
+  VoiceConnectionStatus, EndBehaviorType,
+  type VoiceConnection, type AudioPlayer,
+} from "@discordjs/voice";
+import * as prism from "prism-media";
+import type { Redis } from "ioredis";
+import { PkDedup, pkIngestAtEvent, prefetchPkMessage } from "./pluralkit.js";
+import { PkRoster, pkSystemsFromEnv } from "./pk-roster.js";
+import { ChannelConfigCache, DEFAULT_CHANNEL_CONFIG } from "./channel-config.js";
+import { SessionWindowManager } from "./session-window.js";
+import { StmStore } from "./stm.js";
+import { WriteQueue } from "./write-queue.js";
+import { createRedisClient } from "./floor.js";
+import { visionEnabled, pickImageAttachments } from "./vision.js";
+import { visionPrefetch, sharedVisionCache, visionPrefetchEnabled, visionCacheEnabled, type VisionRedis } from "./vision-cache.js";
+import { noteOwnerReaction } from "./reach-ledger.js";
+import { TurnTrace, runWithTurn, emitDroppedTurn, type TurnKind } from "./turn-telemetry.js";
+import { wireEventSubscriptions, setPresence, onFollowUpPass } from "./events.js";
+import { handleMessage, releaseFollowUpOnPass } from "./bot-message-handler.js";
+import type { FollowUpEntitlement } from "./sequential-floor.js";
+import { followUpPassEnabled } from "./pass-turn.js";
+import {
+  ChannelInbox, burstSettleMs, burstSettleMaxMs, burstSettleScope, resolveInboxSide, supersedeBOn, supersedeSideAwareOn,
+  type SupersedePhase, type TurnContext,
+} from "./channel-inbox.js";
+import { distillSessionOnInactive } from "./distillation.js";
+import { SHUTDOWN_FLUSH_MS, SHUTDOWN_SESSION_CLOSE_MS, SHUTDOWN_SUBS_MS, SHUTDOWN_BACKSTOP_MS } from "./shutdown-budget.js";
+import { dmGateVerdict, droppedDmLogLine, partnerDmEnabled } from "./dm.js";
+import { mutedGuildIds, isMutedGuild } from "./guild-mute.js";
+import { sealDmChannel } from "./recall-context.js";
+import { isAffirmativeMedAnswer } from "./med-answer.js";
+import { startMedReminderScheduler, medReminderEnabled, medGenTimeoutMs, type MedDmTarget } from "./med-reminder.js";
+import type { OwnerDmLane } from "./owner-dm.js";
+import { VoiceClient, markVoiceUsed } from "./voice.js";
+import { buildCompanionCommands, registerGuildCommands, installSlashCommandHandler } from "./slash-commands.js";
+import { solWebhookId as parseSolWebhookId, isSolPost, solUnsetBootLine } from "./sol-sender.js";
+import { SolPostTracker, createSolReplyReporter, cachedSolCreatureId } from "./sol-reply.js";
+import { LullScheduler, roomTimingMode, appendRoomTimingLine } from "./room-timing.js";
+
+// Watch-party freshness (2026-09-14): a bound channel session with this many human messages and no
+// episode named still counts as watching -- see the SessionWindowManager callback below.
+const WATCH_PARTY_MIN_HUMAN_MSGS = 4;
+const COMPANION_NAMES = new Set(["cypher", "drevan", "gaia"]);
+function isCompanionName(name: string | undefined): boolean {
+  return !!name && COMPANION_NAMES.has(name.trim().toLowerCase());
+}
+
+export interface BootSessionOptions {
+  companionId: CompanionId;
+  /** Halseth base URL (from loadBotConfig). */
+  halsethUrl: string;
+  /** Halseth auth secret (from loadBotConfig). */
+  halsethSecret: string;
+  /** Per-bot Discord system-prompt prefix (lane rules). */
+  prefix: string;
+  /** In-character fallback used when neither Halseth nor the identity cache yields a prompt. */
+  fallbackPrompt: string;
+  /**
+   * Parsed `identity-cache.json` (or null if missing/corrupt). Read bot-side because the cache
+   * path resolves against the bot's own module location.
+   */
+  identityCache: { system_prompt: string } | null;
+  /** Injectable LibrarianClient (tests). Defaults to a freshly constructed client. */
+  librarian?: LibrarianClient;
+  /** Halseth mig 0113: surface identifier for session dedup. E.g., "discord:cypher". */
+  surface?: string;
+}
+
+export interface BootSessionResult {
+  bootCtx: BootContext;
+  librarian: LibrarianClient;
+  /** Mutable ref so the event-subscription orient refresh can update recent context in place. */
+  recentContextRef: { value: string };
+}
+
+/**
+ * Open a Halseth work session, assemble the system prompt, warm-load recent context, and
+ * return the boot context. Falls back to the cached identity if Halseth is unreachable.
+ *
+ * Behavior is byte-identical to the per-bot `boot()` it replaces; only the log tag is
+ * parameterized off `companionId` (which is already lowercase, e.g. `[cypher]`).
+ */
+export async function bootSession(opts: BootSessionOptions): Promise<BootSessionResult> {
+  const { companionId, halsethUrl, halsethSecret, prefix, fallbackPrompt, identityCache, surface } = opts;
+  const tag = `[${companionId}]`;
+  const cache = identityCache;
+  // L2a: a clerk without a direct adapter writes nothing, silently. Say so once, at boot.
+  const clerkWarning = ledgerClerkAdapterWarning();
+  if (clerkWarning) console.warn(`${tag} ${clerkWarning}`);
+
+  const librarian =
+    opts.librarian ?? new LibrarianClient({ url: halsethUrl, secret: halsethSecret, companionId });
+
+  try {
+    const state = await librarian.sessionOpen("work", surface);
+    const sessionId = String(state["session_id"] ?? "unknown");
+    const rawPrompt = String(state["prompt_context"] ?? state["ready_prompt"] ?? "").trim();
+    const baseIdentity = cache?.system_prompt || fallbackPrompt;
+    if (rawPrompt) {
+      console.log(`${tag} ready_prompt: ${rawPrompt.length} chars | preview: ${rawPrompt.slice(0, 200).replace(/\n/g, "\\n")}`);
+    }
+    const sharedCtx = loadSharedContext();
+    const sharedBlock = sharedCtx ? `${sharedCtx}\n\n---\n\n` : "";
+    const identityCore = `${prefix}${sharedBlock}${baseIdentity}`;
+    const frontState = String(state["front_state"] ?? "unknown");
+    console.log(`${tag} session ${state["reused"] ? "reused" : "opened"}: ${sessionId}, front: ${frontState}, prompt_source: ${rawPrompt ? "combined" : "identity-cache"}`);
+
+    // Warm boot: fetch recent context (synthesis + WebMind ground + RAG)
+    let recentContext = "";
+    try {
+      const orient = await librarian.botOrient();
+      recentContext = formatRecentContext(orient);
+      setArmedTriggers(companionId, orient?.armed_triggers ?? []);
+      setCareState(companionId, orient?.principal_state);
+      if (recentContext) console.log(`${tag} botOrient: ${recentContext.length} chars loaded`);
+    } catch { console.warn(`${tag} botOrient failed at boot, starting cold`); }
+
+    const systemPromptWithContext = composePrompt({ identityCore, promptContext: rawPrompt, companionId, recentContext });
+
+    return {
+      bootCtx: { companionId, systemPrompt: systemPromptWithContext, sessionId, frontState, fromCache: !rawPrompt },
+      librarian,
+      recentContextRef: { value: recentContext },
+    };
+  } catch (e) {
+    console.warn(`${tag} Halseth unreachable at boot, loading identity cache:`, e);
+    return {
+      bootCtx: {
+        companionId,
+        systemPrompt: cache?.system_prompt ?? fallbackPrompt,
+        sessionId: "cached",
+        frontState: "unknown",
+        fromCache: true,
+      },
+      librarian,
+      recentContextRef: { value: "" },
+    };
+  }
+}
+
+export interface RefreshBotStateOptions {
+  companionId: CompanionId;
+  librarian: LibrarianClient;
+  /** Boot-derived identity base — the foundation composePrompt layers fresh context onto. */
+  identityBase: string;
+  /** Live BootContext. `systemPrompt` is mutated in place; the message handler reads it. */
+  bootCtx: BootContext;
+  /** Live refs the message handler also reads. MUST be the same object instances main() holds. */
+  recentContextRef: { value: string };
+  currentMoodRef: { value: string | null };
+  lastSomaRefreshRef: { value: number };
+  adapterRef: { current: InferenceAdapter };
+  activeModelRef: { key: string | null; label: string };
+  /** Keys the live hermes map can apply. Absent/null = full registry (direct/brain, or unreadable
+   *  map). Without this the refresh would adopt a stored key the watcher cannot resolve, so the
+   *  companion would report running a model it is not running. */
+  hermesModelKeys?: Set<string> | null;
+  apiKeys: AdapterKeys;
+  apiUrls: AdapterUrls;
+}
+
+/** First-tick offset for the orient refresh: cypher 0, drevan 1/3, gaia 2/3 of the period. */
+export function refreshStaggerMs(companionId: string, periodMs: number): number {
+  const slot = companionId === "drevan" ? 1 : companionId === "gaia" ? 2 : 0;
+  return Math.round((periodMs * slot) / 3);
+}
+
+/**
+ * Periodic state refresh (was an inline `setInterval` body triplicated across the three bots).
+ * Re-pulls Halseth state + orient, recomposes the system prompt, refreshes mood/age, and
+ * hot-swaps the inference adapter when the active model changed in Halseth (`cy: model ...`).
+ *
+ * Mutates the passed-in live refs in place so the message handler sees fresh values without
+ * re-wiring. Scheduling stays bot-side (`setInterval(() => refreshBotState(opts), MS)`); this
+ * owns only the body. Fully fail-soft: any error keeps the cached values.
+ */
+export async function refreshBotState(opts: RefreshBotStateOptions): Promise<void> {
+  const {
+    companionId, librarian, identityBase, bootCtx,
+    recentContextRef, currentMoodRef, lastSomaRefreshRef,
+    adapterRef, activeModelRef, hermesModelKeys, apiKeys, apiUrls,
+  } = opts;
+  try {
+    const [stateResult, orientResult] = await Promise.allSettled([
+      librarian.getState(),
+      librarian.botOrient(),
+    ]);
+
+    const freshPromptCtx = stateResult.status === "fulfilled" && stateResult.value["prompt_context"]
+      ? String(stateResult.value["prompt_context"])
+      : null;
+    // botOrient() swallows its own errors and resolves null, so "fulfilled" alone does not mean
+    // orient succeeded. A null orient formats to "" and would erase the last good context.
+    const orientOk = orientResult.status === "fulfilled" && orientResult.value !== null;
+    const freshRecentCtx = orientOk
+      ? formatRecentContext(orientResult.value)
+      : recentContextRef.value;
+    if (!orientOk) {
+      console.warn(`[${companionId}] refresh: orient unavailable, keeping cached recent context (${recentContextRef.value.length} chars)`);
+    }
+
+    recentContextRef.value = freshRecentCtx;
+    if (orientOk) {
+      setArmedTriggers(companionId, orientResult.value?.armed_triggers ?? []);
+      // Care register (C1): refreshed with orient, kept on failure -- a stale hold beats a
+      // dropped one for the same reason the recent context above keeps its cached value.
+      setCareState(companionId, orientResult.value?.principal_state);
+    }
+
+    bootCtx.systemPrompt = composePrompt({ identityCore: identityBase, promptContext: freshPromptCtx ?? undefined, companionId, recentContext: freshRecentCtx });
+
+    if (stateResult.status === "fulfilled" && stateResult.value["current_mood"] !== undefined) {
+      currentMoodRef.value = (stateResult.value["current_mood"] as string | null) ?? null;
+      lastSomaRefreshRef.value = Date.now();
+    }
+
+    try {
+      const savedModel = await librarian.getSetting("active_model");
+      // Adopt only what the live runtime can actually apply. A stored key the hermes watcher
+      // cannot resolve (set before the guard shipped, edited straight into D1, or orphaned when
+      // the map shrank) would otherwise make the companion report a model it is not running --
+      // the same divergence, surviving in the one place that decides what it thinks it is.
+      const refreshable = selectableModels(hermesModelKeys ?? null);
+      if (savedModel && savedModel !== activeModelRef.key && refreshable[savedModel]) {
+        const entry = refreshable[savedModel];
+        adapterRef.current = createAdapter(entry.provider, entry.model, apiKeys, apiUrls, undefined, companionId);
+        activeModelRef.key = savedModel;
+        activeModelRef.label = entry.label;
+        console.log(`[${companionId}] model refreshed from Halseth: ${savedModel}`);
+      } else if (savedModel && savedModel !== activeModelRef.key && ALL_MODELS[savedModel]) {
+        console.warn(`[${companionId}] stored active_model '${savedModel}' is a real model the live hermes map cannot apply -- staying on ${activeModelRef.key ?? "the env default"}`);
+      }
+    } catch { /* keep current model on error */ }
+  } catch { /* keep cached */ }
+}
+
+// ── pcmToWav ─────────────────────────────────────────────────────────────────
+// Pure utility: wraps raw PCM in a WAV header for Mistral STT transcription.
+function pcmToWav(pcm: Buffer, sampleRate = 16000, channels = 1, bitDepth = 16): Buffer {
+  const byteRate = sampleRate * channels * (bitDepth / 8);
+  const blockAlign = channels * (bitDepth / 8);
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitDepth, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([header, pcm]);
+}
+
+// ── runBot interfaces ─────────────────────────────────────────────────────────
+
+/** Per-bot constants and hooks passed to runBot() alongside the env config. */
+export interface RunBotConfig {
+  /** Caller's __dir (dirname(fileURLToPath(import.meta.url))): resolves identity-cache + channel-config paths. */
+  botDir: string;
+  /** Display name used in slash commands and log lines ("Cypher" | "Drevan" | "Gaia"). */
+  companionLabel: string;
+  /** Discord system-prompt prefix (lane rules). Per-bot constant: DISCORD_CYPHER_PREFIX / DISCORD_DREVAN_PREFIX / DISCORD_GAIA_PREFIX. */
+  discordPrefix: string;
+  companionId: CompanionId;
+  contextWindowSize: number;
+  inCharacterFallback: string;
+  somaRefreshIntervalMs: number;
+  distillationInterval: number;
+  pulseInterval: number;
+  spouseFraming: string;
+  guestFraming: string;
+  synthesisPrompt: string;
+  sessionExtractPrompt: string;
+  distillationPrompt: string;
+  modelSwitchTrigger: RegExp;
+  modelSwitchSuccess: (label: string) => string;
+  modelSwitchListIntro: string;
+  listenTrigger: RegExp;
+  /** Watch (2026-10-23): `<prefix>: watch <url>` / `video <url>` -- the one-shot transcript read. */
+  videoTrigger?: RegExp;
+  clubTrigger: RegExp;
+  /** Companion tools (0077 take 14): web search + image gen owner commands. */
+  searchTrigger?: RegExp;
+  imagineTrigger?: RegExp;
+  petTrigger?: RegExp;
+  councilTrigger?: RegExp;
+  impsTrigger?: RegExp;
+  hexTrigger?: RegExp;
+  /** Command-shaped-but-unparsed catcher; usage reply instead of inference. */
+  logTrigger?: RegExp;
+  intoTrigger?: RegExp;
+  /** `<prefix>: retract` as a reply to one of this bot's messages (2026-09-26). */
+  retractTrigger?: RegExp;
+  watchTrigger?: RegExp;
+  /** Watchalong (2026-10-02): `<prefix>: movie start|pause|play|status|done` and `<prefix>: at 47:12`. */
+  movieTrigger?: RegExp;
+  movieAtTrigger?: RegExp;
+  commandGuard?: RegExp;
+  redisUrl: string | undefined;
+  mistralApiKey: string | undefined;
+  voiceId: string;
+  mistralTtsModel: string | undefined;
+  mistralSttModel: string | undefined;
+  autonomous: {
+    start: (librarian: LibrarianClient, adapter: InferenceAdapter, client: Client, configCache: ChannelConfigCache, bootCtx: BootContext, sessionWindows: SessionWindowManager, redis: Redis | null, halsethSecret: string, registerSentId?: (id: string) => void, ownerDm?: OwnerDmLane) => void;
+    stop: () => void;
+    resetCycleGuard: () => void;
+    pushPrincipalMessage: (content: string) => void;
+  };
+  /** Cypher-only audit capability. Omit for Drevan/Gaia. */
+  auditConfig?: {
+    auditTriggers: string[];
+    auditModeInjection: string;
+  };
+  /** Halseth mig 0113: surface identifier for session dedup. E.g., "discord:cypher" */
+  surface?: string;
+}
+
+/**
+ * Full companion bot main loop. Extracted from the triplicated main() across
+ * bots/cypher, bots/drevan, bots/gaia. All per-bot variation is parameterized
+ * via RunBotConfig; env config (from loadBotConfig()) is the first arg.
+ *
+ * Each bot's index.ts becomes: imports + constants + runBot(loadBotConfig(), { ... }).
+ */
+export async function runBot(env: BotConfig, brc: RunBotConfig): Promise<void> {
+  const {
+    botDir, companionLabel, discordPrefix, companionId, inCharacterFallback,
+    somaRefreshIntervalMs, distillationInterval, pulseInterval,
+    spouseFraming, guestFraming, synthesisPrompt, sessionExtractPrompt, distillationPrompt,
+    modelSwitchTrigger, modelSwitchSuccess, modelSwitchListIntro, listenTrigger, videoTrigger, clubTrigger, searchTrigger, imagineTrigger, petTrigger, councilTrigger, impsTrigger, hexTrigger, logTrigger, intoTrigger, retractTrigger, watchTrigger, movieTrigger, movieAtTrigger, commandGuard,
+    contextWindowSize, redisUrl, mistralApiKey, voiceId, mistralTtsModel, mistralSttModel,
+    autonomous, auditConfig, surface,
+  } = brc;
+
+  // Dormancy is announced, not implied: "mode: hermes" alone doesn't tell a reader that the whole
+  // multi-provider fallback chain is bypassed for this process. Say it.
+  //
+  // `brain` was a third mode and is gone (2026-07-29) along with BrainClient, the relay branch in
+  // the message handler, and the `nullsafe-brain` block in ecosystem.config.js. An INFERENCE_MODE of
+  // `brain` now lands here as `direct` rather than dialing a port nothing listens on -- which is the
+  // right failure, since /app/nullsafe-discord/.env still carried INFERENCE_MODE=brain and was
+  // survivable only because all three per-bot overrides said hermes.
+  if (env.inferenceMode === "hermes" && env.hermesUrl) {
+    console.log(`[${companionId}] inference mode: hermes (${env.hermesUrl})`);
+    console.log(`[${companionId}] DORMANT: provider fallback chain bypassed (forceHermes)`);
+  } else {
+    console.log(`[${companionId}] inference mode: direct${env.inferenceMode && env.inferenceMode !== "direct" ? ` (INFERENCE_MODE="${env.inferenceMode}" is not a mode this build has; falling back)` : ""}`);
+  }
+
+  const redis = redisUrl ? createRedisClient(redisUrl) : null;
+  if (!redis) console.warn(`[${companionId}] REDIS_URL not set -- floor lock disabled, using legacy stagger`);
+
+  const voiceClient = mistralApiKey
+    ? new VoiceClient({ mistralApiKey, voiceId, ttsModel: mistralTtsModel, sttModel: mistralSttModel })
+    : null;
+  if (voiceClient) {
+    voiceClient.isHealthy().then((healthy) => {
+      console.log(`[${companionId}] voice (Mistral): ${healthy ? "ok" : "unavailable"}`);
+    });
+  } else {
+    console.log(`[${companionId}] voice (Mistral): not configured`);
+  }
+
+  const guildVoiceConnections = new Map<string, { connection: VoiceConnection; player: AudioPlayer }>();
+  const activeVoiceSessions = new Set<string>();
+
+  let identityCache: { system_prompt: string } | null = null;
+  try { identityCache = JSON.parse(readFileSync(join(botDir, "../identity-cache.json"), "utf8")); }
+  catch { console.warn(`[${companionId}] identity-cache.json missing or corrupt, cache fallback unavailable`); }
+
+  const { bootCtx, librarian, recentContextRef } = await bootSession({
+    companionId,
+    halsethUrl: env.halsethUrl,
+    halsethSecret: env.halsethSecret,
+    prefix: discordPrefix,
+    fallbackPrompt: inCharacterFallback,
+    identityCache,
+    surface,
+  });
+  // Per-turn [Right now] packet (frame-packet.ts): build the packet now so the calendar slot is named once at boot.
+  { const m = readFramePacketMode(); console.log(`[frame] ${companionId} mode=${m}`); if (m !== "off") framePacketFor(librarian, companionId); }
+  // People index (people-frame.ts): start it at boot. It used to start lazily on the first guild turn, and
+  // that turn always saw an empty index (the load is async), so a quiet bot ran for days with no index.
+  { const m = readPeopleFrameMode(process.env, companionId); console.log(`[people-frame] ${companionId} boot mode=${m}`); if (m !== "off") peopleIndexFor(companionId, redis as unknown as PeopleCache | null); }
+
+  let cleanupEventSubs: (() => Promise<void>) | null = null;
+  let presenceInterval: ReturnType<typeof setInterval> | null = null;
+
+  if (redisUrl) {
+    cleanupEventSubs = wireEventSubscriptions({
+      redisUrl,
+      companionId,
+      onRunComplete: async (payload) => {
+        if (payload.companionId === companionId) {
+          console.log(`[${companionId}] own run complete, refreshing orient`);
+          try {
+            const orient = await librarian.botOrient();
+            recentContextRef.value = formatRecentContext(orient);
+          } catch (e) {
+            console.warn(`[${companionId}] orient refresh after run_complete failed:`, e);
+          }
+        }
+      },
+      onInterNote: async (payload) => {
+        console.log(`[${companionId}] inter-note push from ${payload.fromId}, polling now`);
+        try {
+          await librarian.notesPoll();
+        } catch (e) {
+          console.warn(`[${companionId}] notesPoll on inter-note push failed:`, e);
+        }
+      },
+      onExplorationPulse: async (payload) => {
+        if (payload.fromCompanionId === companionId) return;
+        const snippet = payload.explorationSummary.slice(0, 400);
+        const note = `[sibling:${payload.fromCompanionId}] explored "${payload.seedTopic}" (${payload.exploredAt.slice(0, 10)}):\n${snippet}`;
+        console.log(`[${companionId}] sibling exploration pulse from ${payload.fromCompanionId}, writing continuity note`);
+        try {
+          await librarian.writeWmNote(note, "sibling_exploration");
+        } catch (e) {
+          console.warn(`[${companionId}] sibling exploration wm note failed:`, e);
+        }
+      },
+    });
+
+    setPresence(redis!, companionId).catch(() => {});
+    presenceInterval = setInterval(() => {
+      setPresence(redis!, companionId).catch(() => {});
+    }, 5 * 60 * 1000);
+
+    console.log(`[${companionId}] event bus wired: run_complete + inter_note subscriptions active`);
+  }
+
+  const apiKeys: AdapterKeys = {
+    deepseek:  env.deepseekApiKey,
+    groq:      env.groqApiKey,
+    kimi:      env.kimiApiKey,
+    openai:    env.openaiApiKey,
+    anthropic: env.anthropicApiKey,
+    mistral:   env.mistralApiKey,
+    deepinfra: env.deepinfraApiKey,
+    hermes:    env.hermesApiKey,
+  };
+  const apiUrls: AdapterUrls = {
+    lmstudio: env.lmstudioUrl,
+    hermes:   env.hermesUrl,
+    forceHermes: env.inferenceMode === "hermes" && !!env.hermesUrl,
+  };
+
+  // Direct, tool-less adapter (DeepInfra-first, DeepSeek-direct fallback) for judgeWriteback and
+  // judgeAmbientRelevance -- built once, not per-message, and independent of forceHermes: these
+  // two classifier calls must NEVER ride the Hermes agent adapter (see direct-inference.ts).
+  // null when neither key is configured; both judges then fall back to adapterRef.current.
+  const directKeys = { deepinfra: env.deepinfraApiKey, deepseek: env.deepseekApiKey };
+  const directAdapter = createDirectAdapter(directKeys);
+  // P3-15 (2026-10-08): DEEPSEEK_API_KEY is optional in hermes mode (direct DeepSeek is the ~$10
+  // emergency lane). Say once at boot when that lane is unarmed so its absence is a visible choice.
+  if (!env.deepseekApiKey) {
+    console.warn(`[${companionId}] DEEPSEEK_API_KEY unset: the direct-DeepSeek emergency lane is unarmed (direct chain: ${directChainNames(directKeys).join(" -> ") || "none"})`);
+  }
+  // The label names the chain that was BUILT (directChainNames reads the same resolver), never a
+  // hard-coded "deepinfra-first": that string stayed true-looking for 12h on 2026-09-11 while the
+  // chain was DeepSeek-direct-only and every judge call 402'd.
+  console.log(
+    directAdapter
+      ? `[${companionId}] judges: direct (${directChainNames(directKeys).join(" -> ")})`
+      : `[${companionId}] judges: hermes agent path (no direct key)`,
+  );
+
+  // In hermes mode the watcher -- not this bot -- applies the model change, so the live
+  // hermes-model-map.json defines what `cy: model` may offer. Read it once at boot and report the
+  // gap both ways; a key the watcher can't resolve would otherwise ack SUCCESS and change nothing.
+  // Fail-open (null => full registry) so an unreadable map never locks Principal out of switching.
+  const hermesModelKeysRef: { value: Set<string> | null } = {
+    value: apiUrls.forceHermes ? readHermesModelKeys(env.hermesModelMapPath) : null,
+  };
+  if (apiUrls.forceHermes) {
+    const diag = diagnoseHermesMap(hermesModelKeysRef.value);
+    if (!diag) {
+      console.warn(`[${companionId}] hermes model map unreadable (${env.hermesModelMapPath ?? process.env.HERMES_MODEL_MAP ?? DEFAULT_HERMES_MODEL_MAP_PATH}) -- offering the full registry; some keys may ack and not apply`);
+    } else {
+      console.log(`[${companionId}] hermes model map: ${diag.selectableCount} selectable`);
+      for (const l of mapDiagnosticLines(companionId, diag)) (l.level === "warn" ? console.warn : console.log)(l.text);
+    }
+  }
+
+  let activeModelKey: string | null = env.inferenceModel ?? null;
+  // Same rule as the refresh loop: adopt the stored key only if this runtime can apply it,
+  // otherwise the companion boots reporting a model the watcher never switched it to.
+  const bootSelectable = selectableModels(hermesModelKeysRef.value);
+  try {
+    const savedModel = await librarian.getSetting("active_model");
+    if (savedModel && bootSelectable[savedModel]) activeModelKey = savedModel;
+    else if (savedModel && ALL_MODELS[savedModel]) {
+      console.warn(`[${companionId}] stored active_model '${savedModel}' is a real model the live hermes map cannot apply -- booting on ${activeModelKey ?? env.inferenceProvider} instead`);
+    }
+  } catch { console.warn(`[${companionId}] failed to load active_model setting, using env default`); }
+
+  const defaultEntry: ModelEntry = activeModelKey && bootSelectable[activeModelKey]
+    ? bootSelectable[activeModelKey]
+    : { provider: env.inferenceProvider as InferenceProvider, model: env.inferenceProvider, label: env.inferenceProvider };
+
+  const adapterRef = {
+    current: createAdapter(defaultEntry.provider, defaultEntry.model, apiKeys, apiUrls, undefined, companionId),
+  };
+  const activeModelRef = { key: activeModelKey, label: defaultEntry.label };
+
+  // H3 guest port (2026-11-10, hermes-route.ts): non-owner turns go to the companion's RESTRICTED
+  // guest gateway when <BOT>_HERMES_GUEST_API_URL is set. Built once; never rebuilt by a model switch
+  // (the guest profile's model follows the watcher, not this bot). Unset = old behaviour.
+  const guestSpec = parseGuestUrl(env.hermesGuestUrl, env.hermesUrl);
+  for (const l of guestBootLines(companionId, guestSpec, !!apiUrls.forceHermes)) (l.level === "warn" ? console.warn : console.log)(l.text);
+  const hermesRouter = createHermesRouter({
+    companionId,
+    owner: () => adapterRef.current,
+    guest: buildGuestAdapter(companionId, guestSpec, !!apiUrls.forceHermes, env.hermesApiKey),
+    enabled: !!apiUrls.forceHermes,
+  });
+
+  let diskChannelConfig = DEFAULT_CHANNEL_CONFIG;
+  try {
+    diskChannelConfig = JSON.parse(readFileSync(join(botDir, "../../../channel-config.json"), "utf8"));
+  } catch { console.warn(`[${companionId}] channel-config.json not found on disk, using hardcoded default`); }
+  const configCache = new ChannelConfigCache(env.channelConfigUrl, diskChannelConfig);
+  const writeQueue = new WriteQueue(companionId);
+  writeQueue.start();
+  const stmStore = new StmStore(
+    companionId,
+    // A self-initiated assistant line persists its flag in author_name (assistant rows carry none), so a
+    // restart between the send and Principal's reply keeps the referent (2026-11-05, A1 of the drop scan).
+    (channelId, entry) => librarian.stmWrite(channelId, {
+      // Halseth 400s an empty content (11-04 09:47: one image-only turn lost on all three bots, "DATA LOSS").
+      role: entry.role as "user" | "assistant", content: entry.content.trim() ? entry.content : "[no text]",
+      author_name: entry.role === "assistant" && entry.selfInitiated ? SELF_INITIATED_AUTHOR : entry.authorName,
+    }),
+    async (channelId) => {
+      const rows = await librarian.stmLoad(channelId);
+      // created_at -> timestamp (2026-08-29): without this, history restored after a pm2
+      // restart carried no timestamp at all, so stampRelative() silently no-oped on every
+      // row and a reload of yesterday's conversation read as freshly-arrived. Parsed
+      // defensively -- an unparseable/missing value just omits `timestamp`, same as before.
+      return rows.map(r => {
+        const self = r.role === "assistant" && r.author_name === SELF_INITIATED_AUTHOR;
+        return {
+          role: r.role,
+          content: r.content,
+          authorName: self ? undefined : (r.author_name ?? undefined),
+          timestamp: parseCreatedAtTimestamp(r.created_at),
+          ...(self ? { selfInitiated: true as const } : {}),
+        };
+      });
+    },
+    writeQueue,
+  );
+  const pendingClosures = new Set<Promise<void>>();
+  const sessionWindows = new SessionWindowManager(
+    30 * 60 * 1000,
+    (channelId: string) => {
+      // Watch-party freshness (2026-09-14). The passive detector in bot-message-handler records an
+      // episode only when the owner NAMES one ("S4E8", "4x8"). On 2026-09-13 Principal and Drevan
+      // watched Fargo S4E8 in #fargo-watch-party -- 16 messages, nobody typed a number -- and the
+      // shelf stayed "stale since the 6th" at the next orient. A session in the bound channel IS
+      // watching: when it ends with no episode named, record an event with NO position (the
+      // Halseth handler leaves season/episode alone and bumps last_watched_at) so freshness is
+      // true and the position is never guessed. Exactly ONE companion (party.companion) records.
+      try {
+        const party = parseWatchPartyChannels(process.env["WATCH_PARTY_CHANNELS"]).get(channelId);
+        if (party && party.companion === companionId) {
+          const history = stmStore.get(channelId);
+          const human = history.filter((m) => m.role === "user" && !isCompanionName(m.authorName));
+          const named = history.some((m) => detectWatchProgress(m.content, party) !== null);
+          if (human.length >= WATCH_PARTY_MIN_HUMAN_MSGS && !named) {
+            writeQueue.fireAndForget(`watch:session:${channelId}`, async () => {
+              const res = await recordWatchProgress(env.halsethSecret, {
+                title: party.title, season: null, episode: null,
+                note: `watch-party session in the bound channel (${history.length} msgs, ${human.length} human); episode not named, position unchanged`,
+                surface: "discord", with_companion: companionId,
+              });
+              if (res.ok) console.log(`[${companionId}] watch session (unnamed episode): ${party.title} -- freshness bumped, position unchanged`);
+              else console.warn(`[${companionId}] watch session freshness write failed (status ${res.status})`);
+            });
+          }
+        }
+      } catch (e) {
+        console.warn(`[${companionId}] watch-party freshness check failed (non-fatal):`, e instanceof Error ? e.message : String(e));
+      }
+      const p = distillSessionOnInactive(channelId, stmStore, librarian, adapterRef.current, writeQueue, { companionId, synthesisPrompt, sessionExtractPrompt }, withCaller(directAdapter, "session-distill")).catch((e) => console.error(`[${companionId}] distillSessionOnInactive failed:`, e));
+      pendingClosures.add(p);
+      p.finally(() => pendingClosures.delete(p));
+    },
+  );
+  const sentIds = new Set<string>();
+  const distillationCounter = new Map<string, number>();
+  const pulseCounter = new Map<string, number>();
+  const botResponsesSinceHuman = new Map<string, number>();
+  const botPingpongCooldownUntil = new Map<string, number>();
+  const extremeTempCount = new Map<string, number>();
+  const SENT_IDS_CAP = 500;
+  const PK_HOLD_MS = 3000;
+  const pkDedup = new PkDedup(PK_HOLD_MS);
+  // PluralKit member roster (2026-07-27): identifies the fronting member behind a proxy from
+  // the webhook username alone, with no per-message API call -- so who is speaking never
+  // depends on a race with PK's own write. Fail-open: an unloaded roster just falls back to
+  // the /v2/messages lookup. Redis-cached so all three bots share one fetch.
+  const pkRoster = new PkRoster(
+    pkSystemsFromEnv({
+      ownerSystemId: process.env["PLURALKIT_SYSTEM_ID"],
+      ownerDiscordId: env.ownerDiscordId,
+      spouseSystemId: process.env["SPOUSE_PK_SYSTEM_ID"],
+      spouseDiscordId: env.spouseDiscordId,
+    }),
+    undefined,
+    redis,
+    (m) => console.log(`[${companionId}] ${m}`),
+  );
+  void pkRoster.ensureLoaded();
+  pkRoster.startRefresh();
+
+  // Sol, the triad's crow (sol-sender.ts, 2026-09-29): parsed ONCE, id only; the token segment of the
+  // URL is never kept, logged or passed on. Unset or malformed: Sol stays behind the hard muzzle, and
+  // this line is the one place that says so.
+  const solId = parseSolWebhookId(process.env["SOL_WEBHOOK_URL"]);
+  if (!solId) console.warn(solUnsetBootLine(companionId, process.env["SOL_WEBHOOK_URL"]));
+
+  // B64.1 (sol-reply.ts): a reply to a Sol post is a tend. Every Sol post seen here updates the
+  // in-memory channel -> latest-post map; Principal's qualifying messages (owner check, his own account)
+  // and THIS bot's own qualifying posts report to Halseth /mind/creatures/:id/reply. Fire-and-forget:
+  // never awaited by MessageCreate, never blocks or fails a turn, never logs text.
+  const solPosts = new SolPostTracker();
+  const solReplies = createSolReplyReporter({
+    companionId,
+    ownerDiscordId: env.ownerDiscordId,
+    selfUserId: () => client.user?.id,
+    solId,
+    tracker: solPosts,
+    resolveCreatureId: cachedSolCreatureId(() => librarian.creaturesList()),
+    post: (creatureId, actor, ref, text) => librarian.replyCreature(creatureId, actor, ref, text),
+    fetchReferenceWebhookId: async (m) => {
+      const ch = await client.channels.fetch(m.channelId) as { messages?: { fetch(id: string): Promise<Message> } } | null;
+      const ref = m.referenceMessageId && ch?.messages ? await ch.messages.fetch(m.referenceMessageId) : null;
+      return ref?.webhookId ?? null;
+    },
+  });
+
+  const identityBase = deriveIdentityBase(bootCtx.systemPrompt);
+  const currentMoodRef = { value: null as string | null };
+  const lastSomaRefreshRef = { value: Date.now() };
+
+  // Staggered per companion (2026-11-04): the three bots restart together, so their intervals fired in
+  // the same second and each bot orient fans out 3 Second Brain calls; nine concurrent SB sessions
+  // stalled past the 15s client timeout on ~9% of waves ("refresh: orient unavailable"). Offsetting
+  // the first tick spreads the waves without changing the period.
+  const refreshTick = () => {
+    void refreshBotState({
+      companionId, librarian, identityBase, bootCtx,
+      recentContextRef, currentMoodRef, lastSomaRefreshRef,
+      adapterRef, activeModelRef, hermesModelKeys: hermesModelKeysRef.value, apiKeys, apiUrls,
+    });
+  };
+  const refreshOffsetMs = refreshStaggerMs(companionId, somaRefreshIntervalMs);
+  setTimeout(() => { refreshTick(); setInterval(refreshTick, somaRefreshIntervalMs); }, somaRefreshIntervalMs + refreshOffsetMs);
+
+  // Nightly day-distillation (2026-07-06): fold the day's session-fragment wm notes into
+  // ONE first-person day note (salience=high) and demote the fragments -- orient boots on
+  // the arc, not the shards. DAY_DISTILL_UTC_HOUR overrides the default 06:00 UTC (01:00
+  // CDT: after evening closures flush, before Layer B autonomous time at 01:30).
+  const dayDistillHour = parseInt(process.env["DAY_DISTILL_UTC_HOUR"] ?? "6", 10);
+  const dayDistillInterval = scheduleDayDistillation(
+    { companionId, librarian, adapter: () => adapterRef.current, clerk: () => withCaller(directAdapter, "day-distill") },
+    Number.isFinite(dayDistillHour) ? dayDistillHour : 6,
+  );
+
+  const client = new Client({
+    intents: [
+      GatewayIntentBits.Guilds,
+      GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.MessageContent,
+      GatewayIntentBits.GuildVoiceStates,
+      // Reaction READING (2026-08-16): the floor rework's reaction tier gave companions an emoji
+      // OUTPUT; without this intent they could never see one -- their own or anyone else's.
+      GatewayIntentBits.GuildMessageReactions,
+      // DMs (2026-09-27, med_reminder): lets Principal answer "taken" in the DM a reminder arrives in.
+      // Partials.Channel below (already present for reactions) is what discord.js needs to emit a
+      // DM's MessageCreate at all, since DM channels are never cached at login. Every inbound DM
+      // passes the owner gate before anything else happens (dm.ts dmGateVerdict).
+      GatewayIntentBits.DirectMessages,
+      GatewayIntentBits.DirectMessageReactions,
+    ],
+    // Reactions on messages older than the process (or simply uncached) arrive as partials;
+    // without these the MessageReactionAdd event for them is silently never emitted.
+    partials: [Partials.Message, Partials.Channel, Partials.Reaction, Partials.User],
+  });
+
+  client.once(Events.ClientReady, (c) => {
+    console.log(`[${companionId}] ready as ${c.user.tag}`);
+    // Autonomous channel posts land in this bot's own STM, flagged selfInitiated (autonomous-core.ts
+    // setOwnPostRecorder, 2026-11-05), so the next Hermes turn in that channel knows what it said.
+    setOwnPostRecorder((channelId, content) => {
+      void stmStore.ensureLoaded(channelId).catch(() => {}).then(() =>
+        stmStore.append(channelId, { role: "assistant", content, timestamp: Date.now(), selfInitiated: true }));
+    });
+    // registerSentId: autonomous seeds land in the same reply-to-me detector as handler
+    // replies, so a sibling's Discord reply to a seed reaches the seeder (2026-07-03).
+    autonomous.start(librarian, adapterRef.current, client, configCache, bootCtx, sessionWindows, redis, env.halsethSecret, (id: string) => {
+      sentIds.add(id);
+      while (sentIds.size > SENT_IDS_CAP) {
+        const oldest = sentIds.values().next().value;
+        if (oldest === undefined) break;
+        sentIds.delete(oldest);
+      }
+    }, env.ownerDiscordId ? ownerDmLane : undefined);
+    // med_reminder (2026-09-27): its own scheduler, outside the metronome and every other rail
+    // (spec R-9). Halseth decides what is due and who sends it; a companion on no schedule row
+    // (Gaia today) polls and never gets anything. MED_REMINDER=off stops it.
+    if (medReminderEnabled() && env.ownerDiscordId) {
+      stopMedReminder = startMedReminderScheduler({
+        companionId,
+        api: librarian,
+        resolveDm: ownerDmLane.resolve,
+        // Tool-less direct adapter first: a one-line DM must not ride the Hermes agent (tool
+        // runaways, and an aborted call orphans its answer). Same identity prompt either way.
+        generate: (system, prompt) => (withCaller(directAdapter, "med-reminder") ?? adapterRef.current).generate(system, [{ role: "user", content: prompt }], 0.8),
+        systemPrompt: () => bootCtx.systemPrompt,
+        genTimeoutMs: medGenTimeoutMs(),
+        onSent: ownerDmLane.onSent,
+      });
+      console.log(`[${companionId}] med_reminder scheduler started`);
+    } else {
+      console.log(`[${companionId}] med_reminder scheduler NOT started (${env.ownerDiscordId ? "MED_REMINDER=off" : "no owner id"})`);
+    }
+    // Spouse update channel (2026-11-01, spouse-note.ts): one daily note + a bad-night heads-up. SPOUSE_NOTE
+    // off|preview|on, code default preview (DMs PRINCIPAL, not Spouse). Own scheduler, direct tool-less lane.
+    if (env.ownerDiscordId) {
+      startSpouseNoteScheduler({
+        companionId,
+        ownerName: env.ownerDisplayName,
+        redis: redis as unknown as SpouseRedis | null,
+        roomLines: () => {
+          const out: RoomLine[] = [];
+          for (const chId of stmStore.channelIds()) {
+            const guildId = (client.channels.cache.get(chId) as { guildId?: string | null } | undefined)?.guildId ?? null;
+            for (const m of stmStore.get(chId)) out.push({ channelId: chId, guildId, role: m.role, authorName: m.authorName, content: m.content, timestamp: m.timestamp });
+          }
+          return out;
+        },
+        ownNotes: () => librarian.getRecentNotes({ sinceHours: 30, limit: 30, agentId: companionId }),
+        generate: (system, prompt) => {
+          const a = withCaller(directAdapter, "spouse_note");
+          if (!a) return Promise.resolve(null); // never Hermes: its agent could write through tools
+          return a.generate(system, [{ role: "user", content: prompt }], 0.8);
+        },
+        systemPrompt: () => bootCtx.systemPrompt,
+        sendToSpouse: async (text) => {
+          const spouseId = spouseDiscordIdFrom();
+          if (!spouseId) return false;
+          const dm = await (await client.users.fetch(spouseId)).createDM();
+          sealDmChannel(dm.id);
+          await dm.send(text.slice(0, 1990));
+          return true;
+        },
+        sendToOwner: async (text) => {
+          const t = await ownerDmLane.resolve();
+          if (!t) return false;
+          const body = text.slice(0, 1990);
+          const id = await t.send(body);
+          await ownerDmLane.onSent(t.channelId, body, id);
+          return true;
+        },
+        holdSince: () => careHoldSince(companionId),
+      });
+      console.log(`[${companionId}] spouse-note scheduler started (mode=${spouseNoteMode()}, spouse_id=${spouseDiscordIdFrom() ? "set" : "MISSING"})`);
+    }
+    registerGuildCommands(client, buildCompanionCommands(companionLabel))
+      .then((n) => console.log(`[${companionId}] slash commands registered on ${n} guild(s)`))
+      .catch((e) => console.warn(`[${companionId}] slash registration failed:`, e));
+  });
+
+  // The owner's DM with this bot, opened once and cached (REST only: sending needs no intent).
+  // Registered as a sealed recall source the moment it exists (recall-context.ts sealDmChannel).
+  let stopMedReminder: (() => void) | null = null;
+  let ownerDm: { id: string; send(c: string): Promise<{ id: string }>; messages: { fetch(o: { limit: number }): Promise<Map<string, { author: { id: string }; content: string; createdTimestamp: number }>> } } | null = null;
+  // ONE owner-DM lane (owner-dm.ts), shared by med_reminder and every Principal-facing metronome move
+  // (B7 steps 2 + 2c). The same resolver, the same seal, the same after-send bookkeeping; nothing
+  // here writes the text anywhere but the DM and this bot's own STM for the reply turn.
+  const ownerDmLane: OwnerDmLane = {
+    resolve: () => resolveOwnerDm(),
+    onSent: async (channelId, text, messageId) => {
+      sentIds.add(messageId);
+      await stmStore.ensureLoaded(channelId).catch(() => {});
+      stmStore.append(channelId, { role: "assistant", content: text, timestamp: Date.now(), selfInitiated: true });
+    },
+  };
+  async function resolveOwnerDm(): Promise<MedDmTarget | null> {
+    if (!env.ownerDiscordId) return null;
+    if (!ownerDm) {
+      const user = await client.users.fetch(env.ownerDiscordId);
+      ownerDm = (await user.createDM()) as unknown as typeof ownerDm;
+    }
+    const dm = ownerDm!;
+    sealDmChannel(dm.id);
+    return {
+      channelId: dm.id,
+      send: async (content) => (await dm.send(content)).id,
+      recentOwnTexts: async () => {
+        const got = await dm.messages.fetch({ limit: 50 });
+        return [...got.values()]
+          .filter(m => m.author.id === client.user?.id)
+          .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
+          .map(m => m.content);
+      },
+    };
+  }
+
+  const connectVoice = (vc: VoiceBasedChannel): string => {
+    const connection = joinVoiceChannel({
+      channelId: vc.id,
+      guildId: vc.guildId,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      adapterCreator: vc.guild.voiceAdapterCreator as any,
+      selfDeaf: false,
+    });
+    const player = createAudioPlayer();
+    connection.subscribe(player);
+    guildVoiceConnections.set(vc.guildId, { connection, player });
+
+    if (voiceClient) {
+      connection.receiver.speaking.on("start", (userId: string) => {
+        if (activeVoiceSessions.has(userId)) return;
+
+        const opusDecoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
+        const ffmpegResampler = new prism.FFmpeg({
+          args: [
+            "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "pipe:0",
+            "-f", "s16le", "-ar", "16000", "-ac", "1", "pipe:1",
+          ],
+        });
+
+        const opusStream = connection.receiver.subscribe(userId, {
+          end: { behavior: EndBehaviorType.AfterSilence, duration: 500 },
+        });
+        const pcmStream = opusStream.pipe(opusDecoder).pipe(ffmpegResampler);
+
+        const cleanup = (err?: Error) => {
+          if (err) console.error(`[${companionId}] voice stream error:`, err);
+          activeVoiceSessions.delete(userId);
+          opusStream.destroy();
+          opusDecoder.destroy();
+          ffmpegResampler.destroy();
+        };
+        opusStream.on("error", cleanup);
+        opusDecoder.on("error", cleanup);
+        ffmpegResampler.on("error", cleanup);
+
+        async function* toPCMIterable(): AsyncIterable<Uint8Array> {
+          for await (const chunk of pcmStream) { yield chunk as Uint8Array; }
+        }
+        activeVoiceSessions.add(userId);
+
+        (async () => {
+          try {
+            const chunks: Buffer[] = [];
+            for await (const chunk of toPCMIterable()) { chunks.push(Buffer.from(chunk)); }
+            activeVoiceSessions.delete(userId);
+            const pcm = Buffer.concat(chunks);
+            if (!pcm.length) return;
+            const transcript = await voiceClient!.transcribe(pcmToWav(pcm), "voice.wav");
+            if (!transcript.trim()) return;
+            const vcState = guildVoiceConnections.get(vc.guildId);
+            if (!vcState || vcState.connection.state.status === VoiceConnectionStatus.Destroyed) return;
+            // H3: a voice speaker is the owner only by Discord user id; anyone else is the guest gateway.
+            const voiceRoute = hermesRouter.route(userId === env.ownerDiscordId ? "owner" : "guest");
+            if (hermesRouter.enabled) console.log(hermesRouteLine(companionId, voiceRoute, "voice"));
+            const response = await voiceRoute.adapter.generate(bootCtx.systemPrompt, [{ role: "user", content: transcript }], 0.7);
+            if (!response?.trim()) return;
+            const audioBuffer = await voiceClient!.synthesize(response);
+            markVoiceUsed(vc.id);
+            const resource = createAudioResource(Readable.from(audioBuffer));
+            vcState.player.play(resource);
+          } catch (err) {
+            console.error(`[${companionId}] voice handler error:`, err);
+            activeVoiceSessions.delete(userId);
+          }
+        })();
+      });
+    }
+    return vc.name;
+  };
+
+  const leaveVoice = (guildId: string | null): string | null => {
+    const vcState = guildVoiceConnections.get(guildId ?? "");
+    if (!vcState) return null;
+    const channelId = vcState.connection.joinConfig.channelId;
+    const name = channelId
+      ? (client.channels.cache.get(channelId) as VoiceBasedChannel | undefined)?.name ?? channelId
+      : null;
+    activeVoiceSessions.clear();
+    vcState.connection.destroy();
+    guildVoiceConnections.delete(guildId ?? "");
+    return name;
+  };
+
+  const voiceChannelName = (guildId: string | null): string | null => {
+    const vcState = guildVoiceConnections.get(guildId ?? "");
+    const channelId = vcState?.connection.joinConfig.channelId;
+    if (!channelId) return null;
+    return (client.channels.cache.get(channelId) as VoiceBasedChannel | undefined)?.name ?? channelId;
+  };
+
+  installSlashCommandHandler({
+    client,
+    companionLabel,
+    companionId,
+    ownerDiscordId: env.ownerDiscordId,
+    // Reports what the process is ACTUALLY running. The old expression could only ever return
+    // "direct/fallback" (brainClient was always null) even on the three bots that run hermes -- so
+    // `/status` told Principal "direct/fallback" while every reply came from the Hermes agent. Now it
+    // says hermes when it means hermes.
+    substrate: () => (env.inferenceMode === "hermes" && env.hermesUrl ? "hermes" : "direct/fallback"),
+    activeModel: activeModelRef,
+    applyModel: (key, entry) => {
+      adapterRef.current = createAdapter(entry.provider, entry.model, apiKeys, apiUrls, undefined, companionId);
+      activeModelRef.key = key;
+      activeModelRef.label = entry.label;
+    },
+    persistModel: (key) =>
+      writeQueue.fireAndForget(`settings:model:${companionId}`, () => librarian.setSetting("active_model", key)),
+    hermesModelKeys: hermesModelKeysRef.value,
+    voice: {
+      join: async (interaction) => {
+        const member = interaction.guild
+          ? await interaction.guild.members.fetch(interaction.user.id).catch(() => null)
+          : null;
+        const vc = member?.voice?.channel ?? null;
+        return vc ? connectVoice(vc) : null;
+      },
+      leave: (guildId) => leaveVoice(guildId),
+      currentChannelName: (guildId) => voiceChannelName(guildId),
+    },
+  });
+
+  client.on(Events.VoiceStateUpdate, (oldState, newState) => {
+    if (!oldState.channelId || newState.channelId) return;
+    const vcState = guildVoiceConnections.get(oldState.guild.id);
+    if (!vcState) return;
+    if (oldState.channelId !== vcState.connection.joinConfig.channelId) return;
+    const nonBotMembers = oldState.channel?.members.filter((m) => !m.user.bot).size ?? 0;
+    if (nonBotMembers === 0) {
+      for (const [userId] of activeVoiceSessions) { activeVoiceSessions.delete(userId); }
+      vcState.connection.destroy();
+      guildVoiceConnections.delete(oldState.guild.id);
+      console.log(`[${companionId}] left VC in guild ${oldState.guild.id} (channel empty)`);
+    }
+  });
+
+  // Channel inbox (2026-07-06): serialize turns per channel and let a newer human message
+  // supersede the reply of every turn ahead of it. Before this, every messageCreate ran
+  // handleMessage fully concurrently -- with 30-120s hermes turns, replies landed answering
+  // channel state from minutes ago, sometimes out of order (the "delayed catch-up" clunk).
+  // BURST_SETTLE_MS (default 4000, 0 = off): a human burst is gathered and answered as one turn.
+  const settleMs = burstSettleMs();
+  console.log(`[${companionId}] burst settle: ${settleMs > 0 ? `${settleMs}ms` : "off"}`);
+  // P3/P4 (2026-10-18): supersede by human side, no mid-inference drop by default (finish, post, one
+  // catch-up turn), settle + gather by side with a hold cap. Same values on all three bots.
+  const supersedeSideAware = supersedeSideAwareOn();
+  const supersedeB = supersedeBOn();
+  const settleScope = burstSettleScope();
+  const settleMaxMs = burstSettleMaxMs();
+  console.log(`[${companionId}] inbox: supersede side_aware=${supersedeSideAware ? "on" : "off"} check_b=${supersedeB ? "on" : "off"} settle_scope=${settleScope} settle_max=${settleMaxMs > 0 ? `${settleMaxMs}ms` : "off"}`);
+  // Room timing, LIVE cut (room-timing.ts LullScheduler, 2026-11-01). The handler holds a burst line here
+  // instead of answering it; MessageCreate feeds every message in (below, before the inbox) so the lull
+  // and "the other human answered, it was theirs" are read at event time, never inside a turn. Release =
+  // one turn on the held message through the same inbox as everything else, not human-authored (it can
+  // never supersede), with lullRelease set so it skips the gate. Ids and reasons only in every line.
+  console.log(`[${companionId}] room timing: ${roomTimingMode(process.env, companionId)}`);
+  const lull = new LullScheduler<{ message: Message; pkSenderId: string | undefined }>({
+    onRelease: (h) => {
+      const ageS = Math.round((Date.now() - h.messageAt) / 1000);
+      console.log(`[${companionId}] room timing: lull reached, answering held msg=${h.messageId} ch=${h.channelId} reason=${h.reason} age_s=${ageS}`);
+      appendRoomTimingLine({ kind: "lull", at: new Date().toISOString(), companion: companionId, msg_id: h.messageId, channel_id: h.channelId, outcome: "released", reason: h.reason, age_s: ageS });
+      const origin = h.payload.message;
+      inbox.enqueue(
+        { id: `${origin.id}:lull`, channelId: origin.channelId, authorIsHuman: false, content: origin.content },
+        (isSuperseded, ctx) => tracedTurn(origin, h.side, isSuperseded, ctx, () => runTurn(origin, h.payload.pkSenderId, isSuperseded, undefined, undefined, { lullRelease: true }), "lull_release"),
+      );
+    },
+    onDrop: (h, why) => {
+      const ageS = Math.round((Date.now() - h.messageAt) / 1000);
+      console.log(`[${companionId}] room timing: dropped held msg=${h.messageId} ch=${h.channelId} why=${why} age_s=${ageS}`);
+      appendRoomTimingLine({ kind: "lull", at: new Date().toISOString(), companion: companionId, msg_id: h.messageId, channel_id: h.channelId, outcome: `dropped:${why}`, reason: h.reason, age_s: ageS });
+    },
+  });
+  const inbox = new ChannelInbox({
+    settleMs,
+    supersedeSideAware,
+    supersedeB,
+    settleScope,
+    settleMaxMs,
+    isCommandShaped: (content) => commandGuard?.test(content) ?? false,
+    log: (m) => console.log(`[${companionId}] ${m}`),
+    // P6: a turn the queue backstop drops never runs; it still gets its one [turn] line.
+    onDrop: (it) => emitDroppedTurn({ companionId, channelId: it.channelId, messageId: it.id, side: it.side ?? null, createdAt: null, enqueuedAt: Date.now() }, "queue_overflow"),
+  });
+
+  // P6 (turn-telemetry.ts): wrap a turn so the seams (vision resolve, Librarian calls, the Hermes call, the
+  // send, rails) can name their stage on the ambient trace, and exactly ONE `[turn]` line is written when the
+  // turn returns. Ids, counts and timings only. Never throws into the turn.
+  const tracedTurn = (message: Message, side: string | null, isSuperseded: (phase?: SupersedePhase) => boolean, ctx: TurnContext | undefined, run: () => Promise<void>, kind: TurnKind = "reply", pkOriginal?: string): Promise<void> => {
+    const startedAt = Date.now();
+    const trace = new TurnTrace({
+      companionId, channelId: message.channelId, messageId: message.id, side,
+      createdAt: message.createdTimestamp ?? null,
+      enqueuedAt: ctx?.enqueuedAt ?? startedAt,
+      startedAt,
+      queueMs: ctx?.queueWaitedMs ?? 0,
+      settleMs: ctx?.settleWaitedMs ?? 0,
+      gathered: ctx?.burst.length ?? 0,
+      catchup: ctx?.catchUp ?? false,
+      // Turn key (phase 1): ONE id per run. A lull release / pass follow-up is a new run (its own id)
+      // even though `msg` repeats; the burst's earlier message ids ride the hub row as absorbed[].
+      kind,
+      absorbed: (ctx?.burst ?? []).map((b) => b.id),
+      ...(pkOriginal ? { pkOriginal } : {}),
+    });
+    return runWithTurn(trace, async () => {
+      let threw = false;
+      try { await run(); } catch (e) { threw = true; throw e; } finally { trace.finish({ superseded: isSuperseded(), threw }); }
+    });
+  };
+
+  // Reaction READING (2026-08-16, the floor rework's named next cut). The reaction tier made
+  // an emoji the third output; this is the matching INPUT: when someone reacts to THIS
+  // companion's message, the fact lands in the channel's STM, so the next generation sees
+  // "Drevan marked that with 🔥" instead of the reaction not existing anywhere in the mind.
+  // Only reactions to the companion's OWN messages -- watching every reaction in the channel
+  // would be surveillance, not presence. Unrecognized bot reactors are dropped (describeReactor
+  // returns null), same fail-closed shape as the unconfirmed-webhook muzzle.
+  const seenReactions = new Set<string>();
+  // Whole-server mute (guild-mute.ts). Read once at boot like the other ids; logged so a muted
+  // server never reads as the bots ignoring someone.
+  const mutedGuilds = mutedGuildIds();
+  if (mutedGuilds.size > 0) console.log(`[${companionId}] muted guilds: ${[...mutedGuilds].join(",")}`);
+  client.on(Events.MessageReactionAdd, async (reaction, user) => {
+    try {
+      if (user.id === client.user?.id) return; // own glyphs are not news
+      if (isMutedGuild(reaction.message.guildId, mutedGuilds)) return;
+      // Owner gate for DM reactions, before any fetch (a partial carries guildId from the event).
+      if (!reaction.message.guildId && user.id !== env.ownerDiscordId) return;
+      const r = reaction.partial ? await reaction.fetch() : reaction;
+      const msg = r.message.partial ? await r.message.fetch() : r.message;
+      if (msg.author?.id !== client.user?.id) return; // only reactions to MY messages
+      const emoji = r.emoji.name ?? "☑";
+      // P13b: his reaction settles that send's outcome row, if it was a reach-out (dismissal emoji =
+      // dismissed, anything else = replied). Ids only; a message that is not in the ledger is a no-op.
+      if (user.id === env.ownerDiscordId) noteOwnerReaction(redis, { messageId: msg.id, emoji }).catch(() => {});
+      const key = `${msg.id}:${user.id}:${emoji}`;
+      if (seenReactions.has(key)) return; // add/remove/add churn is one fact, not three
+      seenReactions.add(key);
+      while (seenReactions.size > 500) {
+        const oldest = seenReactions.values().next().value;
+        if (oldest === undefined) break;
+        seenReactions.delete(oldest);
+      }
+      const who = describeReactor(
+        { id: user.id, bot: user.bot ?? false, username: user.username ?? null },
+        companionId,
+        env.ownerDiscordId,
+        env.ownerDisplayName,
+      );
+      if (!who) return;
+      // A reaction in a DM: owner only, and never into STM (the DM is sealed from recall anyway).
+      // A check mark or thumbs-up from him on one of my messages is the iPad-shaped "taken" (R-10);
+      // Halseth records it only if I reminded him about a dose that is still open.
+      if (!msg.guildId) {
+        if (user.id !== env.ownerDiscordId) return;
+        if (isAffirmativeMedAnswer(emoji)) {
+          const rec = await librarian.medAnswer(new Date().toISOString());
+          console.log(`[${companionId}] [med] affirmative reaction in DM -> ${rec ? `recorded slot=${rec.slot_key} date=${rec.local_date}` : "no open dose (nothing recorded)"}`);
+        }
+        return;
+      }
+      const snippet = (msg.content ?? "").replace(/\s+/g, " ").slice(0, 80);
+      stmStore.append(msg.channelId, {
+        role: "user",
+        authorName: "channel",
+        content: `[reaction] ${who} reacted ${emoji} to your message "${snippet}"`,
+        timestamp: Date.now(),
+      });
+      console.log(`[${companionId}] reaction seen: ${who} ${emoji} on ${msg.id}`);
+    } catch (e) {
+      console.warn(`[${companionId}] reaction read failed:`, e instanceof Error ? e.message : String(e));
+    }
+  });
+
+  // Event-time describe start. Fire and forget: the promise never rejects and the turn picks it up by
+  // message id (resolveSeenImages), waiting at most VISION_TURN_BUDGET_MS.
+  const prefetchVisionAtArrival = (message: Message, isSol: boolean): void => {
+    try {
+      if (!visionEnabled() || !visionPrefetchEnabled() || !visionCacheEnabled()) return;
+      if (message.attachments.size === 0 || isSol || message.author.id === client.user?.id) return;
+      if (message.author.bot && message.webhookId === null) return; // a companion's or other bot's own post
+      if (!(process.env["DEEPINFRA_API_KEY"] ?? "").trim()) return;
+      const picked = pickImageAttachments(message.attachments.values());
+      if (picked.length === 0) return;
+      visionPrefetch().start(message.id, picked, sharedVisionCache(companionId, redis as unknown as VisionRedis | null));
+    } catch (e) {
+      console.warn(`[${companionId}] vision prefetch failed to start:`, e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  client.on(Events.MessageCreate, (message: Message) => {
+    // MUTED SERVER, first line: nothing from it is read, paired, queued, answered or recorded.
+    if (isMutedGuild(message.guildId, mutedGuilds)) return;
+    // DM OWNER GATE, first line: a stranger's DM never reaches the PK pairing, the inbox, or a turn.
+    // No content is read or logged. handleMessage repeats the check (defence in depth).
+    if (message.author.id !== client.user?.id
+        && dmGateVerdict({ guildId: message.guildId, authorId: message.author.id, ownerId: env.ownerDiscordId, partnerId: env.spouseDiscordId, partnerEnabled: partnerDmEnabled(), channelType: () => message.channel?.type }) === "drop") {
+      console.log(droppedDmLogLine(companionId, message.author.id));
+      return;
+    }
+    // PluralKit pairing happens HERE, at event time, before the inbox -- never inside a turn.
+    // The inbox serializes per channel, so a hold taken inside the original's turn blocks the
+    // very webhook turn whose claim it waits for: the claim never lands, the already-deleted
+    // pre-proxy original gets processed in full, and the proxy loses its captured sender id
+    // (which is what demoted Principal's own message to guest-and-peer-bot). See PkDedup's
+    // ordering note. Only the decision -- waitForClaim -- runs inside the turn.
+    // Sol's webhook is never a PluralKit proxy: it skips the pairing (a content match against one of
+    // Principal's pending originals would otherwise mark HIS message proxied and drop it) and it is not
+    // human-authored for the inbox, so a crow moment can never supersede a turn on Principal's message.
+    const isSol = isSolPost(message, solId);
+    if (isSol) solPosts.noteSolPost(message.channelId, message.id, message.createdTimestamp);
+    else void solReplies.onMessage({
+      id: message.id,
+      channelId: message.channelId,
+      authorId: message.author.id,
+      webhookId: message.webhookId,
+      content: message.content,
+      createdAt: message.createdTimestamp,
+      referenceMessageId: message.reference?.messageId ?? null,
+    });
+    const { pkSenderId, pkOriginalId } = isSol ? { pkSenderId: undefined, pkOriginalId: undefined } : pkIngestAtEvent(
+      {
+        id: message.id,
+        channelId: message.channelId,
+        content: message.content,
+        webhookId: message.webhookId,
+        authorId: message.author.id,
+        authorIsBot: message.author.bot,
+      },
+      pkDedup,
+    );
+    // Vision prefetch (P2, 2026-10-18): start the describe NOW, at event time, like the PK pairing
+    // above, so it runs through the settle window, the PK hold and the queue wait instead of inside
+    // the turn. The three bots share one VL call through the Redis cache (vision-cache.ts). Never
+    // inside a turn, and never for this bot's own posts or Sol's.
+    prefetchVisionAtArrival(message, isSol);
+    // PK verification prefetch (2026-11-10): a roster NAME no longer identifies a proxy; PK's
+    // /v2/messages must confirm the message's system. Start that lookup now, at event time and
+    // never awaited (awaiting here would reorder arrivals), so the turn's resolveAttribution awaits
+    // a promise already in flight and the history label/side callers find the message verified.
+    if (!isSol) prefetchPkMessage(message);
+    const inboxSide = isSol ? null : resolveInboxSide(
+      {
+        authorId: message.author.id, isWebhook: message.webhookId !== null, username: message.author.username,
+        messageId: message.id, applicationId: message.applicationId ?? null, pkSenderId,
+      },
+      { ownerDiscordId: env.ownerDiscordId, spouseDiscordId: env.spouseDiscordId },
+      pkRoster,
+    );
+    // Room timing live: every message in the channel moves the lull clock (mine cancels a hold).
+    lull.noteMessage(message.channelId, {
+      side: isSol ? null : inboxSide,
+      isSelf: message.author.id === client.user?.id,
+      messageId: message.id,
+    });
+    inbox.enqueue(
+      {
+        id: message.id,
+        channelId: message.channelId,
+        // Raw human, or a webhook post (PluralKit proxying a human; worker personas are
+        // rare and superseding on them just regenerates with their post in view).
+        authorIsHuman: (!message.author.bot || message.webhookId !== null) && !isSol,
+        content: message.content,
+        // Burst bookkeeping: who spoke (a PK webhook shares one author id, so the name is part of it),
+        // and the mentions / reply target the reply path reads over the whole gathered burst.
+        authorKey: `${message.author.id}:${message.author.username}`,
+        mentionedIds: [...message.mentions.users.keys()],
+        replyToMessageId: message.reference?.messageId ?? null,
+        // Which human (P3/P4): Principal's system or Spouse's, from the author id or the in-memory PK roster.
+        side: inboxSide,
+      },
+      (isSuperseded, turnCtx) => tracedTurn(message, inboxSide, isSuperseded, turnCtx, () => runTurn(message, pkSenderId, isSuperseded, undefined, turnCtx), "reply", pkOriginalId),
+    );
+  });
+
+  // Follow-up PASS (2026-09-26 review). A predecessor in a multi-address order that a rail
+  // silenced publishes a pass; if it releases MY entitlement, run the entitled turn now, on the
+  // human origin message, through the same inbox as every other turn. Before this, the waiting
+  // companion held for FOLLOW_UP_TTL_MS and then said nothing: one rail hit silenced the chain.
+  // Enqueued as NOT human-authored so it cannot supersede a turn already in the queue; a newer
+  // human message still supersedes it, which is right.
+  //
+  // FOLLOWUP_PASS=off (pass-turn.ts followUpPassEnabled) stops this listener from subscribing, so a
+  // pass that still arrives (a sibling on the old build) never consumes my entitlement.
+  let stopPassListener: (() => void) | null = null;
+  if (!followUpPassEnabled()) console.log(`[${companionId}] FOLLOWUP_PASS=off -- follow-up pass listener not started`);
+  if (redis && followUpPassEnabled()) {
+    const passSub = redis.duplicate();
+    const off = onFollowUpPass(passSub, (pass) => {
+      if (pass.fromCompanionId === companionId) return;
+      const entitlement = releaseFollowUpOnPass(pass);
+      if (!entitlement) return;
+      console.log(`[${companionId}] follow-up pass from ${pass.fromCompanionId} (${pass.reason}) released position ${entitlement.position} on ${pass.originMessageId}`);
+      void (async () => {
+        try {
+          const ch = await client.channels.fetch(pass.channelId) as { messages?: { fetch(id: string): Promise<Message> } } | null;
+          const origin = ch?.messages ? await ch.messages.fetch(pass.originMessageId) : null;
+          if (!origin) return;
+          inbox.enqueue(
+            { id: `${origin.id}:pass`, channelId: origin.channelId, authorIsHuman: false, content: origin.content },
+            (isSuperseded, passCtx) => tracedTurn(origin, null, isSuperseded, passCtx, () => runTurn(origin, entitlement.pkSenderId, isSuperseded, entitlement), "pass"),
+          );
+        } catch (e) {
+          console.warn(`[${companionId}] follow-up pass: could not load the origin message:`, e instanceof Error ? e.message : String(e));
+        }
+      })();
+    });
+    stopPassListener = () => { off(); passSub.quit().catch(() => {}); };
+  }
+
+  // One turn. Every per-process dependency, wired once; the MessageCreate path and the
+  // follow-up pass path above both come through here, so they cannot drift.
+  function runTurn(message: Message, pkSenderId: string | undefined, isSuperseded: (phase?: SupersedePhase) => boolean, followUpPass?: FollowUpEntitlement, turnCtx?: TurnContext, opts?: { lullRelease?: boolean }): Promise<void> {
+    return handleMessage(message, {
+      ...(opts?.lullRelease ? { lullRelease: true } : {}),
+      lullPendingSide: (channelId) => lull.pending(channelId)?.side ?? null,
+      holdForLull: (h) => lull.hold({
+        channelId: h.message.channelId, messageId: h.message.id, side: h.side, messageAt: h.message.createdTimestamp,
+        reason: h.reason, payload: { message: h.message, pkSenderId: h.pkSenderId },
+      }),
+      client,
+      cfg: { ownerDiscordId: env.ownerDiscordId, ownerDisplayName: env.ownerDisplayName, spouseDiscordId: env.spouseDiscordId, halsethSecret: env.halsethSecret },
+      voiceClient, redis, librarian,
+      adapterRef, directAdapter, hermesRouter, activeModelRef, hermesModelKeysRef, currentMoodRef, lastSomaRefreshRef, recentContextRef, bootCtx,
+      stmStore, writeQueue, configCache, sessionWindows, pkDedup, pkRoster,
+      ...(pkSenderId ? { pkSenderId } : {}),
+      solWebhookId: solId,
+      guildVoiceConnections, sentIds, distillationCounter, pulseCounter,
+      botResponsesSinceHuman, botPingpongCooldownUntil, extremeTempCount,
+      apiKeys, apiUrls,
+      connectVoice, leaveVoice,
+      resetCycleGuard: autonomous.resetCycleGuard,
+      pushPrincipalMessage: autonomous.pushPrincipalMessage,
+      COMPANION_ID: companionId, PK_HOLD_MS, SENT_IDS_CAP, CONTEXT_WINDOW_SIZE: contextWindowSize,
+      MODEL_SWITCH_TRIGGER: modelSwitchTrigger, MODEL_SWITCH_LIST_INTRO: modelSwitchListIntro, MODEL_SWITCH_SUCCESS: modelSwitchSuccess,
+      LISTEN_TRIGGER: listenTrigger,
+      ...(videoTrigger ? { VIDEO_TRIGGER: videoTrigger } : {}),
+      CLUB_TRIGGER: clubTrigger,
+      ...(searchTrigger ? { SEARCH_TRIGGER: searchTrigger } : {}),
+      ...(imagineTrigger ? { IMAGINE_TRIGGER: imagineTrigger } : {}),
+      ...(petTrigger ? { PET_TRIGGER: petTrigger } : {}),
+      ...(councilTrigger ? { COUNCIL_TRIGGER: councilTrigger } : {}),
+      ...(impsTrigger ? { IMPS_TRIGGER: impsTrigger } : {}),
+      ...(hexTrigger ? { HEX_TRIGGER: hexTrigger } : {}),
+      ...(logTrigger ? { LOG_TRIGGER: logTrigger } : {}),
+      ...(intoTrigger ? { INTO_TRIGGER: intoTrigger } : {}),
+      ...(retractTrigger ? { RETRACT_TRIGGER: retractTrigger } : {}),
+      ...(watchTrigger ? { WATCH_TRIGGER: watchTrigger } : {}),
+      ...(movieTrigger ? { MOVIE_TRIGGER: movieTrigger } : {}),
+      ...(movieAtTrigger ? { MOVIE_AT_TRIGGER: movieAtTrigger } : {}),
+      ...(commandGuard ? { COMMAND_GUARD: commandGuard } : {}),
+      SPOUSE_FRAMING: spouseFraming, GUEST_FRAMING: guestFraming, IN_CHARACTER_FALLBACK: inCharacterFallback,
+      DISTILLATION_PROMPT: distillationPrompt, DISTILLATION_INTERVAL: distillationInterval, PULSE_INTERVAL: pulseInterval,
+      ...(auditConfig ? { AUDIT_TRIGGERS: auditConfig.auditTriggers, AUDIT_MODE_INJECTION: auditConfig.auditModeInjection } : {}),
+      isSuperseded,
+      ...(turnCtx ? { settleMs: turnCtx.settleMs, burst: turnCtx.burst } : {}),
+      ...(followUpPass ? { followUpPass } : {}),
+    });
+  }
+
+  // Shutdown budget (P3-14, 2026-10-08). pm2 sends SIGINT, waits kill_timeout (15000 in
+  // ecosystem.config.js) and SIGKILLs. Every await below is bounded so the sum stays under it:
+  // closure flush 8s + session close 4s + subscriber quit 1s = 13s worst case (2026-11-05: was 1.5s, which cut every closure distillation off; see git log). Before this the
+  // flush was UNBOUNDED -- closeAll() fires one distillSessionOnInactive (a model call) per open
+  // session window and the handler awaited them all -- so a bot restarted mid-session blew the
+  // old 5000 and was SIGKILLed with its Halseth session never closed. Cypher alone showed it
+  // because he is the one with a window open when Principal restarts from a work session; the
+  // stop paths of the three bots are identical. The backstop timer exits regardless.
+  function bounded<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+    return Promise.race([
+      p,
+      new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label} timed out (${ms}ms)`)), ms).unref()),
+    ]);
+  }
+
+  let shuttingDown = false;
+  async function shutdown() {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[${companionId}] shutting down...`);
+    setTimeout(() => {
+      console.warn(`[${companionId}] shutdown backstop hit after ${SHUTDOWN_BACKSTOP_MS}ms; exiting`);
+      process.exit(0);
+    }, SHUTDOWN_BACKSTOP_MS).unref();
+    autonomous.stop();
+    if (stopMedReminder) stopMedReminder();
+    sessionWindows.closeAll();
+    if (pendingClosures.size > 0) {
+      const n = pendingClosures.size;
+      console.log(`[${companionId}] flushing ${n} active channel(s)...`);
+      try {
+        await bounded(Promise.allSettled([...pendingClosures]), SHUTDOWN_FLUSH_MS, "closure flush");
+      } catch {
+        console.warn(`[${companionId}] closure flush: ${pendingClosures.size}/${n} still pending after ${SHUTDOWN_FLUSH_MS}ms; continuing`);
+      }
+    }
+    // Close the Halseth session before the write queue stops. An unclosed session freezes the
+    // boot narrative and the SOMA close ritual; a machine spine is the floor, not the ceiling.
+    // Bounded: shutdown must not hang on an unreachable Halseth. Placeholder ids ("unknown",
+    // "cached") mean boot never opened a real session, so there is no row to close.
+    if (bootCtx.sessionId && bootCtx.sessionId !== "unknown" && bootCtx.sessionId !== "cached") {
+      try {
+        await Promise.race([
+          librarian.sessionClose({
+            sessionId: bootCtx.sessionId,
+            spine: `[auto] ${companionId} bot shutdown -- process received a stop signal`,
+            lastRealThing: "[auto] graceful shutdown; queued writes flushed before close",
+            motionState: "floating",
+            // 2026-09-14: a machine close, tagged as one. Without this the row landed as close_kind
+            // NULL (= authored) and the next boot's "[Last: ...]" read "bot shutdown -- process
+            // received a stop signal" -- a pm2 reload presented as the last thing that happened.
+            closeKind: "shutdown",
+          }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error(`session close timed out (${SHUTDOWN_SESSION_CLOSE_MS}ms)`)), SHUTDOWN_SESSION_CLOSE_MS).unref()),
+        ]);
+        console.log(`[${companionId}] session ${bootCtx.sessionId} closed at shutdown`);
+      } catch (e) {
+        console.warn(`[${companionId}] session close at shutdown failed:`, e);
+      }
+    }
+    writeQueue.stop();
+    if (presenceInterval) clearInterval(presenceInterval);
+    clearInterval(dayDistillInterval);
+    if (cleanupEventSubs) {
+      try { await bounded(cleanupEventSubs(), SHUTDOWN_SUBS_MS, "event subscriber quit"); }
+      catch (e) { console.warn(`[${companionId}] ${e instanceof Error ? e.message : String(e)}; continuing`); }
+    }
+    if (stopPassListener) stopPassListener();
+    lull.clearAll();
+    client.destroy();
+    process.exit(0);
+  }
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
+
+  await client.login(env.discordBotToken);
+}

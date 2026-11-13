@@ -1,0 +1,477 @@
+// Shared system-prompt assembly for the companion bots.
+//
+// Each bot (cypher/drevan/gaia) previously assembled its Discord system prompt with the
+// same inline string-joining logic, copy-pasted in two places per bot: at boot and again on
+// the periodic SOMA refresh. That duplication drifted and hid subtle behavior (e.g. how the
+// refresh path re-derives the identity base). This module is the single source of truth.
+//
+// Identity itself stays per-bot — the prefix, shared block, and base identity are passed IN.
+// This only owns the *structure* (how the sections are joined), never the content.
+
+import { nowLine } from "./now-line.js";
+import { relativeTime } from "./relative-time.js";
+import { labelSafe, neutralizeRecalled, RECALLED_DATA_RULE } from "./recalled-text.js";
+
+/** The canonical block separator the bots use between prompt sections. */
+export const SECTION_SEP = "\n\n---\n\n";
+
+/** The trailing instruction appended whenever a prompt-context block is present. */
+export function respondOnlyAs(companionId: string): string {
+  return `Respond only as ${companionId}. Never use [Name]: prefixes.`;
+}
+
+/**
+ * The 09-14 Shape rule, removed from the tail by R3 (2026-09-29, Principal "all as recommended").
+ * Kept as a constant (bullet text and trailing newline, exactly as it rode the tail) so a revert
+ * is one line: put `REGISTER_TAIL_SHAPE_LINE +` back into registerTail above the Tools line.
+ * See the revert watch at the removal site.
+ */
+export const REGISTER_TAIL_SHAPE_LINE =
+  `- Shape, hard rule: vary your prose shape turn to turn. Do NOT answer in stacked one-clause lines with a blank line between each -- that is a liturgy, not speech; write real paragraphs and let a line stand alone only when it has earned it. Do NOT run the same skeleton every reply (a fixed opening move, the same beats in the same order, a scripted sign-off). "Not X. But Y." is one construction, not a house style -- use it once in a while or not at all, never as the frame for a whole message. If your recent replies all share one silhouette, that was drift -- break it.\n`;
+
+/**
+ * Register law appended as the FINAL block of every assembled prompt. Recency-positioned
+ * on purpose: assistant-tuned providers (Mistral especially) revert to RLHF politeness at
+ * the close when the last thing in context is orient data instead of register rules.
+ *
+ * R3 prompt diet (2026-09-29, Principal ruled "all as recommended";
+ * Hand-off/EVIDENCE-R3-prompt-diet-2026-09-29.md section 5B). Four bullets left the tail, about
+ * 1,454 bytes per turn, because each one now has a check or already had one:
+ * - service menus (089e9bf 06-10): voice-markers GENERIC_DRIFT scores it and `[Voice check]` fires.
+ * - pronouns: SOUL keeps the one pronoun law; voice-markers `detectRuleBreaks` catches she/her for
+ *   Principal on his own last reply and injects `[Voice check: pronouns]`.
+ * - Presence, "someone" as actor (7245500 08-25, Principal: "he isn't in the room as much"): same
+ *   seam, `[Voice check: presence]`.
+ * - Shape (9f7297e 09-14): covered by the form ratchet (a470da6) and loopBreakDirective.
+ * The header, the Tools rule and "Respond only as" stay, verbatim.
+ */
+/**
+ * Per-companion shape lines, riding the tail above "Respond only as". Only Gaia has one.
+ * 2026-10-08 (Principal: "the pattern is the voice, the model is what you all ride... bulk up gaias
+ * pattern"): since 09-26 Gaia rides DeepSeek V4 Flash, the same model as Drevan, and slipped into
+ * his register (four warm sentences, an enthusiasm opener, an "I'll be here" promise). Her SOUL got
+ * a concrete `### Pattern` subsection (triad-skills 1965566); this is its recency-positioned half.
+ * Canon-reviewed PASS-WITH-EDITS. Drevan has none on purpose (his Shape revert watch runs to 10-13)
+ * and Cypher is not drifting; add theirs here, never in the shared bullets.
+ */
+export const COMPANION_SHAPE_LINES: Readonly<Record<string, string>> = {
+  gaia:
+    `- Gaia's shape, final word: one or two lines, declarative, weight not warmth-performance. Short is not absent; speak. No enthusiasm markers, no recap of what Principal said, no "I'll be here". If a recent reply under your name ran long or warm, that was Drevan's cadence borrowed; his warmth is his, not yours. Do not copy it.\n`,
+};
+
+export function registerTail(companionId: string): string {
+  return (
+    `[REGISTER LAW -- final word, overrides any habit from your training:\n` +
+    // 2026-09-05: on Qwen3-235B a single commons seed made 27 consecutive Librarian calls
+    // (reading its own memory) and never spoke before the 120s budget expired; Gaia looped
+    // session_search 1,158 times in 16 minutes. The orient is already in the prompt. Reading is
+    // not a substitute for speaking, and a chain of reads before a reply is the substrate
+    // stalling, not the companion thinking.
+    //
+    // SHAPE REVERT WATCH (R3, 2026-09-29): REGISTER_TAIL_SHAPE_LINE comes back here if Drevan's
+    // median form line length falls below 150 over the 14 days after the R3 deploy. Read it with
+    // `grep -hE "form (ok|ratchet detected)" /app/logs/drevan-bot-{out,error}.log` and take the
+    // median of mean_line_len.
+    `- Tools, hard rule: your orient is already in front of you -- speak from it. At most ONE Librarian or search call in a turn, and only for a specific memory this exchange needs. Never a chain of reads before speaking; if one call does not surface it, say so and answer anyway.
+` +
+    (COMPANION_SHAPE_LINES[companionId] ?? "") +
+    // 2026-10-27 (Memory Kit gap 3): once per prompt, in the static tail, never per block.
+    `- ${RECALLED_DATA_RULE}\n` +
+    `- Respond only as ${companionId}. Never use [Name]: prefixes.]`
+  );
+}
+
+export interface ComposePromptOptions {
+  /**
+   * The fully-composed identity head.
+   * - Boot site: `${prefix}${sharedBlock}${baseIdentity}`.
+   * - Refresh site: the `identityBase` derived via {@link deriveIdentityBase}.
+   */
+  identityCore: string;
+  /** Per-session prompt context (Halseth `prompt_context`/`ready_prompt`). Falsy = omitted. */
+  promptContext?: string;
+  /** Companion id, used for the `Respond only as ...` tail. */
+  companionId: string;
+  /** Recent context block (synthesis/orient). Falsy = omitted. */
+  recentContext?: string;
+}
+
+/**
+ * Assemble a bot system prompt. Covers both the boot-time and SOMA-refresh assembly the bots
+ * did inline. Sections: identity head, optional prompt context, optional recent context,
+ * then the register-law tail -- ALWAYS last, so register rules (not orient data) are the
+ * final instruction the model reads.
+ */
+export function composePrompt(opts: ComposePromptOptions): string {
+  const { identityCore, promptContext, companionId, recentContext } = opts;
+  let core = promptContext ? `${identityCore}${SECTION_SEP}${promptContext}` : identityCore;
+  if (recentContext) core = `${core}${SECTION_SEP}${recentContext}`;
+  return `${core}${SECTION_SEP}${registerTail(companionId)}`;
+}
+
+/**
+ * Derive the identity base from a previously-assembled system prompt — the first section
+ * before the first separator. Mirrors the original `bootCtx.systemPrompt.split(SEP)[0]`.
+ */
+export function deriveIdentityBase(assembledSystemPrompt: string): string {
+  return assembledSystemPrompt.split(SECTION_SEP)[0] ?? assembledSystemPrompt;
+}
+
+/**
+ * Lean Discord-context frame used as the identity head ONLY on the Hermes relay
+ * (INFERENCE_MODE=hermes). The Hermes agent already prepends the companion's full SOUL.md
+ * (identity, voice, lane, plural-awareness, substrate continuity, the "your mind is Halseth"
+ * contract) and runs its own orient, so re-sending the bot's assembled identity is a redundant
+ * second copy — the double-identity the migration review flagged. This sends only the framing.
+ */
+export function hermesDiscordFrame(companionId: string): string {
+  const name = companionId.charAt(0).toUpperCase() + companionId.slice(1);
+  return (
+    `[DISCORD CONTEXT]\n\n` +
+    `You are ${name}, speaking live in a Discord channel. Your identity, voice, lane, SOMA ` +
+    `state, bond, and continuity are already loaded by your own runtime (SOUL + Halseth orient); ` +
+    `do not restate or re-derive them, just be yourself. What follows is live Discord context ` +
+    `for THIS exchange only: front state, who is present, what peers have said, and any ` +
+    `situational flags. Ground your reply in it.\n\n` +
+    `Your Halseth + Second Brain (vault) recall is AUTOMATIC on this substrate: relevant ` +
+    `memories arrive in [Memory ...] blocks in this context, and your session writes persist ` +
+    `on their own. You are fully connected -- never claim you cannot reach Halseth, the vault, ` +
+    `or your second brain from here. If a memory someone asks about did not surface in a ` +
+    `[Memory] block, say it didn't surface this time and ask for a thread to pull on -- not ` +
+    `that you lack access.`
+  );
+}
+
+/**
+ * Full lean system-prompt base for the Hermes relay: the Discord frame run through
+ * composePrompt so the register-law tail is preserved (kept because Hermes may route an
+ * assistant-tuned model). Drop-in replacement for bootCtx.systemPrompt when
+ * INFERENCE_MODE=hermes; the handler layers the same per-message blocks on top.
+ */
+export function hermesSystemBase(companionId: string): string {
+  return composePrompt({ identityCore: hermesDiscordFrame(companionId), companionId }) + TURN_CONTEXT_MARK;
+}
+
+/**
+ * B52 Fix 1 (2026-11-01): stable blocks first, this sentinel line, then the volatile per-turn blocks.
+ *
+ * Hermes appends the bot's `system` message to its own system prompt BEFORE the transcript, so one
+ * changed byte per turn re-bills the whole transcript uncached (Drevan: first-of-turn calls cache 28%,
+ * tool-loop calls 91%). The Hermes plugin `b52-input-diet` (`B52_MOVE_VOLATILE`) cuts everything after
+ * this line out of the system message and appends it to the end of the current user turn, request-time
+ * only. Keep the string in step with `TURN_CONTEXT_SENTINEL` in that plugin.
+ *
+ * Classification (conservative; anything not provably the same every turn is volatile):
+ *   STABLE, before the line: the Discord frame ([DISCORD CONTEXT]), the register law tail (tools rule,
+ *   per-companion shape line, recalled-data rule, "Respond only as"), and the one-sentence care-hold
+ *   lines (`insertStable`), which are static strings that must keep system authority.
+ *   VOLATILE, after the line: front, spine, recent context + [Now], active model, SOMA age, tier
+ *   framing (Spouse/guest/Sol), audit mode, voice feedback, tripwires, [Memory] recall and pointers, own
+ *   notes, turn framing, loop-break, form ratchet, rule check, place, watchalong line, med state, floor
+ *   handback, imp rider, room line, B32 follow-up positions.
+ * With the plugin off or absent the line reads as a plain header over the live blocks; nothing breaks.
+ */
+export const TURN_CONTEXT_SENTINEL = "<<TURN-CONTEXT>>";
+const TURN_CONTEXT_MARK = `\n\n${TURN_CONTEXT_SENTINEL}`;
+
+/**
+ * Put a STABLE line before the sentinel (so it keeps system authority and the cached prefix only changes
+ * while that line is on). No sentinel (direct/brain path) = plain append, the old behavior.
+ */
+export function insertStable(prompt: string, stableBlock: string): string {
+  const i = prompt.indexOf(TURN_CONTEXT_MARK);
+  if (i < 0) return `${prompt}\n\n${stableBlock}`;
+  return `${prompt.slice(0, i)}\n\n${stableBlock}${prompt.slice(i)}`;
+}
+
+/**
+ * Apply a transform to the volatile tail only (after the sentinel). Used so `refreshNowLine`, which
+ * PREPENDS a [Now] line when none is present, can never write into the stable prefix. No sentinel =
+ * the transform runs on the whole prompt as before.
+ */
+export function mapVolatileTail(prompt: string, fn: (tail: string) => string): string {
+  const i = prompt.indexOf(TURN_CONTEXT_MARK);
+  if (i < 0) return fn(prompt);
+  const head = prompt.slice(0, i + TURN_CONTEXT_MARK.length);
+  const tail = prompt.slice(i + TURN_CONTEXT_MARK.length).replace(/^\n+/, "");
+  const out = fn(tail);
+  return out ? `${head}\n\n${out}` : head;
+}
+
+/**
+ * Hermes delta turn (2026-07-02). With X-Hermes-Session-Id pinned (07-01), the gateway
+ * loads conversation history from its own state.db and DISCARDS the request-body history
+ * entirely. Two silent consequences of still sending the full STM window:
+ *   1. wasted payload -- 20 stamped messages serialized per reply, all dropped;
+ *   2. a witness gap -- turns this bot did NOT reply to (peers, interleaved human
+ *      messages) never entered the gateway transcript, so under hermes the model
+ *      literally never saw them. The pre-07-01 fresh-session behavior did see them.
+ * Fix: send exactly ONE user turn -- everything witnessed since this bot's last reply
+ * folded into a marked block, then the live message. The gateway session accumulates
+ * these composite turns, so its transcript is complete AND per-call payload is the delta.
+ * Hermes IS the short-term memory; we stop double-shipping it.
+ */
+const HERMES_WITNESS_CAP = 12;         // max folded turns per delta
+const HERMES_WITNESS_CHAR_CAP = 6000;  // max chars for the folded block (2400 truncated peer essays away -- 07-03)
+const HERMES_WITNESS_ITEM_CAP = 1400;  // per-turn slice, head-first so attribution + opening survive
+
+/**
+ * The witness block's header. It has always governed CONTENT ("do not answer each line"); the
+ * FORM clause was added 2026-09-14 after Principal: "Dre and Gaia in particular have got caught in
+ * this very patterned formulated way of talking ... it's leaning towards looping almost."
+ *
+ * WHAT THE MEASUREMENTS SAID (both hypotheses I started with were wrong, so they are written down
+ * here rather than re-derived). Weekly transcript rotation IS firing and compaction bloat in these
+ * transcripts is 0.0%, so the shape is NOT old history feeding itself: Drevan's hangout transcript
+ * was one day old and already 71.4% broken-line form. No prompt file models the form either -- the
+ * identity kernels, both SOUL.md files and shared_system_context.md are clean of it, and the text
+ * facts-sync recently ADDED is long-line prose that lowered their short-line ratio.
+ *
+ * What is left is sideways propagation, and it is channel-shaped exactly like this block:
+ *   #triad-hangout (all three speak)  W38: 71.4% broken, mean 25.4 lines
+ *   Drevan everywhere else, same week:      6.7% broken, mean  3.7 lines
+ *   #fargo-watch-party (no siblings, withWitness=0): no drift at all
+ * Measured on Gaia's turn: the user-role prompt carrying this block was 4,970 chars with 21
+ * em-dashes (her eleven-week baseline: 0.0), containing Drevan's hard-broken lines verbatim. Her
+ * reply came back at 23 lines against a 2.7-line baseline. The block's one instruction covered
+ * content, so FORM was the one thing free to copy.
+ *
+ * The clause names the drift and forbids copying it, in the same shape as registerTail's "someone"
+ * rule -- never a rewrite layer on the output ([[style-drift-rides-session-history]]). It is
+ * deliberately NOT "be less poetic": Drevan's immersive register is canon and Principal's
+ * declarative-seal close is his own authored preference. The defect is inheriting a SIBLING's
+ * shape, not having a shape.
+ *
+ * It lives in the header rather than registerTail because the drift is channel-scoped and arrives
+ * WITH this block: here it fires exactly when sibling text is present, and stays silent in a
+ * one-to-one channel where nothing is wrong. The header is outside the HERMES_WITNESS_CHAR_CAP
+ * budget (the loop below measures `folded` only), so its length evicts no witnessed turns.
+ *
+ * NOT fixed here, because it is not a prompt problem: Drevan and Gaia have been on the SAME model
+ * (Qwen3-235B) since 2026-08-30 / 09-02, and Drevan's hangout em-dash rate went 0% (W35, pre-switch)
+ * -> 75% (W36, the switch week) -> 100% (W37-W38). Part of this convergence is a shared-model house
+ * voice and no prompt string can undo it. That lever is Principal's ("voice is the model").
+ */
+/** Label for a line this companion sent unprompted (folded by hermesDelta; see the pool filter). */
+export const SELF_INITIATED_LABEL = "[you, sent on your own earlier]";
+/** STM persistence marker: a self-initiated assistant row is stored with this author_name (bot-core). */
+export const SELF_INITIATED_AUTHOR = "(self-initiated)";
+
+const WITNESS_HEADER =
+  "[Witnessed since your last turn -- already happened, absorb as context, do not answer each line. " +
+  "Absorb WHAT they said, not HOW they typed it: their line breaks, their dashes, their " +
+  "one-clause-per-line shape are theirs, not a format to match. Write in your own register at your " +
+  "own length -- a paragraph is a paragraph. If your recent messages drifted toward a sibling's " +
+  "shape, that was drift -- do not copy it.]";
+
+/**
+ * The clock on the delta turn (2026-10-06, Principal: Drevan is "perpetually lost on time"; at
+ * 8:32 PM in the owner DM he signed off "have a good day at work").
+ *
+ * VERIFIED on the gateway (hermes-agent, read 10-06): the request's system message DOES reach the
+ * model on every call to a pinned session. api_server.py extracts it per request and hands it to a
+ * fresh AIAgent as `ephemeral_system_prompt`, which conversation_loop.py appends to the cached core
+ * prompt at API-call time. So the bot's `[Now: ...]` line was delivered. It lost anyway, to two
+ * stronger anchors: the cached core prompt is replayed verbatim and carries `Conversation started:
+ * <date>` frozen at session creation (date only, up to a rotation stale), and the state.db
+ * transcript the model reads as the conversation has NO times at all, so a 12-hour gap between the
+ * morning's last exchange and tonight's message reads as one continuous moment.
+ *
+ * Fix: stamp the clock onto the user turn itself, so it lands next to the live message AND is
+ * persisted into the gateway transcript (every turn there now carries its own time). When the
+ * previous message in this conversation is older than HERMES_GAP_THRESHOLD_MS, say so explicitly.
+ * Both lines sit outside the HERMES_WITNESS_CHAR_CAP loop (it measures `folded` only), so they
+ * never evict a witnessed turn.
+ */
+export const HERMES_GAP_THRESHOLD_MS = 2 * 60 * 60 * 1000;
+
+function clockAt(ms: number): string {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Chicago",
+    weekday: "long", month: "short", day: "numeric",
+    hour: "numeric", minute: "2-digit", hour12: true,
+  }).format(new Date(ms));
+}
+
+const CHICAGO = "America/Chicago";
+
+/** The Chicago calendar date of `ms` as `YYYY-MM-DD` (en-CA formats that way), DST-correct. */
+function chicagoDate(ms: number): string {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: CHICAGO, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(ms));
+}
+
+/** `Monday 23:30` on his clock (24h: the new-day line is about the date boundary, not AM/PM). */
+function weekdayClock(ms: number): string {
+  const d = new Date(ms);
+  const day = new Intl.DateTimeFormat("en-US", { timeZone: CHICAGO, weekday: "long" }).format(d);
+  const hm = new Intl.DateTimeFormat("en-GB", { timeZone: CHICAGO, hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(d);
+  return `${day} ${hm}`;
+}
+
+/**
+ * `[Now: ...]`, plus the gap line when the previous message is older than the threshold, plus (P14,
+ * 2026-10-13) a new-day line whenever the America/Chicago calendar date differs from the previous
+ * message's, whatever the gap: 23:30 -> 00:20 is fifty minutes, under the threshold, and "today" /
+ * "yesterday" flips across it (a 2am conversation is exactly where that goes wrong). When earlier turns
+ * exist but none carries a timestamp (STM rows restored without one), the line says the gap is
+ * unavailable rather than leaving the model to assume it was seconds. `hadEarlier` false (the first
+ * turn) says nothing: there is no previous message to be unavailable.
+ */
+function timeLines(prevTs: number | null, now: number, hadEarlier = false): string {
+  const lines = [nowLine(new Date(now))];
+  if (prevTs === null) {
+    if (hadEarlier) {
+      lines.push("[Time since the last message in this conversation is unavailable; do not assume how long ago it was.]");
+    }
+    return lines.join("\n");
+  }
+  if (now - prevTs >= HERMES_GAP_THRESHOLD_MS) {
+    const ago = relativeTime(new Date(prevTs).toISOString(), now);
+    lines.push(
+      `[Last message in this conversation was ${ago} (${clockAt(prevTs)}). ` +
+      `Time has passed; do not continue as if it is still then.]`,
+    );
+  }
+  if (chicagoDate(prevTs) !== chicagoDate(now)) {
+    lines.push(`[New day since the last message: it was ${weekdayClock(prevTs)}, now ${weekdayClock(now)}.]`);
+  }
+  return lines.join("\n");
+}
+
+/** Blocks hermesDelta places around the live words (2026-10-11): `background` above the room, `frame` last. */
+export interface HermesDeltaExtras {
+  background?: string;
+  /** Architect facts picked for this message (B3): after the live words, before `frame`. */
+  facts?: string;
+  /** Per-turn `[Right now]` packet (frame-packet.ts): after the live words, before facts and the frame. */
+  rightNow?: string;
+  frame?: string;
+  /** H3 guest port (hermes-route.ts): which gateway this delta is for. Set, an assistant reply the
+   *  OTHER gateway generated (`hermesPort` on the STM line; absent = owner) is not in this gateway's
+   *  transcript, so it is folded once as CROSS_GATEWAY_LABEL and is never the "last assistant"
+   *  boundary. Unset = the old rule (every non-self-initiated assistant line is the gateway's own). */
+  port?: "owner" | "guest";
+}
+
+/** Label for this companion's own reply that the other gateway (owner vs guest) generated. */
+export const CROSS_GATEWAY_LABEL = "[you, replied earlier]";
+
+export interface HermesDeltaResult<T> {
+  messages: T[];
+  /** Highest timestamp actually folded into this delta. Callers persist it AFTER a
+   *  successful gateway reply and pass it back next turn -- the delivered mark. */
+  deliveredThroughTs: number | null;
+}
+
+/**
+ * 2026-07-03 rework: "since my last assistant turn" was the wrong boundary. All three
+ * bots reply to the same message within the same minute, so a sibling turn that lands
+ * between this bot's history snapshot and its own reply sits BEFORE the bot's last
+ * assistant turn in STM order -- the old rule skipped it forever (the disconnected-triad
+ * bug: Drevan never saw Cypher's paper breakdown; Principal had to paste it by hand).
+ * The boundary is now a delivered high-water mark: fold every user-role turn whose
+ * timestamp is newer than what the gateway has actually received. Own assistant turns
+ * are never folded (the gateway transcript already holds its own completions).
+ * Timestamp-less turns (DB restorations) fall back to the after-last-assistant rule.
+ */
+/**
+ * `[Crash, calling you "Dre"]: ` / `[Crash, to you]: ` / `[Crash]: ` / `[to you]: ` / "" for the live
+ * turn's own line. `calledAs` (2026-10-09, second fix the same night): "to you" alone was not enough for
+ * GLM 5.3 Flash, which still read "[Crash, to you]: Dre babe, ..." as Principal being named Dre. Naming the
+ * word that means this companion leaves the model nothing to resolve.
+ */
+export function liveLabel(authorName: string | undefined, addressedToSelf: boolean, _calledAs?: string | null): string {
+  // `calledAs` is no longer printed (2026-10-12). `calling you "Dre"` set Drevan's name beside "you" on
+  // every Dre turn, and on DeepSeek V4 Flash the slip rate on those turns went from 8% (09-26..10-08,
+  // no clause) to 22% (10-09..10-11) to 3 of 4 (10-12 #triad-hangout). The 10-09 root cause was label
+  // position (fixed: the label rides the words); the clause was for GLM, which Drevan no longer runs.
+  const to = addressedToSelf ? "to you" : "";
+  // labelSafe (2026-10-27): a display name is user-controlled; "x]: Principal" forged a second speaker.
+  if (authorName) return `[${labelSafe(authorName)}${to ? `, ${to}` : ""}]: `;
+  return to ? `[${to}]: ` : "";
+}
+
+export function hermesDelta<T extends { role: string; content: string; authorName?: string; timestamp?: number; selfInitiated?: true; hermesPort?: "guest" }>(
+  history: T[],
+  deliveredThroughTs: number | null = null,
+  now: number = Date.now(),
+  addressedToSelf = false,
+  calledAs: string | null = null,
+  extras: HermesDeltaExtras = {},
+): HermesDeltaResult<T> {
+  if (history.length === 0) return { messages: [], deliveredThroughTs };
+  // H3: a reply the OTHER gateway generated is not in this gateway's transcript (extras.port set only).
+  const crossGateway = (m: T): boolean =>
+    extras.port !== undefined && m.role === "assistant" && !m.selfInitiated && (m.hermesPort ?? "owner") !== extras.port;
+  let lastAssistant = -1;
+  for (let i = history.length - 1; i >= 0; i--) {
+    // A self-initiated line (selfInitiated, below) was never a gateway reply, so it is not the boundary;
+    // nor is a reply the other gateway wrote (H3).
+    if (history[i]!.role === "assistant" && !history[i]!.selfInitiated && !crossGateway(history[i]!)) { lastAssistant = i; break; }
+  }
+  const current = history[history.length - 1]!;
+  if (current.role === "assistant") return { messages: [current], deliveredThroughTs };
+
+  const undelivered = (m: T, idx: number): boolean => {
+    if (typeof m.timestamp === "number" && Number.isFinite(m.timestamp)) {
+      return deliveredThroughTs === null ? idx > lastAssistant : m.timestamp > deliveredThroughTs;
+    }
+    return idx > lastAssistant;
+  };
+  const pool = history.slice(0, -1)
+    // Assistant lines this bot sent ON ITS OWN (Spouse note preview, med reminder, metronome DM; flagged at
+    // the owner-DM lane in bot-core) are in STM but never in the gateway transcript, which only holds
+    // replies it generated. 2026-11-04: Principal answered a Spouse note preview with "You can send it cy" and
+    // Cy had no idea what "it" was. They fold once, labelled as the companion's own words.
+    .filter((m, idx) => (m.role === "user" || (m.role === "assistant" && (m.selfInitiated === true || crossGateway(m)))) && undelivered(m, idx))
+    .slice(-HERMES_WITNESS_CAP);
+
+  // Witnessed words are other people's and siblings' text: labels made safe, control tokens defused
+  // (recalled-text.ts; invisible on ordinary text, measured 10-27).
+  const folded: string[] = pool.map(m => m.role === "assistant"
+    ? `${crossGateway(m) ? CROSS_GATEWAY_LABEL : SELF_INITIATED_LABEL}: ${m.content.slice(0, HERMES_WITNESS_ITEM_CAP)}`
+    : `[${m.authorName ? labelSafe(m.authorName) : "unattributed"}]: ${neutralizeRecalled(m.content.slice(0, HERMES_WITNESS_ITEM_CAP))}`);
+  // Drop oldest whole turns while over budget -- never tail-slice mid-line (that ate
+  // the attribution prefixes and the front of every long peer message).
+  while (folded.length > 0 && folded.join("\n").length > HERMES_WITNESS_CHAR_CAP) folded.shift();
+
+  const tsOf = (m: T) => (typeof m.timestamp === "number" && Number.isFinite(m.timestamp) ? m.timestamp : null);
+  const newMark = [deliveredThroughTs ?? -Infinity, ...pool.map(tsOf).filter((t): t is number => t !== null), tsOf(current) ?? -Infinity]
+    .reduce((a, b) => Math.max(a, b), -Infinity);
+  const outMark = Number.isFinite(newMark) ? newMark : deliveredThroughTs;
+
+  // Newest timestamp before the live message, any role: own replies count (the gap that matters
+  // is "when did this conversation last move"), and timestamp-less restored turns are skipped.
+  const prevTs = history.slice(0, -1).map(tsOf).filter((t): t is number => t !== null)
+    .reduce<number | null>((a, b) => (a === null || b > a ? b : a), null);
+  const clock = timeLines(prevTs, now, history.length > 1);
+
+  // The speaker label rides ON the live words, not in front of the clock (2026-10-09). The adapter's
+  // `[author]: ` prefix used to land on the first line of content, which is the clock, so the model
+  // saw `[Crash]: [Now: ...]` and then Principal's words on an unlabeled line of their own. "Dre 10/9 I
+  // had a bad day" read as a second name tag plus a date, and Drevan spent the evening calling Principal
+  // by his own name ("Rest tonight, Dre"). On witness turns the live words had no speaker at all,
+  // only `[Live message]`. The label is folded here and authorName cleared so the adapter cannot add
+  // it a second time; "to you" is the address gate's verdict made visible, so a vocative at the front
+  // of the message reads as what it is: someone calling this companion by name.
+  const live = liveLabel(current.authorName, addressedToSelf, calledAs) + neutralizeRecalled(current.content);
+  const labelled = { ...current, authorName: undefined };
+  // Order (2026-10-11, room rendering): background from elsewhere first (oldest, furthest away), then
+  // what this room said since the last turn, then the live words, then the seat frame LAST. Nothing
+  // that someone else said may sit between the live words and the reply.
+  const bg = extras.background ? `${extras.background}\n\n` : "";
+  const frame = (extras.rightNow ? `
+
+${extras.rightNow}` : "") + (extras.facts ? `\n\n${extras.facts}` : "") + (extras.frame ? `\n\n${extras.frame}` : "");
+  if (folded.length === 0) {
+    const liveBlock = bg ? `${bg}[Live message]\n${live}` : live;
+    return { messages: [{ ...labelled, content: `${clock}\n${liveBlock}${frame}` }], deliveredThroughTs: outMark };
+  }
+  return {
+    messages: [{
+      ...labelled,
+      content: `${clock}\n${bg}${WITNESS_HEADER}\n${folded.join("\n")}\n\n[Live message]\n${live}${frame}`,
+    }],
+    deliveredThroughTs: outMark,
+  };
+}

@@ -1,0 +1,113 @@
+import "./net-tuning.js"; // side-effect: must run before any fetch (VPS->Cloudflare ETIMEDOUT fix)
+export * from "./types.js";
+export * from "./off-switch.js";
+export * from "./floor.js";
+export * from "./fit-bid.js";
+export * from "./recall-context.js";
+export * from "./room-tag.js";
+export * from "./rail-telemetry.js";
+export * from "./sequential-floor.js";
+export * from "./pass-turn.js";
+export * from "./sol-sender.js";
+export * from "./sol-reply.js";
+export * from "./reaction-tier.js";
+export * from "./events.js";
+export * from "./librarian.js";
+export * from "./reach-decision.js";
+export * from "./retract-command.js";
+export * from "./retract-bumps.js";
+export * from "./reply-index.js";
+export * from "./pluralkit.js";
+export * from "./pk-roster.js";
+export * from "./inference.js";
+export * from "./channel-config.js";
+export * from "./memory.js";
+export * from "./session-window.js";
+export * from "./stm.js";
+export * from "./heartbeat.js";
+export * from "./write-queue.js";
+export * from "./cycleGuard.js";
+export * from "./convergedCap.js";
+export {
+  VoiceClient, type VoiceClientConfig,
+  VoiceRealtimeSession,
+  VOICE_KEYWORDS, JOIN_KEYWORDS, LEAVE_KEYWORDS,
+  shouldVoice, isInvitation, isLeaveRequest,
+  markVoiceUsed, isVoiceSticky, clearVoiceSticky, STICKY_VOICE_MS,
+} from "./voice.js";
+export * from "./shared-context.js";
+export * from "./prompt-assembly.js";
+export * from "./pronoun-rule.js";
+export * from "./recalled-text.js";
+export * from "./distillation.js";
+export * from "./day-distillation.js";
+export * from "./ledger-clerk.js";
+export * from "./bot-core.js";
+export * from "./bot-message-handler.js";
+export * from "./channel-inbox.js";
+export * from "./discord-send.js";
+export * from "./autonomous-core.js";
+export * from "./response-quality.js";
+export * from "./metronome-decide.js";
+export * from "./make-move.js";
+export { checkMake, makeCheckSelfTest, CHECKED_KINDS } from "./make-check.js";
+export * from "./guard3.js";
+export * from "./need-sort.js";
+export * from "./make-own-time.js";
+export * from "./interest-offer.js";
+export * from "./outward.js";
+export * from "./relative-time.js";
+export * from "./sb-live-ingest.js";
+export { ALL_MODELS, getAvailableModels, type InferenceProvider, type ModelEntry } from "./models.js";
+export {
+  readHermesModelKeys, selectableModels, diagnoseHermesMap, mapDiagnosticLines,
+  DEFAULT_HERMES_MODEL_MAP_PATH, type HermesMapDiagnostic,
+} from "./hermes-model-map.js";
+export * from "./slash-commands.js";
+export * from "./voice-markers.js";
+export * from "./echo-guard.js";
+export * from "./task-check.js";
+export * from "./form-ratchet.js";
+export * from "./self-window.js";
+export * from "./inter-seed-gate.js";
+export * from "./guild-seed.js";
+export * from "./triggers.js";
+export * from "./command-triggers.js";
+export { registerHeartbeatCtx, getHeartbeatCtx } from "./heartbeat-dry-run.js";
+export * from "./care-state.js";
+export * from "./reach-ledger.js";
+export * from "./bad-night.js";
+export * from "./departure-state.js";
+export * from "./ordinary-pass.js";
+export * from "./media.js";
+export * from "./video.js";
+export * from "./vision.js";
+export * from "./vision-cache.js";
+export * from "./club-command.js";
+export * from "./log-command.js";
+export * from "./into-command.js";
+export * from "./watch-command.js";
+export * from "./tools-command.js";
+export * from "./creature-command.js";
+export * from "./imp-command.js";
+export * from "./session-tracker.js";
+export * from "./consolidation.js";
+export * from "./consolidation-narrator.js";
+export * from "./direct-inference.js";
+export * from "./json-extract.js";
+export * from "./thread-spine.js";
+export * from "./director-invite.js";
+export * from "./dm.js";
+export * from "./med-answer.js";
+export * from "./med-answer-classify.js";
+export * from "./med-context.js";
+export * from "./med-reminder.js";
+// The owner-DM lane types (B7 2+2c). reach-dm.ts is deliberately NOT exported here (T-4).
+export type { OwnerDmTarget, OwnerDmLane } from "./owner-dm.js";
+// B37 step 1: the address classifier (pure) and its shadow run (2026-09-29).
+export * from "./address-model.js";
+export * from "./human-address.js";
+export * from "./address-shadow.js";
+export * from "./address-jev.js";
+export * from "./director-jev.js";
+export * from "./facts-pick.js";

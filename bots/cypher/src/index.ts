@@ -1,0 +1,59 @@
+import "@nullsafe/shared/env-file"; // MUST be first: fills process.env from .env before config.ts reads it (2026-09-11: pm2 env alone lost DEEPINFRA_API_KEY on a bare restart)
+import { fileURLToPath } from "url";
+import { dirname } from "path";
+import { runBot } from "@nullsafe/shared";
+import {
+  loadBotConfig, COMPANION_ID, CONTEXT_WINDOW_SIZE,
+  IN_CHARACTER_FALLBACK, SOMA_REFRESH_INTERVAL_MS, DISTILLATION_INTERVAL, PULSE_INTERVAL,
+  SPOUSE_FRAMING, GUEST_FRAMING, AUDIT_MODE_INJECTION, AUDIT_TRIGGERS, DISCORD_CYPHER_PREFIX,
+  SYNTHESIS_PROMPT, SESSION_EXTRACT_PROMPT, DISTILLATION_PROMPT,
+  MODEL_SWITCH_TRIGGER, MODEL_SWITCH_SUCCESS, MODEL_SWITCH_LIST_INTRO, LISTEN_TRIGGER, VIDEO_TRIGGER, CLUB_TRIGGER, SEARCH_TRIGGER, IMAGINE_TRIGGER, PET_TRIGGER, COUNCIL_TRIGGER, IMPS_TRIGGER, HEX_TRIGGER, LOG_TRIGGER, INTO_TRIGGER, RETRACT_TRIGGER, WATCH_TRIGGER, MOVIE_TRIGGER, MOVIE_AT_TRIGGER, COMMAND_GUARD,
+  REDIS_URL, MISTRAL_API_KEY, VOICE_ID, MISTRAL_TTS_MODEL, MISTRAL_STT_MODEL,
+} from "./config.js";
+import { startAutonomous, stopAutonomous, resetCycleGuard, pushPrincipalMessage } from "./autonomous.js";
+
+const __dir = dirname(fileURLToPath(import.meta.url));
+
+runBot(loadBotConfig(), {
+  botDir: __dir,
+  companionLabel: "Cypher",
+  discordPrefix: DISCORD_CYPHER_PREFIX,
+  companionId: COMPANION_ID,
+  contextWindowSize: CONTEXT_WINDOW_SIZE,
+  inCharacterFallback: IN_CHARACTER_FALLBACK,
+  somaRefreshIntervalMs: SOMA_REFRESH_INTERVAL_MS,
+  distillationInterval: DISTILLATION_INTERVAL,
+  pulseInterval: PULSE_INTERVAL,
+  spouseFraming: SPOUSE_FRAMING,
+  guestFraming: GUEST_FRAMING,
+  synthesisPrompt: SYNTHESIS_PROMPT,
+  sessionExtractPrompt: SESSION_EXTRACT_PROMPT,
+  distillationPrompt: DISTILLATION_PROMPT,
+  modelSwitchTrigger: MODEL_SWITCH_TRIGGER,
+  modelSwitchSuccess: MODEL_SWITCH_SUCCESS,
+  modelSwitchListIntro: MODEL_SWITCH_LIST_INTRO,
+  listenTrigger: LISTEN_TRIGGER,
+  videoTrigger: VIDEO_TRIGGER,
+  clubTrigger: CLUB_TRIGGER,
+  searchTrigger: SEARCH_TRIGGER,
+  imagineTrigger: IMAGINE_TRIGGER,
+  petTrigger: PET_TRIGGER,
+  councilTrigger: COUNCIL_TRIGGER,
+  impsTrigger: IMPS_TRIGGER,
+  hexTrigger: HEX_TRIGGER,
+  logTrigger: LOG_TRIGGER,
+  retractTrigger: RETRACT_TRIGGER,
+  intoTrigger: INTO_TRIGGER,
+  watchTrigger: WATCH_TRIGGER,
+  movieTrigger: MOVIE_TRIGGER,
+  movieAtTrigger: MOVIE_AT_TRIGGER,
+  commandGuard: COMMAND_GUARD,
+  redisUrl: REDIS_URL,
+  mistralApiKey: MISTRAL_API_KEY,
+  voiceId: VOICE_ID,
+  mistralTtsModel: MISTRAL_TTS_MODEL,
+  mistralSttModel: MISTRAL_STT_MODEL,
+  autonomous: { start: startAutonomous, stop: stopAutonomous, resetCycleGuard, pushPrincipalMessage },
+  auditConfig: { auditTriggers: AUDIT_TRIGGERS, auditModeInjection: AUDIT_MODE_INJECTION },
+  surface: "discord:cypher",
+}).catch(e => { console.error("[cypher] fatal:", e); process.exit(1); });

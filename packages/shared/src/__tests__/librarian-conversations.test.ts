@@ -1,0 +1,155 @@
+import { jest, describe, it, expect } from "@jest/globals";
+import { LibrarianClient } from "../librarian.js";
+
+function makeClient(mockFetch: ReturnType<typeof jest.fn>) {
+  return new LibrarianClient({
+    url: "https://example.com",
+    secret: "test-secret",
+    companionId: "cypher",
+    fetch: mockFetch as unknown as typeof fetch,
+  });
+}
+
+describe("LibrarianClient.convoActive()", () => {
+  it("returns null when body has thread:null", async () => {
+    const mockFetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ thread: null }),
+    } as any);
+    const client = makeClient(mockFetch);
+    const result = await client.convoActive("chan-1");
+    expect(result).toBeNull();
+  });
+
+  it("returns dto+ledger when a thread is active", async () => {
+    const thread = {
+      id: "t1", channel_id: "chan-1", seed_text: "seed", seed_author: "principal",
+      ref_type: null, ref_id: null, ref_label: null,
+      state: "open", turn_count: 2, last_turn_at: "2026-07-21T00:00:00Z",
+    };
+    const ledger = [
+      { author: "principal", gist: "asked about spine", said_at: "2026-07-20T23:59:00Z" },
+      { author: "cypher", gist: "explained the design", said_at: "2026-07-21T00:00:00Z" },
+    ];
+    const mockFetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ thread, ledger }),
+    } as any);
+    const client = makeClient(mockFetch);
+    const result = await client.convoActive("chan-1");
+    expect(result).toEqual({ thread, ledger });
+  });
+
+  // CONTRACT CHANGE 2026-08-05. This used to return null on non-ok, which conflated four
+  // situations into one value. Harmless while the only caller was ensureThread ("no thread? open
+  // one"), and a live hazard the moment the commons seed started reading it: `!spine` means
+  // new-ground mode, so a Halseth 500 would not degrade the commons to its old behaviour -- it
+  // would MUTE it (history withheld, fresh material required, silence without it). `null` now
+  // means exactly one thing: Halseth answered and there is no active thread.
+  it("THROWS on a non-ok response -- null is reserved for 'answered, no thread'", async () => {
+    const mockFetch = jest.fn().mockResolvedValue({ ok: false, status: 500 } as any);
+    const client = makeClient(mockFetch);
+    await expect(client.convoActive("chan-1")).rejects.toThrow("convoActive 500");
+  });
+
+  it("THROWS on a transport failure rather than reporting an empty channel", async () => {
+    const mockFetch = jest.fn().mockRejectedValue(new Error("ETIMEDOUT"));
+    const client = makeClient(mockFetch);
+    await expect(client.convoActive("chan-1")).rejects.toThrow("ETIMEDOUT");
+  });
+
+  it("returns null ONLY when the body says there is no thread", async () => {
+    const mockFetch = jest.fn().mockResolvedValue({ ok: true, json: async () => ({ thread: null }) } as any);
+    const client = makeClient(mockFetch);
+    expect(await client.convoActive("chan-1")).toBeNull();
+  });
+});
+
+describe("LibrarianClient.convoOpen()", () => {
+  it("posts the correct URL and JSON body to /mind/conversations", async () => {
+    const thread = {
+      id: "t2", channel_id: "chan-1", seed_text: "seed text", seed_author: "principal",
+      ref_type: null, ref_id: null, ref_label: null,
+      state: "open", turn_count: 0, last_turn_at: "2026-07-21T00:00:00Z",
+    };
+    const mockFetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ thread, created: true }),
+    } as any);
+    const client = makeClient(mockFetch);
+    const params = { channel_id: "chan-1", seed_text: "seed text", seed_author: "principal" };
+    const result = await client.convoOpen(params);
+
+    expect(result).toEqual(thread);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const [url, init] = mockFetch.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://example.com/mind/conversations");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body as string)).toEqual(params);
+    expect((init.headers as Record<string, string>)["Authorization"]).toBe("Bearer test-secret");
+  });
+
+  it("returns null when fetch throws (fail-open)", async () => {
+    const mockFetch = jest.fn().mockRejectedValue(new Error("network down"));
+    const client = makeClient(mockFetch);
+    const result = await client.convoOpen({ channel_id: "chan-1", seed_text: "s", seed_author: "principal" });
+    expect(result).toBeNull();
+  });
+
+  it("returns null on non-ok response", async () => {
+    const mockFetch = jest.fn().mockResolvedValue({ ok: false, status: 400 } as any);
+    const client = makeClient(mockFetch);
+    const result = await client.convoOpen({ channel_id: "chan-1", seed_text: "s", seed_author: "principal" });
+    expect(result).toBeNull();
+  });
+});
+
+describe("LibrarianClient.convoTurn()", () => {
+  it("posts to the turns endpoint and resolves on success", async () => {
+    const mockFetch = jest.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true }) } as any);
+    const client = makeClient(mockFetch);
+    await client.convoTurn("t1", { author: "cypher", gist: "replied" });
+    const [url, init] = mockFetch.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://example.com/mind/conversations/t1/turns");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body as string)).toEqual({ author: "cypher", gist: "replied" });
+  });
+
+  it("does not throw on 409 (terminal thread, warn-only)", async () => {
+    const mockFetch = jest.fn().mockResolvedValue({ ok: false, status: 409 } as any);
+    const client = makeClient(mockFetch);
+    await expect(client.convoTurn("t1", { author: "cypher", gist: "too late" })).resolves.toBeUndefined();
+  });
+
+  it("does not throw on network failure", async () => {
+    const mockFetch = jest.fn().mockRejectedValue(new Error("timeout"));
+    const client = makeClient(mockFetch);
+    await expect(client.convoTurn("t1", { author: "cypher", gist: "x" })).resolves.toBeUndefined();
+  });
+});
+
+describe("LibrarianClient.convoLand()", () => {
+  it("returns true on ok response", async () => {
+    const mockFetch = jest.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true }) } as any);
+    const client = makeClient(mockFetch);
+    const result = await client.convoLand("t1", { resolution: "resolved", landed_by: "cypher" });
+    expect(result).toBe(true);
+    const [url, init] = mockFetch.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://example.com/mind/conversations/t1/land");
+    expect(JSON.parse(init.body as string)).toEqual({ resolution: "resolved", landed_by: "cypher" });
+  });
+
+  it("returns false on a 409 response", async () => {
+    const mockFetch = jest.fn().mockResolvedValue({ ok: false, status: 409 } as any);
+    const client = makeClient(mockFetch);
+    const result = await client.convoLand("t1", { resolution: "resolved", landed_by: "cypher" });
+    expect(result).toBe(false);
+  });
+
+  it("returns false on network failure (fail-open)", async () => {
+    const mockFetch = jest.fn().mockRejectedValue(new Error("network down"));
+    const client = makeClient(mockFetch);
+    const result = await client.convoLand("t1", { resolution: "resolved", landed_by: "cypher" });
+    expect(result).toBe(false);
+  });
+});

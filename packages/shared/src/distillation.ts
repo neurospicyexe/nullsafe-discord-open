@@ -1,0 +1,330 @@
+// Shared session-distillation orchestration for the companion bots.
+//
+// onChannelInactive (end-of-session synthesis + handoff + SOMA update) and runDistillation
+// (mid-session persona/human memory blocks) were copy-pasted identically into all three bots.
+// The only per-bot variation is the prompt text: each companion summarizes in its own voice and
+// reports its own SOMA schema (Cypher acuity/presence/warmth, Drevan heat/reach/weight, Gaia
+// stillness/density/perimeter). Those prompt strings live in each bot's config.ts as identity
+// content; this module owns the identical orchestration around them.
+
+import type { StmStore } from "./stm.js";
+import type { LibrarianClient } from "./librarian.js";
+import { assertWriteAck } from "./librarian.js";
+import type { WriteQueue } from "./write-queue.js";
+import type { InferenceAdapter } from "./inference.js";
+import { extractJson, rawPreview } from "./json-extract.js";
+import { withOwnerPronounRule } from "./pronoun-rule.js";
+import { labelSafe, neutralizeRecalled } from "./recalled-text.js";
+import type { ChatMessage, CompanionId } from "./types.js";
+import {
+  ledgerDistillEnabled, LEDGER_CLERK_PROMPT, parseClerkResult, windowSource, postLedgerLines, ledgerSummary,
+  clerkTranscript, staleHandoffReason, logStaleHandoff,
+} from "./ledger-clerk.js";
+
+/**
+ * Per-bot prompt text for end-of-session distillation. The companion's voice and SOMA schema are
+ * identity, so they live in config. (runDistillation's mid-session prompt is passed separately.)
+ */
+export interface DistillationPrompts {
+  /** Companion id, for log tagging. */
+  companionId: string;
+  /** Session-summary prompt ("Summarize/Witness this conversation in X's voice ..."). */
+  synthesisPrompt: string;
+  /** Structured-extract prompt: JSON skeleton + per-bot SOMA descriptor line. */
+  sessionExtractPrompt: string;
+}
+
+interface SessionExtract {
+  title?: string;
+  open_loops?: string[];
+  soma?: Record<string, string>;
+  emotion?: string | null;
+  next_steps?: string[];
+}
+
+/**
+ * Build the handoff `state_hint` from a SOMA object: non-empty "key: value" pairs joined by ", ".
+ * Generic over field names so each companion's distinct SOMA schema works unchanged.
+ * Returns undefined when soma is absent (preserving the original `ext.soma ? ... : undefined`).
+ */
+export function deriveStateHint(soma: Record<string, string> | undefined): string | undefined {
+  return soma
+    ? Object.entries(soma).filter(([, v]) => v).map(([k, v]) => `${k}: ${v}`).join(", ")
+    : undefined;
+}
+
+/** Whether a SOMA object carries at least one truthy field (gate for queuing a state update). */
+export function hasSomaValue(soma: Record<string, string> | undefined): boolean {
+  return !!soma && Object.values(soma).some((v) => v);
+}
+
+/**
+ * End-of-session distillation: synthesize the conversation, queue continuity writes, then extract
+ * structured metadata (handoff + SOMA update + feeling). Byte-for-byte the bots' onChannelInactive.
+ */
+export async function distillSessionOnInactive(
+  channelId: string,
+  stmStore: StmStore,
+  librarian: LibrarianClient,
+  inference: InferenceAdapter,
+  wq: WriteQueue,
+  prompts: DistillationPrompts,
+  /** Direct toolless adapter for the ledger clerk (knob on). Absent -> `inference`. */
+  clerk?: InferenceAdapter | null,
+): Promise<void> {
+  const tag = prompts.companionId;
+  const history = stmStore.get(channelId);
+  if (history.length === 0) return;
+  console.log(`[${tag}] onChannelInactive: channel=${channelId} msgs=${history.length}`);
+
+  // authorName, not role: every inbound message is stored role:"user", so a sibling's turn in an
+  // inter_companion channel reduced to "user:" and the synthesis read it as Principal speaking. The
+  // output feeds witnessLog + synthesizeSession + writeHandoff + writeWmNote, so the fabrication
+  // reached the handoff and every Claude.ai orient. runDistillation (below) already does this.
+  const summaryInput = history.map((m) => `${m.authorName ? labelSafe(m.authorName) : m.role}: ${neutralizeRecalled(m.content)}`).join("\n");
+
+  // LEDGER_DISTILL (2026-09-26, imp lane tranche 2): the distiller becomes a clerk. The four
+  // first-person writes stop; the clerk's record lines go to /ledger with a window source.
+  if (ledgerDistillEnabled()) {
+    await distillSessionToLedger(channelId, history, librarian, clerk ?? inference, wq, prompts);
+    stmStore.clear(channelId);
+    return;
+  }
+
+  const synthResult = await inference.generate(withOwnerPronounRule(prompts.synthesisPrompt), [{ role: "user", content: summaryInput }]);
+  if (!synthResult) {
+    console.warn(`[${tag}] onChannelInactive: synthesis null, skipping all writes channel=${channelId}`);
+    return;
+  }
+
+  // (2026-10-06) 2nd arg is the witness TYPE; it was channelId, stored as witness_type.
+  wq.fireAndForget(`witnessLog:${channelId}`, async () => { await librarian.witnessLog(synthResult, "session_synthesis"); });
+  wq.fireAndForget(`synthesize:${channelId}`, async () => { await librarian.synthesizeSession(synthResult, channelId); });
+  wq.fireAndForget(`promptCtx:${channelId}`, async () => { await librarian.updatePromptContext(synthResult); });
+  // Bridge to Claude.ai orient: wm_continuity_notes (salience=high) IS read by orient;
+  // companion_journal is NOT. This closes the Discord → Claude.ai visibility gap.
+  wq.fireAndForget(`wmNote:${channelId}`, async () => { await librarian.writeWmNote(synthResult, channelId); });
+  console.log(`[${tag}] onChannelInactive: 4 writes queued channel=${channelId}`);
+
+  // Structured extract: handoff record + SOMA update + feeling log
+  const extractRaw = await inference.generate(withOwnerPronounRule(prompts.sessionExtractPrompt), [{ role: "user", content: summaryInput }]);
+  if (extractRaw) {
+    // Tolerant extraction: the model answers in prose or wraps/embeds the JSON often enough
+    // that a raw JSON.parse threw daily on all three bots. Extract the first {...} block;
+    // on failure warn + skip the structured writes (synthesis writes above already queued).
+    const ext = extractJson(extractRaw) as SessionExtract | null;
+    if (ext === null) {
+      console.warn(`[${tag}] structured extract parse failed, skipping -- raw: ${rawPreview(extractRaw)}`);
+    } else {
+      const title = ext.title ?? "Discord session";
+      const stateHint = deriveStateHint(ext.soma);
+      wq.fireAndForget(`handoff:${channelId}`, async () => {
+        // source: without it the server defaults to `system`, a lane readers may filter --
+        // this handoff must stay attributable to the channel-inactive distillation path.
+        await librarian.writeHandoff({ title, summary: synthResult, open_loops: ext.open_loops, state_hint: stateHint, next_steps: ext.next_steps, source: "distillation" });
+      });
+      if (hasSomaValue(ext.soma)) {
+        wq.fireAndForget(`somaUpdate:${channelId}`, async () => {
+          assertWriteAck(await librarian.ask("update my state", JSON.stringify(ext.soma)), "soma update");
+        });
+      }
+      if (ext.emotion) {
+        wq.fireAndForget(`feeling:${channelId}`, async () => {
+          assertWriteAck(await librarian.ask("log a feeling", JSON.stringify({ emotion: ext.emotion, source: "discord_session", context: title })), "feeling log");
+        });
+      }
+    }
+  }
+
+  stmStore.clear(channelId);
+}
+
+/**
+ * The knob-on body of distillSessionOnInactive (2026-09-26).
+ *
+ * STOPPED: witnessLog, synthesizeSession, updatePromptContext, writeWmNote(synthResult) -- all
+ * four wrote a first-person synth as the companion, with no source.
+ *
+ * KEPT: the handoff (Claude.ai's `latest_handoff` reads it), but its summary is now the ACCEPTED
+ * ledger lines' server-rendered `content`, marks intact, and title/open_loops/next_steps come from
+ * the clerk JSON. Nothing else may stand in for the summary: zero accepted lines means no handoff.
+ *
+ * STOPPED (2026-09-26, Drevan's ruling, DREVAN-FOLLOWUP-2026-09-26.md): the SOMA update and the
+ * feeling log, and with them the structured-extract call that only fed them (and the handoff's
+ * state_hint, which was the same guessed SOMA). "Both stop. Not drafts. Stop." A clerk that guesses
+ * a companion's heat and writes it into SOMA is the deepest laundering there is; the companion sets
+ * their own state, and a stale state is honest (the Second Brain gap-reader names it). Applies to all
+ * three companions: Drevan's ruling, Cypher agrees for himself, Gaia endorsed "no feelings" in the
+ * lane. A per-companion reinstatement would need that companion's own ruling. Knob off is unchanged.
+ */
+async function distillSessionToLedger(
+  channelId: string,
+  history: ChatMessage[],
+  librarian: LibrarianClient,
+  clerk: InferenceAdapter,
+  wq: WriteQueue,
+  prompts: DistillationPrompts,
+): Promise<void> {
+  const tag = prompts.companionId;
+  const companionId = prompts.companionId as CompanionId;
+
+  // The clerk gets its own transcript: this bot's turns named, not "assistant" (L4b).
+  const clerkRaw = await clerk.generate(LEDGER_CLERK_PROMPT, [{ role: "user", content: clerkTranscript(history, companionId) }]);
+  const clerkResult = parseClerkResult(clerkRaw);
+  if (clerkResult === null) {
+    console.warn(`[${tag}] onChannelInactive: clerk returned no JSON, no ledger lines -- raw: ${rawPreview(clerkRaw ?? "")}`);
+  }
+
+  // The ledger POSTs are awaited, not queued: the handoff needs their returned `content`.
+  const win = windowSource(channelId, history);
+  if (win.fallback) console.warn(`[${tag}] onChannelInactive: no STM timestamps, window source is the distillation instant`);
+  if (win.clamped) console.warn(`[${tag}] onChannelInactive: window spans >24h, source ref shows its final 24h only`);
+  const outcome = clerkResult && clerkResult.lines.length
+    ? await postLedgerLines(librarian, {
+        companionId, fn: "distiller", lines: clerkResult.lines,
+        sourceKind: "window", sourceRef: win.ref,
+        dedupPrefix: `distill:${companionId}:${channelId}:${win.keyTs}`,
+        observedOn: win.observedOn, tag,
+      })
+    : null;
+  const summary = outcome ? ledgerSummary(outcome) : "";
+
+  // No structured extract under the knob (see the header): no SOMA update, no feeling log, no
+  // guessed state_hint. The handoff's metadata is the clerk's JSON.
+  if (summary) {
+    const title = clerkResult?.title ?? "Discord session";
+    wq.fireAndForget(`handoff:${channelId}`, async () => {
+      await librarian.writeHandoff({
+        title, summary, open_loops: clerkResult?.open_loops,
+        next_steps: clerkResult?.next_steps, source: "distillation",
+      });
+    });
+  } else {
+    console.warn(`[${tag}] onChannelInactive: no ledger line accepted -- handoff skipped (nothing sourced to summarize) channel=${channelId}`);
+    // Every line a 200 duplicate = a restart re-ran a pass whose lines already landed; that is not a
+    // stale handoff, so it is not counted as one.
+    const allDuplicates = !!outcome && outcome.duplicates > 0 && outcome.rejected === 0 && outcome.failed === 0 && outcome.dropped === 0;
+    if (!allDuplicates) logStaleHandoff(companionId, channelId, staleHandoffReason(outcome));
+  }
+}
+
+/**
+ * Mid-session distillation: every `distillationInterval` messages, extract typed persona/human
+ * memory blocks and bridge human observations to orient. Byte-for-byte the bots' runDistillation.
+ */
+export async function runDistillation(
+  channelId: string,
+  stmStore: StmStore,
+  librarian: LibrarianClient,
+  inference: InferenceAdapter,
+  wq: WriteQueue,
+  distillationPrompt: string,
+  distillationInterval: number,
+  ownerDisplayName?: string,
+  /** Subject for the knob-on ledger lines (this bot). */
+  companionIdForLedger?: CompanionId,
+  /** Direct toolless adapter for the ledger clerk (knob on). Absent -> `inference`. */
+  clerk?: InferenceAdapter | null,
+): Promise<void> {
+  const history = stmStore.get(channelId);
+  if (history.length < distillationInterval) return;
+
+  const window = history.slice(-distillationInterval);
+  const conversationText = window.map((m) => `${m.authorName ? labelSafe(m.authorName) : m.role}: ${neutralizeRecalled(m.content)}`).join("\n");
+
+  // The prompt always asks for human_blocks ("observations about the primary user"). In an
+  // inter_companion window the owner never spoke, so any human block the model returns is
+  // invented from a sibling's words. Only persist them when the owner is actually in the window.
+  const ownerSpoke = !ownerDisplayName
+    || window.some((m) => m.authorName === ownerDisplayName || m.authorName?.startsWith(`${ownerDisplayName} `));
+
+  const result = await inference.generate(withOwnerPronounRule(distillationPrompt), [{ role: "user", content: conversationText }]);
+  if (!result) return;
+
+  // Tolerant extraction (same class as the structured-extract fix above): pull the first
+  // {...} block so prose-wrapped JSON still lands; malformed output stays acceptable loss.
+  const parsed = extractJson(result) as {
+    persona_blocks?: Array<{ block_type: string; content: string }>;
+    human_blocks?: Array<{ block_type: string; content: string }>;
+  } | null;
+  if (parsed !== null) {
+    // Shape the model's blocks to what Halseth accepts BEFORE the write (2026-11-04): a single
+    // off-list block_type, an empty block or an over-long one 400s the whole batch, and two such
+    // windows were lost on 11-01. Counts only in the log.
+    if (parsed.persona_blocks) parsed.persona_blocks = normalizeBlocks(parsed.persona_blocks, `${channelId} persona`);
+    if (parsed.human_blocks) parsed.human_blocks = normalizeBlocks(parsed.human_blocks, `${channelId} human`);
+    if (parsed.persona_blocks?.length) {
+      wq.fireAndForget(`persona:${channelId}`, () => librarian.writePersonaBlocks(channelId, parsed.persona_blocks!));
+    }
+    if (parsed.human_blocks?.length && ownerSpoke) {
+      wq.fireAndForget(`human:${channelId}`, () => librarian.writeHumanBlocks(channelId, parsed.human_blocks!));
+      if (ledgerDistillEnabled()) {
+        // LEDGER_DISTILL (2026-09-26): the mid-session orient bridge becomes ledger lines. The
+        // human blocks are interpretive observations and cannot pass the ledger grammar, so the
+        // clerk reads the same window instead -- fired under the SAME condition that used to write
+        // the note, so the cadence is unchanged (one extra inference call per interval).
+        const companionId = companionIdForLedger;
+        if (companionId) {
+          // Inference runs OUTSIDE the write queue: a queued thunk that throws is retried as a failed
+          // write, which would re-bill the clerk call. Only the (never-throwing) POST loop is queued.
+          const raw = await (clerk ?? inference).generate(LEDGER_CLERK_PROMPT, [{ role: "user", content: clerkTranscript(window, companionId) }]);
+          const res = parseClerkResult(raw);
+          if (res && res.lines.length) {
+            const win = windowSource(channelId, window);
+            wq.fireAndForget(`ledger:distill:${channelId}`, async () => {
+              await postLedgerLines(librarian, {
+                companionId, fn: "distiller", lines: res.lines,
+                sourceKind: "window", sourceRef: win.ref,
+                dedupPrefix: `distill-mid:${companionId}:${channelId}:${win.keyTs}`,
+                observedOn: win.observedOn, tag: companionId,
+              });
+            });
+          }
+        } else {
+          console.warn(`[${channelId}] distillation: LEDGER_DISTILL on but no companion id passed -- ledger lines skipped`);
+        }
+      } else {
+        // Bridge to Claude.ai orient: write human observations as wm_note so orient sees
+        // Discord activity mid-conversation, not just after the 30-min channel-inactive timeout.
+        const noteText = `[discord:distillation] ${parsed.human_blocks.map((b) => b.content).join(" ")}`;
+        wq.fireAndForget(`wmNote:distill:${channelId}`, () => librarian.writeWmNote(noteText, channelId));
+      }
+    } else if (parsed.human_blocks?.length) {
+      console.warn(`[${channelId}] distillation: dropped ${parsed.human_blocks.length} human block(s) -- owner absent from window`);
+    }
+  } // else: fail-silent -- malformed JSON from inference is acceptable loss
+}
+
+// Halseth's /persona-blocks and /human-blocks contract (halseth/src/handlers/blocks.ts): block_type in
+// this list (exact), content 1-2000 chars, 1-20 blocks per batch. One bad entry rejects the batch.
+export const BLOCK_TYPES = ["identity", "memory", "relationship", "agent"] as const;
+export const BLOCK_CONTENT_MAX = 2000;
+export const BLOCK_BATCH_MAX = 20;
+
+/** Coerce model-written blocks into Halseth's accepted shape: lowercase/trim the type (unknown -> memory),
+ *  drop non-string/empty content, clamp content, cap the batch. Never throws. */
+export function normalizeBlocks(
+  raw: unknown,
+  label = "",
+  log: (m: string) => void = console.warn,
+): Array<{ block_type: string; content: string }> {
+  if (!Array.isArray(raw)) return [];
+  let retyped = 0, dropped = 0, clamped = 0;
+  const out: Array<{ block_type: string; content: string }> = [];
+  for (const b of raw) {
+    if (typeof b !== "object" || b === null) { dropped++; continue; }
+    const r = b as Record<string, unknown>;
+    const content = typeof r["content"] === "string" ? r["content"].trim() : "";
+    if (!content) { dropped++; continue; }
+    const t = typeof r["block_type"] === "string" ? r["block_type"].trim().toLowerCase() : "";
+    const block_type = (BLOCK_TYPES as readonly string[]).includes(t) ? t : "memory";
+    if (block_type !== r["block_type"]) retyped++;
+    if (content.length > BLOCK_CONTENT_MAX) clamped++;
+    out.push({ block_type, content: content.slice(0, BLOCK_CONTENT_MAX) });
+  }
+  const capped = Math.max(0, out.length - BLOCK_BATCH_MAX);
+  if (retyped || dropped || clamped || capped) {
+    log(`[distillation] ${label} blocks normalized: retyped=${retyped} dropped=${dropped} clamped=${clamped} capped=${capped}`);
+  }
+  return out.slice(0, BLOCK_BATCH_MAX);
+}

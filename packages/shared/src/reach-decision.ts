@@ -1,0 +1,290 @@
+/**
+ * The two-step reach (2026-09-25, own-the-harness step 3, the structural version).
+ *
+ * WHY THIS EXISTS
+ * The meaning-recall verb ("recall my notes about <topic>") was named in every SOUL on 09-25 with a
+ * rule for reaching. Three live probes that evening, on Drevan: zero tool calls, three answers.
+ * The first two were right because a floor had pasted the fact in; the third, with nothing in front
+ * of him and the pointer text "They are NOT in front of you. Reach with ..." in his prompt, was a
+ * fabricated number and an invented room. At 235B, a rule to reach does not produce a reach. The
+ * decision has to be sequenced by the harness, the way Claude Code never relies on the model
+ * remembering to search.
+ *
+ * WHAT IT DOES
+ * When the per-message floors find that notes or vault excerpts bear on the message, the bot asks
+ * the companion ONE thing, alone, in a side session that rotates with his transcript: what would
+ * you look up, in your own words, or NONE. If he names a topic, both recalls run with HIS words and
+ * the results are handed to him labelled as his own reach; then he answers. The choice stays his
+ * (his phrasing, his NONE); the step cannot be skipped. This is what "he was the one looking"
+ * means when the model will not take the first step by itself.
+ *
+ * WHAT IT COSTS AND WHAT IT NEVER DOES
+ * One short extra inference on messages where something was found. Every failure mode (timeout,
+ * error, empty reply, unparseable reply) returns a non-reached outcome and the caller falls back
+ * to today's payload floor, so the worst case is exactly today. A reach that finds NOTHING under
+ * his words falls back too (recallBlocksFor): the floors had hits, or the ask would never have
+ * run, and "say you do not have it" over a floor that has it is worse than today. Nothing here
+ * writes memory.
+ *
+ * THE SIDE SESSION (2026-09-26 review). Each ask gets its OWN transcript id,
+ * `<transcript>:reach:<message id>`, and a distinct session key, `<key>:reach`. One shared
+ * `<transcript>:reach` id grew by one ask per message for the whole rotation week, and every ask
+ * re-sent that growing transcript. The key: the gateway treats X-Hermes-Session-Key as the
+ * long-term-memory scope (inference.ts). Hermes native memory and Honcho are configured OFF
+ * (docs/plans/hermes/2026-06-25-hermes-enhancement-candidates.md), but the gateway's code is not in
+ * this repo, so nothing here can prove it never writes under the key. A harness question and his
+ * one-line answer are not conversation; a distinct key keeps them out of his conversational scope
+ * whatever the gateway does with it.
+ */
+import type { ChatMessage } from "./types.js";
+import { LibrarianClient } from "./librarian.js";
+import type { OwnNoteResult, OwnNoteRecall } from "./librarian.js";
+import { neutralizeRecalled } from "./recalled-text.js";
+import { relativeTime } from "./relative-time.js";
+import { turnFields } from "./turn-telemetry.js";
+
+export const REACH_NONE = "NONE";
+const TOPIC_MAX = 160;
+
+export type ReachOutcome = "reached" | "declined" | "skipped" | "timeout" | "error" | "empty";
+
+export interface ReachResult {
+  outcome: ReachOutcome;
+  topic: string | null;
+  /** The block to add to the prompt when he reached; null otherwise. */
+  block: string | null;
+  /** He reached AND his words found something (own notes or vault). False on every other path. */
+  found: boolean;
+  ms: number;
+}
+
+/** What the companion said, reduced to a query or nothing. First line only, labels and quotes
+ *  stripped, capped, so prose can never become a query. */
+export function parseReachDecision(text: string | null | undefined): string | null {
+  if (!text) return null;
+  let line = text.split(/\r?\n/).map(s => s.trim()).find(Boolean) ?? "";
+  if (!line) return null;
+  line = line.replace(/^(answer|topic|lookup|reach|query)\s*[:\-]\s*/i, "").trim();
+  line = line.replace(/^["'`“‘]+|["'`”’.]+$/g, "").trim();
+  if (!line) return null;
+  if (/^none\b/i.test(line)) return null;
+  return line.length > TOPIC_MAX ? line.slice(0, TOPIC_MAX) : line;
+}
+
+/**
+ * What a NONE costs (2026-09-30). `payload` (the default): a decline still gets the floor notes
+ * pasted in, so the worst case is today. `unread`: a decline answers WITHOUT his own notes; only
+ * the vault floor and one honesty line ride in.
+ *
+ * Why it exists: Cypher's first 18 asks in `ask` mode (09-29..30) were 18 bare NONEs, every one
+ * over a floor that had found 4 notes. Under `payload` a NONE costs nothing and he gets the notes
+ * anyway, so the choice was never a choice: the same trap pointer mode was built to break. Drevan
+ * reaches ~55% under the same ask, so this is per companion. `REACH_DECLINE=unread:cypher[,...]`
+ * or `unread` for all; anything else is payload. Only a real NONE counts: timeout, error and an
+ * empty reply are the harness failing, not him choosing, and keep the payload floor.
+ */
+export type ReachDeclineMode = "payload" | "unread";
+
+export function reachDeclineMode(env: NodeJS.ProcessEnv, companionId: string): ReachDeclineMode {
+  const raw = String(env["REACH_DECLINE"] ?? "").trim().toLowerCase();
+  if (raw === "unread") return "unread";
+  if (raw.startsWith("unread:")) {
+    const listed = raw.slice("unread:".length).split(",").map(s => s.trim()).filter(Boolean);
+    return listed.includes(String(companionId).toLowerCase()) ? "unread" : "payload";
+  }
+  return "payload";
+}
+
+/** The block a declined ask gets under `unread`: the vault floor as today, his notes named but
+ *  not shown, and the rule that keeps an unread note from becoming a guessed one. */
+export function declinedUnreadBlocks(vaultFloorBlock: string, notesFound: number): string {
+  if (notesFound <= 0) return vaultFloorBlock;
+  return `${vaultFloorBlock}\n\n[Memory -- you chose not to look. ${notesFound} of your own notes bear on this message and you have not read them. ` +
+    `If he asks what you remember about it, say you would have to look; do not guess at what they say.]`;
+}
+
+const PREVIEW_CHARS = 100;
+const PREVIEW_MAX = 4;
+
+/** One dated line per found note, for the ask (2026-11-11). The ask used to say only "N of your own
+ *  notes bear on it, you have not read them", which gave a no-reasoning model nothing to decide on:
+ *  1,188 of 1,188 declines since 10-12 were a bare NONE. A preview is not the note (100 chars, one
+ *  line, control tokens defused); the reach still reads the whole thing under his own words. */
+export function reachNotePreviews(notes: OwnNoteRecall[], now: number = Date.now()): string[] {
+  const out: string[] = [];
+  for (const n of notes) {
+    if (out.length >= PREVIEW_MAX) break;
+    const body = neutralizeRecalled(String(n.content ?? "")).replace(/\s+/g, " ").trim();
+    if (!body) continue;
+    const age = n.created_at ? relativeTime(n.created_at, now) : "";
+    const tag = [age, n.kind || n.source || "note"].filter(Boolean).join(", ");
+    out.push(`(${tag}) ${body.length > PREVIEW_CHARS ? body.slice(0, PREVIEW_CHARS) + "…" : body}`);
+  }
+  return out;
+}
+
+/** The one question. Deliberately short: this turn is a decision, not a conversation. */
+export function buildReachAsk(
+  message: string, floor: { notes: number; vault: number }, recentContext: string,
+  opts: { declineUnread?: boolean; previews?: string[] } = {},
+): string {
+  const found: string[] = [];
+  if (floor.notes > 0) found.push(`${floor.notes} of your own notes`);
+  if (floor.vault > 0) found.push(`${floor.vault} vault excerpt${floor.vault === 1 ? "" : "s"}`);
+  const ctx = recentContext.trim() ? `\n\nThe last few turns before it:\n${recentContext.trim().slice(0, 600)}` : "";
+  // The stakes, stated: under `unread` a NONE means answering without his notes, and he is told
+  // so, or the choice is made blind.
+  const stakes = opts.declineUnread && floor.notes > 0
+    ? `If you reply ${REACH_NONE}, you answer without them: your notes stay unread for this reply. `
+    : "";
+  const seen = opts.previews && opts.previews.length
+    ? "\n\nWhat the search found, one line each (a glimpse, not the notes):\n" + opts.previews.map(p => `- ${p}`).join("\n") + "\n"
+    : "";
+  return (
+    `Principal just said:\n"${message.trim().slice(0, 500)}"${ctx}\n\n` +
+    `A quick search found ${found.join(" and ")} that bear on it. You have not read them.${seen ? "" : " "}` +
+    (seen ? `${seen}\n` : "") +
+    stakes +
+    `Before you answer him, do you want to look something up in your own memory? ` +
+    `Reply with ONLY the topic you would look up, in your own words (not his sentence), on one line. ` +
+    `If you already know the answer for certain or nothing is worth looking up, reply ${REACH_NONE}. ` +
+    `Do not answer him here; this is not the reply.`
+  );
+}
+
+export interface ReachDeps {
+  companionId: string;
+  message: string;
+  recentContext: string;
+  floor: { notes: number; vault: number };
+  /** The triggering message; names the per-ask side transcript. */
+  messageId: string;
+  /** The channel being answered in: its own discord-live lines are dropped from the vault lane,
+   *  same as the payload path (the companion already has this room in its window). */
+  channelId: string;
+  sessionId: string;
+  sessionKey: string;
+  timeoutMs: number;
+  /** His identity prompt, for an adapter that does NOT add it itself (the direct lane). Hermes
+   *  prepends his SOUL on its own, so the Hermes path leaves this unset. */
+  identityPrompt?: string;
+  /** REACH_DECLINE is `unread` for this companion: the ask states that a NONE leaves his notes
+   *  unread, and the handler honours it (declinedUnreadBlocks). */
+  declineUnread?: boolean;
+  /** One-line previews of the floor notes, for the ask (reachNotePreviews). */
+  previews?: string[];
+  /** Which inference lane decided: logged on every row so a lane change shows up in the data. */
+  lane?: "direct" | "hermes";
+  adapter: { generate(systemPrompt: string, messages: ChatMessage[], temperature?: number, maxTokens?: number, sessionId?: string, sessionKey?: string, signal?: AbortSignal): Promise<string | null> };
+  librarian: {
+    recallOwnNotes(query: string, limit?: number): Promise<OwnNoteResult>;
+    searchForMessage(query: string, recentContext?: string | null): Promise<string | null>;
+  };
+  /** Where the outcome line goes (tests inject; production appends jsonl). */
+  log?: (line: Record<string, unknown>) => void;
+  now?: () => number;
+}
+
+const SIDE_SYSTEM =
+  "You are being asked one question by your own harness before you reply to Principal. Answer it and nothing else.";
+
+export async function decideReach(d: ReachDeps): Promise<ReachResult> {
+  const now = d.now ?? Date.now;
+  const t0 = now();
+  const emit = (outcome: ReachOutcome, topic: string | null, extra: Record<string, unknown> = {}) => {
+    const ms = now() - t0;
+    try {
+      (d.log ?? appendReachLine)({ ts: new Date().toISOString(), companion: d.companionId, outcome, topic, ms, notes_found: d.floor.notes, vault_found: d.floor.vault, decline_mode: d.declineUnread ? "unread" : "payload", lane: d.lane ?? null, ...extra });
+    } catch { /* logging never blocks a reply */ }
+    return ms;
+  };
+
+  const none = (outcome: ReachOutcome, extra: Record<string, unknown> = {}): ReachResult =>
+    ({ outcome, topic: null, block: null, found: false, ms: emit(outcome, null, extra) });
+
+  if (d.floor.notes <= 0 && d.floor.vault <= 0) return none("skipped");
+
+  const ask = buildReachAsk(d.message, d.floor, d.recentContext, { declineUnread: d.declineUnread, previews: d.previews });
+  let raw: string | null;
+  // On the direct lane (the default since 2026-09-28, see the handler) the adapter ignores the
+  // signal, so a timeout only stops the WAIT; the call is a ~1s tool-less completion, so nothing
+  // long is left running. On the Hermes fallback lane the abort below still applies.
+  // The timeout ABORTS the call (2026-09-26 review): racing a bare timer left the gateway turn
+  // running to completion on a request nobody would read, holding a gateway slot for up to the
+  // adapter's own ceiling. The timer is cleared on every path so a fast answer leaves no pending
+  // handle behind.
+  const ctl = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const timedOut = new Promise<"__timeout__">(res => {
+      timer = setTimeout(() => { ctl.abort(); res("__timeout__"); }, d.timeoutMs);
+    });
+    const call = d.adapter.generate(
+      d.identityPrompt ? `${d.identityPrompt}\n\n${SIDE_SYSTEM}` : SIDE_SYSTEM,
+      [{ role: "user", content: ask }], 0.2, 80,
+      `${d.sessionId}:reach:${d.messageId}`, `${d.sessionKey}:reach`, ctl.signal,
+    );
+    const winner = await Promise.race([call, timedOut]);
+    if (winner === "__timeout__") {
+      call.catch(() => undefined); // the aborted call rejects or resolves null; either way, quietly
+      return none("timeout");
+    }
+    raw = winner;
+  } catch (e) {
+    return none("error", { error: String(e).slice(0, 120) });
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  if (!raw || !raw.trim()) return none("empty");
+  const topic = parseReachDecision(raw);
+  if (!topic) return none("declined", { raw: raw.slice(0, 120) });
+
+  // HIS words into both stores. Failures here degrade to "reached, found nothing" rather than
+  // throwing: the reach happened, which is the thing being measured.
+  const [own, vault] = await Promise.all([
+    d.librarian.recallOwnNotes(topic).catch(() => ({ notes: [], failed: true } as OwnNoteResult)),
+    d.librarian.searchForMessage(topic, d.recentContext || null).catch(() => null),
+  ]);
+  const ownText = LibrarianClient.formatOwnNotes(own.notes);
+  const vaultText = vault ? LibrarianClient.formatSbRecall(vault, d.channelId) : null;
+  // FIDELITY (probe 5, 2026-09-26): with the true note in his prompt ("the knee scooter from the
+  // prior ankle surgery") he wrote a purple mobility scooter dug out from under tarps in a barn.
+  // A retrieved fact gets a rule of its own: report it; invented detail is a lie in his own voice.
+  const parts: string[] = [
+    `You reached for: "${topic}". Answer from these notes. State what they say and no detail they do not contain; ` +
+    `if they do not say, say that. Colour goes on how you hold it, never on the facts.`,
+  ];
+  if (ownText) parts.push(`From your own notes (what was actually said, any surface; trust the dates):\n${ownText}`);
+  if (vaultText) parts.push(`From the vault (syntheses and files, written ABOUT things):\n${vaultText.slice(0, 1200)}`);
+  if (!ownText && !vaultText) parts.push(own.failed ? "Your notes could not be reached just now; say so rather than guessing." : "Nothing matched. Say you do not have it rather than guessing.");
+  const block = `[Memory -- ${parts.join("\n\n")}]`;
+  const found = Boolean(ownText || vaultText);
+  return { outcome: "reached", topic, block, found, ms: emit("reached", topic, { raw: raw.slice(0, 120), own_hits: own.notes.length, vault_hit: Boolean(vaultText), found }) };
+}
+
+/**
+ * Which recall text rides into the prompt: his reach, or the payload floors. Pure; the handler
+ * calls it with the floor blocks it already built.
+ *
+ * The reach wins only when his words FOUND something. A reach that found nothing ("Nothing
+ * matched. Say you do not have it") used to replace both floor blocks although the floors had
+ * hits (by construction: the ask is skipped when they have none), so he was told to deny a memory
+ * that was sitting in the floor payload. "The worst case is exactly today" means the floor
+ * payload, so that is the fallback. An empty floor, with nothing to fall back to, keeps the
+ * reach's honest "nothing matched" line.
+ */
+export function recallBlocksFor(reach: Pick<ReachResult, "outcome" | "block" | "found">, floorBlocks: string): string {
+  if (reach.outcome === "reached" && reach.block && (reach.found || !floorBlocks.trim())) {
+    return `\n\n${reach.block}`;
+  }
+  return floorBlocks;
+}
+
+/** Production sink: one JSON line per decision, same shape the Jev shadow log uses, so
+ *  ops/recall-choice-report.py can read it. Never throws. */
+export function appendReachLine(line: Record<string, unknown>): void {
+  const path = process.env["REACH_LOG"] ?? "/app/logs/reach-decisions.jsonl";
+  let payload: string;
+  try { payload = `${JSON.stringify({ ...line, ...turnFields() })}\n`; } catch { return; }
+  import("node:fs").then(fs => { try { fs.appendFileSync(path, payload); } catch { /* a log we cannot write is not worth a failed reply */ } }).catch(() => undefined);
+}

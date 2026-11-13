@@ -1,0 +1,215 @@
+import { describe, it, expect } from "vitest";
+import { stripJsonFence, sanitizeEvidence, sanitizeIdList, clampStrength, sanitizeMaterial, parseSelfModelReview } from "../parsers.js";
+
+describe("stripJsonFence", () => {
+  it("returns input unchanged when no fence present", () => {
+    expect(stripJsonFence(`{"x":1}`)).toBe(`{"x":1}`);
+  });
+
+  it("strips ```json ... ``` fence", () => {
+    expect(stripJsonFence("```json\n{\"x\":1}\n```")).toBe(`{"x":1}`);
+  });
+
+  it("strips bare ``` ... ``` fence", () => {
+    expect(stripJsonFence("```\n{\"x\":1}\n```")).toBe(`{"x":1}`);
+  });
+
+  it("trims surrounding whitespace", () => {
+    expect(stripJsonFence("   ```json\n{\"x\":1}\n```   ")).toBe(`{"x":1}`);
+  });
+});
+
+describe("sanitizeEvidence", () => {
+  it("returns [] for non-arrays", () => {
+    expect(sanitizeEvidence(null)).toEqual([]);
+    expect(sanitizeEvidence(undefined)).toEqual([]);
+    expect(sanitizeEvidence("string")).toEqual([]);
+    expect(sanitizeEvidence({ quote: "x" })).toEqual([]);
+  });
+
+  it("drops entries with short or missing quote", () => {
+    const out = sanitizeEvidence([
+      { quote: "tiny" },              // < 8 chars after trim -> drop
+      { quote: "   " },               // empty after trim -> drop
+      { },                            // missing quote -> drop
+      { quote: "this quote is long enough" },
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0]!.quote).toBe("this quote is long enough");
+  });
+
+  it("preserves source_url, source_id, source_companion when present and valid", () => {
+    const out = sanitizeEvidence([{
+      quote: "valid evidence quote here",
+      source_url: "https://x.test/y",
+      source_id: "abc-123",
+      source_companion: "drevan",
+    }]);
+    expect(out[0]).toEqual({
+      quote: "valid evidence quote here",
+      source_url: "https://x.test/y",
+      source_id: "abc-123",
+      source_companion: "drevan",
+    });
+  });
+
+  it("rejects unknown source_companion values (no schema injection)", () => {
+    const out = sanitizeEvidence([{
+      quote: "another valid quote",
+      source_companion: "principal",  // not in {cypher, drevan, gaia}
+    }]);
+    expect(out[0]!.source_companion).toBeUndefined();
+  });
+
+  it("truncates over-long quotes to 400 chars", () => {
+    const long = "x".repeat(500);
+    const out = sanitizeEvidence([{ quote: long }]);
+    expect(out[0]!.quote.length).toBe(400);
+  });
+
+  it("caps array at 16 entries", () => {
+    const many = Array.from({ length: 30 }, (_, i) => ({ quote: `entry number ${i} long enough` }));
+    expect(sanitizeEvidence(many)).toHaveLength(16);
+  });
+
+  it("ignores non-object array entries (model nonsense)", () => {
+    const out = sanitizeEvidence([null, undefined, 42, "string", { quote: "the only valid entry" }]);
+    expect(out).toHaveLength(1);
+  });
+});
+
+describe("sanitizeIdList", () => {
+  it("returns [] for non-arrays", () => {
+    expect(sanitizeIdList(null)).toEqual([]);
+    expect(sanitizeIdList("ab-cd-ef-gh")).toEqual([]);
+  });
+
+  it("strips entries that don't match UUID-shaped regex", () => {
+    expect(sanitizeIdList(["abc12345", "not a uuid", "xx", "12345678-90ab-cdef-1234-567890abcdef"])).toEqual([
+      "abc12345",
+      "12345678-90ab-cdef-1234-567890abcdef",
+    ]);
+  });
+
+  it("strips non-string entries", () => {
+    expect(sanitizeIdList([null, 42, undefined, "12345678"])).toEqual(["12345678"]);
+  });
+
+  it("dedupes identical ids", () => {
+    expect(sanitizeIdList(["abc12345", "abc12345", "abc12345"])).toEqual(["abc12345"]);
+  });
+
+  it("caps at 32 entries", () => {
+    const many = Array.from({ length: 50 }, (_, i) => `${i.toString(16).padStart(8, "0")}`);
+    expect(sanitizeIdList(many)).toHaveLength(32);
+  });
+});
+
+describe("clampStrength", () => {
+  it("clamps below 1 to 1", () => {
+    expect(clampStrength(0)).toBe(1);
+    expect(clampStrength(-3)).toBe(1);
+  });
+
+  it("clamps above 10 to 10", () => {
+    expect(clampStrength(11)).toBe(10);
+    expect(clampStrength(99)).toBe(10);
+  });
+
+  it("rounds non-integers", () => {
+    expect(clampStrength(3.4)).toBe(3);
+    expect(clampStrength(3.6)).toBe(4);
+  });
+
+  it("returns default 3 for non-numbers", () => {
+    expect(clampStrength("5")).toBe(3);
+    expect(clampStrength(null)).toBe(3);
+    expect(clampStrength(undefined)).toBe(3);
+    expect(clampStrength(NaN)).toBe(3);
+    expect(clampStrength(Infinity)).toBe(3);
+  });
+
+  it("preserves valid integer values 1..10", () => {
+    for (let n = 1; n <= 10; n++) expect(clampStrength(n)).toBe(n);
+  });
+});
+
+describe("parseSelfModelReview", () => {
+  const surfaced = new Set(["sm_a", "sm_b", "sm_c"]);
+
+  it("returns [] for non-arrays", () => {
+    expect(parseSelfModelReview(null, surfaced)).toEqual([]);
+    expect(parseSelfModelReview(undefined, surfaced)).toEqual([]);
+    expect(parseSelfModelReview("confirm sm_a", surfaced)).toEqual([]);
+    expect(parseSelfModelReview({ id: "sm_a", verdict: "confirm" }, surfaced)).toEqual([]);
+  });
+
+  it("keeps confirm/revise/retire verdicts for surfaced ids", () => {
+    const out = parseSelfModelReview([
+      { id: "sm_a", verdict: "confirm" },
+      { id: "sm_b", verdict: "revise" },
+      { id: "sm_c", verdict: "retire" },
+    ], surfaced);
+    expect(out).toEqual([
+      { id: "sm_a", action: "confirm" },
+      { id: "sm_b", action: "revise" },
+      { id: "sm_c", action: "retire" },
+    ]);
+  });
+
+  it("drops ids the model was never shown (hallucinated)", () => {
+    const out = parseSelfModelReview([
+      { id: "sm_a", verdict: "confirm" },
+      { id: "sm_HALLUCINATED", verdict: "confirm" },
+    ], surfaced);
+    expect(out).toEqual([{ id: "sm_a", action: "confirm" }]);
+  });
+
+  it("rejects the graduate verdict (graduation is human-gated)", () => {
+    const out = parseSelfModelReview([{ id: "sm_a", verdict: "graduate" }], surfaced);
+    expect(out).toEqual([]);
+  });
+
+  it("rejects unknown verdicts and non-object entries", () => {
+    const out = parseSelfModelReview([
+      { id: "sm_a", verdict: "maybe" },
+      null,
+      42,
+      { id: "sm_b" },              // missing verdict
+      { verdict: "confirm" },      // missing id
+      { id: "sm_c", verdict: "CONFIRM" }, // case-insensitive -> kept
+    ], surfaced);
+    expect(out).toEqual([{ id: "sm_c", action: "confirm" }]);
+  });
+
+  it("dedupes repeated ids (first verdict wins)", () => {
+    const out = parseSelfModelReview([
+      { id: "sm_a", verdict: "confirm" },
+      { id: "sm_a", verdict: "retire" },
+    ], surfaced);
+    expect(out).toEqual([{ id: "sm_a", action: "confirm" }]);
+  });
+
+  it("caps at 12 verdicts", () => {
+    const big = new Set(Array.from({ length: 20 }, (_, i) => `id${i}`));
+    const input = Array.from({ length: 20 }, (_, i) => ({ id: `id${i}`, verdict: "confirm" }));
+    expect(parseSelfModelReview(input, big)).toHaveLength(12);
+  });
+});
+
+describe("sanitizeMaterial (R18)", () => {
+  it("keeps a short plain name, collapsing whitespace", () => {
+    expect(sanitizeMaterial("  the   dime ")).toBe("the dime");
+    expect(sanitizeMaterial("a horse's blind side")).toBe("a horse's blind side");
+  });
+  it("rejects non-strings, empties, one-char junk and the schema placeholder echoed back", () => {
+    expect(sanitizeMaterial(undefined)).toBeNull();
+    expect(sanitizeMaterial({ name: "x" })).toBeNull();
+    expect(sanitizeMaterial("  ")).toBeNull();
+    expect(sanitizeMaterial("x")).toBeNull();
+    expect(sanitizeMaterial("short name of what this sighting is in (e.g. the dime)")).toBeNull();
+  });
+  it("caps at 60 chars", () => {
+    expect(sanitizeMaterial("m".repeat(200))).toHaveLength(60);
+  });
+});

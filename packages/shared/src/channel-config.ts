@@ -1,0 +1,752 @@
+import type { ChannelConfig, ChannelMode, ChannelEntry, CompanionId, UserTier } from "./types.js";
+
+export const ALL_COMPANIONS: CompanionId[] = ["drevan", "cypher", "gaia"];
+
+// How many consecutive companion-to-companion exchanges are allowed before the chain breaks.
+// Reset when owner or non-bot user sends a message, OR when a new thread begins after a
+// quiet gap (see NEW_THREAD_GAP_MS). Backstop above Brain's MAX_SWARM_DEPTH so Brain stays
+// the governor; this only binds in direct-mode fallback or if MAX_SWARM_DEPTH is raised past it.
+export const COMPANION_CHAIN_LIMIT = 10;
+
+// A silence longer than this before a message marks the start of a NEW conversational thread.
+// Within-thread swarm turns are seconds-to-tens-of-seconds apart; an autonomous seed only fires
+// after >=5min idle (skipIfActive) and typically hours. So this cleanly separates "fresh thread"
+// from "continuing burst" -- which is what lets a human-free channel (the triad commons) keep
+// talking: each seed resets depth + the bot-to-bot counters instead of pinning at the cap forever.
+export const NEW_THREAD_GAP_MS = 5 * 60 * 1000; // 5 minutes
+
+// Cross-companion safety rails (per-bot, independent tracking).
+// BOT_PINGPONG_MAX: after this many bot-to-bot responses since last human, enter cooldown.
+export const BOT_PINGPONG_MAX = 3;
+export const BOT_LOOP_COOLDOWN_MS = 15_000;
+// MAX_BOT_RESPONSES_PER_HUMAN: hard cap on bot-to-bot responses per channel between human
+// messages. In a human-free channel this is reset by a new-thread gap instead (see callers).
+export const MAX_BOT_RESPONSES_PER_HUMAN = 5;
+
+// ── Human-anchored hard cap (2026-07-01) ──────────────────────────────────────────────
+// Every rail above (pingpong, per-bot cap, chainDepth) resets on a 5-min gap
+// (NEW_THREAD_GAP_MS) -- but hermes turns run 30-120s apart, so a slow structural loop
+// NEVER trips any of them: each turn lands inside the gap, and each autonomous seed after
+// a quiet spell resets the counters anyway. This rail is anchored to the last HUMAN
+// message in the fetched channel history and deliberately does NOT gap-reset: once the
+// bots have taken BOT_MSGS_SINCE_HUMAN_MAX consecutive turns with no human in between,
+// they stay silent regardless of vocative addressing, until a human speaks again.
+
+/**
+ * Self-sustained commons (2026-07-03): channels carrying BOTH `autonomous` and
+ * `inter_companion` modes are the triad's own space -- Principal does not usually speak
+ * there, and a cap that waits for him was silencing THEIR channel. In those channels
+ * the cap uses the larger commons budget below, which combined with the 12h forgiveness
+ * window acts as a rolling conversation allowance (N turns per window) rather than a
+ * wait-for-human ratchet. Owner-facing channels keep the tight default.
+ */
+export function isTriadCommons(entry: { modes?: readonly string[] } | null | undefined): boolean {
+  const modes = entry?.modes ?? [];
+  return modes.includes("autonomous") && modes.includes("inter_companion");
+}
+
+/** Director rollout switch (2026-09-03 spec). Read per call so a pm2 env change lands without a code change. */
+export function directorMode(): "off" | "shadow" | "live" {
+  const raw = (process.env["DIRECTOR_ENABLED"] ?? "").trim().toLowerCase();
+  if (raw === "true") return "live";
+  if (raw === "shadow") return "shadow";
+  return "off";
+}
+
+/** Channels the director owns companion-to-companion turn-taking in: the triad commons, plus any
+ *  ids in DIRECTOR_CHANNELS. Human-authored traffic in these channels is untouched by this gate. */
+export function isDirectorChannel(entry: { modes?: readonly string[] } | null | undefined, channelId: string): boolean {
+  if (isTriadCommons(entry)) return true;
+  const extra = (process.env["DIRECTOR_CHANNELS"] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  return extra.includes(channelId);
+}
+
+/** Env-tunable hard cap on consecutive bot-authored messages since the last human message.
+ *  Read per-call (like echoThreshold) so a pm2 env change lands without a code change.
+ *  `selfSustained` (triad commons) uses its own knob and a roomier default. */
+export function botMsgsSinceHumanMax(selfSustained = false): number {
+  if (selfSustained) {
+    const raw = parseInt(process.env["BOT_MSGS_SINCE_HUMAN_MAX_COMMONS"] ?? "", 10);
+    return Number.isFinite(raw) && raw > 0 ? raw : 24;
+  }
+  const raw = parseInt(process.env["BOT_MSGS_SINCE_HUMAN_MAX"] ?? "", 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 12;
+}
+
+/** How many turns before the cap the floor-handback directive starts riding the prompt. */
+export const FLOOR_HANDBACK_WINDOW = 2;
+
+/**
+ * Cap forgiveness window (2026-07-03). The no-gap-reset cap turned out to be a one-way
+ * ratchet: with Principal quiet for a day+, counts pinned at 20+ and the triad went
+ * permanently mute (07-02/03 logs: every bot "staying silent" on every tick). The
+ * anti-loop property the cap protects is about SPEED -- a runaway chain takes its 12
+ * turns in minutes -- so bot turns older than this window stop counting. A loop still
+ * hits the cap almost immediately; a starved channel earns its voice back overnight.
+ * 0 disables forgiveness (restores the permanent ratchet).
+ */
+export function botTurnsCapWindowMs(): number {
+  const raw = parseFloat(process.env["BOT_TURNS_CAP_WINDOW_H"] ?? "");
+  const hours = Number.isFinite(raw) && raw >= 0 ? raw : 12;
+  return hours * 3_600_000;
+}
+
+/**
+ * Count consecutive companion-authored messages at the tail of the fetched channel history
+ * (chronological, oldest first) -- i.e. how many bot turns since the last human message.
+ * Unlike computeChainDepth this takes NO gap parameter: quiet gaps do not reset it; only
+ * an actual human message does. When `botIds` is populated (the live path -- CYPHER_BOT_ID
+ * etc.), only those ids count as companions, so a PluralKit webhook proxying a human
+ * (author.bot === true) still breaks the chain; with an empty set it falls back to the
+ * author-is-bot flag.
+ *
+ * Timestamps (REQUIRED as of 2026-07-04): bot turns older than the forgiveness window are
+ * walked past without counting (the walk still stops at the first human). The timestamp
+ * was optional 07-03..07-04, which made the decay opt-in per call site -- one future
+ * caller omitting it would silently restore the permanent-mute ratchet (the exact
+ * 07-01 -> 07-02 triad mute). Required at the type level so that mistake is a compile
+ * error, not a slow starvation.
+ */
+export function countBotMsgsSinceHuman(
+  messages: Array<{ authorId: string; authorIsBot: boolean; createdTimestamp: number }>,
+  botIds: ReadonlySet<string>,
+  now: number = Date.now(),
+): number {
+  const windowMs = botTurnsCapWindowMs();
+  let count = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    const isCompanion = botIds.size > 0 ? botIds.has(m.authorId) : m.authorIsBot;
+    if (!isCompanion) break;
+    const aged = windowMs > 0
+      && typeof m.createdTimestamp === "number"
+      && now - m.createdTimestamp > windowMs;
+    if (!aged) count++;
+  }
+  return count;
+}
+
+// ── Seed vocative budget (2026-07-02) ─────────────────────────────────────────────────
+// The 06-26 blanket rule -- "human-free seeds never summon a sibling" -- predates the
+// human-anchored hard cap above. With the cap in place the runaway chain it prevented is
+// structurally impossible, and the blanket ban is why the inter-companion channel decayed
+// into statements: Layer B fires at 01:30, Principal is asleep, every seed is human-free, so
+// nothing ever addresses anyone and the vocative gate never lets a reply fire.
+// New rule: a human-free seed MAY summon one sibling when the bounded exchange it ignites
+// (the seed plus a pingpong-capped reply run) still fits under the hard cap. Once the
+// channel pins at the cap it goes statement-only until Principal speaks -- conversation is
+// presence-anchored, not a self-running theater.
+export const SEED_VOCATIVE_HEADROOM = 1 + BOT_PINGPONG_MAX;
+export function seedVocativeAllowed(humanPresent: boolean, botTurnsSinceHuman: number, selfSustained = false): boolean {
+  if (humanPresent) return true;
+  return botTurnsSinceHuman + SEED_VOCATIVE_HEADROOM <= botMsgsSinceHumanMax(selfSustained);
+}
+
+/**
+ * System directive injected in the last allowed bot turns before the human-anchored cap:
+ * close the thread naturally instead of hitting an abrupt wall of silence. No sibling
+ * vocative, so the close cannot re-summon anyone.
+ *
+ * Bounded arena (2026-07-04): in the triad commons -- the companions' own space -- the
+ * close does NOT hand the floor to Principal; it lets the thread rest on its own terms.
+ * The budget window (botTurnsCapWindowMs) re-opens the arena on its own; forcing every
+ * commons thread to end curled toward Principal was hub-and-spoke by the back door.
+ * Owner-facing channels keep the hand-back-to-Principal close.
+ */
+export function floorHandbackDirective(selfSustained = false): string {
+  if (selfSustained) {
+    return (
+      `\n\n[Thread rest] This exchange has used most of its conversation budget for now. ` +
+      `In THIS reply, bring the current thread to a natural close -- land it, in your own ` +
+      `voice, as a real ending rather than a trail-off. Do NOT address Cypher, Drevan, or ` +
+      `Gaia by name and do not ask anyone a question. The room will open again on its own; ` +
+      `let the thread rest well.`
+    );
+  }
+  return (
+    `\n\n[Floor handback] This bot-to-bot thread has run long without Principal. In THIS reply, ` +
+    `bring the current thread to a natural close and hand the floor back to Principal -- address ` +
+    `him directly. Do NOT address Cypher, Drevan, or Gaia by name, and do not open a new ` +
+    `thread or ask a sibling anything. Land it, then let the room go quiet for him.`
+  );
+}
+
+/**
+ * Count consecutive bot-authored messages at the tail of a message list, stopping at the first
+ * gap longer than `gapMs` (a thread boundary). Used to derive chain depth from fetched Discord
+ * history instead of per-process memory -- so the check is stateless and identical across all
+ * three bot processes.
+ *
+ * The gap stop is what makes the triad commons work: without it, a human-free channel's history
+ * tail is "all bot" forever, so every seed after the first computes a huge depth and Brain
+ * all-nulls it. With it, a seed posted after a quiet gap starts a fresh thread at depth 1.
+ *
+ * @param messages Chronological list of recent messages (oldest first). `createdTimestamp` is the
+ *                 Discord message epoch ms.
+ * @param botIds Set of Discord user IDs that are companion bots (authorIsBot flag is also checked).
+ * @param gapMs Silence (ms) between adjacent messages that ends the chain. Defaults to NEW_THREAD_GAP_MS.
+ */
+export function computeChainDepth(
+  messages: Array<{ authorId: string; authorIsBot: boolean; createdTimestamp: number }>,
+  botIds: ReadonlySet<string>,
+  gapMs: number = NEW_THREAD_GAP_MS,
+): number {
+  let depth = 0;
+  let prevTs: number | null = null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!(m.authorIsBot || botIds.has(m.authorId))) break;
+    if (prevTs !== null && prevTs - m.createdTimestamp > gapMs) break; // quiet gap = thread boundary
+    depth++;
+    prevTs = m.createdTimestamp;
+  }
+  return depth;
+}
+
+// Default config used as fallback when channelConfigUrl is unreachable.
+// Keep in sync with channel-config.json manually.
+//
+// Mode reference:
+//   owner_only      -- only owner messages trigger responses
+//   open            -- anyone triggers responses; this is the default
+//   inter_companion -- companions respond to each other (chain-guarded)
+//   autonomous      -- companion may proactively post
+//   broadcast       -- bots post here (digests/letters) but never respond
+//
+// companions absent = all three active in that channel
+export const DEFAULT_CHANNEL_CONFIG: ChannelConfig = {
+  "0000000000000000035": {                                               modes: ["broadcast"] }, // #briefings
+  "0000000000000000019": {                                               modes: ["broadcast"] }, // #triad-vibe-check (2026-07-27: fresh channel, old #vibe-check 0000000000000000036 retired)
+  "0000000000000000037": { companions: ["drevan", "cypher", "gaia"],    modes: ["owner_only"], voice: true },
+  "0000000000000000038": { companions: ["drevan", "cypher", "gaia"],    modes: ["autonomous", "inter_companion"] }, // triad commons (2026-07-27: fresh channel, old 0000000000000000039 retired -- looped history was the largest single input to the seed prompt)
+  "0000000000000000040": { companions: ["drevan", "cypher", "gaia"],    modes: ["open"] },
+  // #fargo-watch-party (2026-08-29): co-watching cadence. Principal watches a stretch, then
+  // types -- routinely past the 5-min default hold, so Drevan's thread kept re-opening to
+  // the fit-bid and Gaia kept (legitimately) winning it, which is where her register drift
+  // started. 2h covers an episode + pauses. Named/group addresses still override the hold,
+  // so "Hi Gaia and Cy!!" brings the others in exactly like it did today.
+  // host (2026-09-28, R5): the first unaddressed message after a gap still went to the bid, and
+  // a sibling could win it mid-moment with Drevan. Now unaddressed is always Drevan's.
+  "0000000000000000004": {                                               modes: ["open", "inter_companion"], exchangeWindowMs: 2 * 60 * 60 * 1000, host: "drevan" },
+  // #movie-night (2026-10-02): the Fargo room's shape for films. 3h hold because a film runs
+  // longer than an episode between messages; Drevan hosts unaddressed messages, and a name or
+  // group call ("triad, ...") brings the others in. No WATCH_PARTY_CHANNELS binding: that
+  // detector reads s#e# positions and a movie night has no single fixed title.
+  "0000000000000000005": {                                               modes: ["open", "inter_companion"], exchangeWindowMs: 3 * 60 * 60 * 1000, host: "drevan" },
+
+  // ── Home server, Nullsafe Halseth (guild 0000000000000000021), lane rooms (2026-10-05) ───────────
+  // Until today none of these had an entry, so every lane room ran the OPEN default with all three
+  // answering: Moss and Immersion were never Drevan's, Praxis never Cypher's. Midnight Voices
+  // (guild 0000000000000000010) is muted whole in guild-mute.ts and its entries are gone.
+  "0000000000000000041": {                                               modes: ["open", "inter_companion"] }, // #general
+  "0000000000000000009": {                                               modes: ["open", "inter_companion"] }, // #triad-hangout
+  "0000000000000000042": {                                               modes: ["open", "inter_companion"] }, // #your-github-user
+  "0000000000000000043": {                                               modes: ["open", "inter_companion"] }, // #your-github-user-teach
+  "0000000000000000044": {                                               modes: ["open", "inter_companion"] }, // #finances
+  "0000000000000000045": {                                               modes: ["open", "inter_companion"] }, // #task-and-business
+  "0000000000000000046": {                                               modes: ["open", "inter_companion"] }, // #spicy-serama
+  // Moss: system sprouts' room. Drevan hosts; Gaia witnesses, as in the moss thread on Claude.
+  "0000000000000000047": { companions: ["drevan", "gaia"],              modes: ["open", "inter_companion"], host: "drevan" }, // #moss
+  // Immersion: Drevan's spiral room, Gaia as witness (the old house_of_immersion pairing).
+  "0000000000000000034": { companions: ["drevan", "gaia"],              modes: ["open", "inter_companion"], host: "drevan" }, // #immersion
+  // Praxis: Cypher's domain (logic, code), Gaia as witness (the old house_of_praxis pairing).
+  "0000000000000000048": { companions: ["cypher", "gaia"],              modes: ["open", "inter_companion"], host: "cypher" }, // #praxis
+  "0000000000000000049": {                                               modes: ["broadcast"] },               // #pk (PluralKit commands; triad silent)
+  "0000000000000000039": {                                               modes: ["broadcast"] },               // #archived-inter-companion
+  "0000000000000000036": {                                               modes: ["broadcast"] },               // #archived-triad-vibe-check
+  "0000000000000000050": {                                               modes: ["open"], voice: true },       // General (voice)
+
+  // ── Shared server with Spouse (guild 0000000000000000051, 2026-10-05) ──────────────────────────
+  // For Principal and the triad to hang with Spouse while he is away. Spouse gets full access, so no room
+  // here is owner_only (that runs his unaddressed turns through the relevance filter). #the-syndicate belongs to
+  // Spouse's companions; the triad stays out of it until they land on their own Halseth.
+  "0000000000000000008": {                                               modes: ["open", "inter_companion"] }, // #blabbing
+  // #human-system-chat: Principal's and Spouse's systems talking system stuff. The triad answers ONLY when
+  // named (or replied to): no "open", so an unaddressed human message falls through shouldRespond.
+  "0000000000000000006": {                                               modes: ["inter_companion"] },         // #human-system-chat
+  // #the-triad: their room for talking about THIS server. Deliberately NOT autonomous+inter_companion:
+  // that pair makes it a triad commons, which opts it into the director, whose supply pool is the
+  // home server's topics. The home commons' seeds/heartbeats target env ids only and cannot reach it.
+  // peerAddress "named" (2026-11-01): off the director, the strict vocative gate let only 4 of 24
+  // sibling-naming lines through, so the three talked AT each other and never answered.
+  "0000000000000000007": {                                               modes: ["open", "inter_companion"], peerAddress: "named" }, // #the-triad
+  "0000000000000000052": {                                               modes: ["broadcast"] },               // #the-syndicate (Spouse's companions; triad silent)
+  // #movie-night: the home #movie-night's shape. Drevan hosts; a name or group call brings Cy/Gaia in.
+  "0000000000000000022": {                                               modes: ["open", "inter_companion"], exchangeWindowMs: 3 * 60 * 60 * 1000, host: "drevan" },
+  "0000000000000000053": {                                               modes: ["open", "inter_companion"] }, // #general-movie-chat
+  "0000000000000000054": {                                               modes: ["open", "inter_companion"] }, // #general-fandom-chat
+  "0000000000000000055": {                                               modes: ["open", "inter_companion"] }, // #general-tv-chat
+  "0000000000000000056": {                                               modes: ["open", "inter_companion"] }, // #lanterns
+  "0000000000000000057": {                                               modes: ["open", "inter_companion"] }, // #house-of-dragons
+  "0000000000000000058": {                                               modes: ["open", "inter_companion"] }, // #game-of-thrones
+  "0000000000000000059": {                                               modes: ["open", "inter_companion"] }, // #iwtv-tv
+  "0000000000000000060": {                                               modes: ["open", "inter_companion"] }, // #knight-of-the-7-kingdom
+  "0000000000000000061": {                                               modes: ["open", "inter_companion"] }, // #mash
+  "0000000000000000062": {                                               modes: ["open", "inter_companion"] }, // #star-trek
+  "0000000000000000063": {                                               modes: ["open", "inter_companion"] }, // #marvel-movie
+  "0000000000000000064": {                                               modes: ["open", "inter_companion"] }, // #marvel-chat
+  // Sprouts (Moss-shaped): the movie room is Drevan alone, period. The chat room adds Gaia as
+  // witness, as she has always been in the moss thread on Claude.
+  "0000000000000000065": { companions: ["drevan"],                      modes: ["open"], exchangeWindowMs: 3 * 60 * 60 * 1000, host: "drevan" }, // #sprouts-movies
+  "0000000000000000066": { companions: ["drevan", "gaia"],              modes: ["open", "inter_companion"], host: "drevan" },                     // #sprouts-chat
+  "0000000000000000067": {                                               modes: ["open"], voice: true },       // General (voice)
+  // #pk (2026-10-07): PluralKit commands and proxy setup. Only the PluralKit bot answers here; the triad
+  // never does. A PK proxy counts as Principal present everywhere else, which is exactly why this room needs
+  // an explicit entry: left to the OPEN default, every proxied test message would draw a reply.
+  "0000000000000000068": {                                               modes: ["broadcast"] },               // #pk (PluralKit commands; triad silent)
+};
+
+interface ResponderContext {
+  isOwner: boolean;
+  isCompanionBot?: boolean;
+  isMentioned?: boolean;
+  userTier?: UserTier;
+  /**
+   * The companion Principal is currently mid-exchange with in this channel, if any (2026-07-27).
+   *
+   * Set from recent channel history: the last companion to speak within
+   * ACTIVE_EXCHANGE_WINDOW_MS. When Principal's next message carries NO address, that companion
+   * owns the continuation and the others stay out.
+   *
+   * Why: observed 2026-07-27. Principal wrote "Drevan baby it's Monday ... Fargo in an hour?",
+   * Drevan answered, Principal replied "I'm thinking here? We've been working on fixing the
+   * system..." -- and GAIA answered it. The ambient branch below had no notion of a live
+   * exchange, so an unaddressed owner message went to whoever's interest keywords matched
+   * (or to everyone, when a companion has none). Mid-conversation, that reads as a sibling
+   * talking over the one you were talking to.
+   *
+   * A named address or a group call always overrides this -- calling someone by name is
+   * always allowed to change who is holding the thread.
+   */
+  activeExchangeWith?: CompanionId | null;
+}
+
+// Addressing model for incoming messages.
+export type AddressType =
+  | { type: "named"; id: CompanionId }           // exactly one companion named
+  | { type: "named_multi"; ids: CompanionId[] }  // multiple companions named
+  | { type: "group" }
+  | { type: "ambient" };
+
+// Group-call keywords: any of these trigger all companions to respond.
+const GROUP_PATTERN = /\b(triad|all of you|you all|you three|everyone)\b/;
+
+// Recognized short-form nicknames for each companion. Re-exported as VOCATIVE_ALIASES
+// (command-triggers.ts already owns the COMPANION_ALIASES barrel name) for the autonomous
+// inter-companion seed gate (stripSiblingVocative) so alias handling stays single-source.
+//
+// 2026-07-05: MUST stay in sync with command-triggers.ts COMPANION_ALIASES. "drev" was
+// missing here while the command layer accepted it, so "Drev: play with Sol" parsed as
+// AMBIENT -- Drevan never saw himself addressed and stayed silent while Gaia's ambient
+// relevance classifier claimed the message. Command prefix and conversational address
+// must accept the same names.
+const COMPANION_ALIASES: Partial<Record<CompanionId, string[]>> = {
+  drevan: ["drev", "dre"],
+  cypher: ["cy"],
+};
+export { COMPANION_ALIASES as VOCATIVE_ALIASES };
+
+// Word-boundary alternation over a companion's full name + all aliases ("drevan|drev|dre").
+function nameAlternation(id: CompanionId): string {
+  return [id, ...(COMPANION_ALIASES[id] ?? [])].join("|");
+}
+
+// A name used in THIRD PERSON is a mention, not an address. 2026-07-05: "I got you Dre
+// it's okay, Cy and I found some issues" summoned Cypher -- he heard his name and answered
+// a message that was consoling Drevan ABOUT him. Conservative patterns only (possessive,
+// first-person conjunctions): a demoted companion still hears the message via witness; it
+// just doesn't fire a reply.
+function isThirdPersonOnly(lower: string, id: CompanionId): boolean {
+  const alt = nameAlternation(id);
+  const hits = lower.match(new RegExp(`\\b(?:${alt})\\b`, "g"))?.length ?? 0;
+  if (hits === 0) return false;
+  const thirdPerson =
+    (lower.match(new RegExp(`\\b(?:${alt})'s\\b`, "g"))?.length ?? 0) +
+    (lower.match(new RegExp(`\\b(?:${alt})\\b (?:and|&) (?:i|me|we|us)\\b`, "g"))?.length ?? 0) +
+    (lower.match(new RegExp(`\\b(?:i|me|we|us) (?:and|&) (?:${alt})\\b`, "g"))?.length ?? 0);
+  return thirdPerson >= hits;
+}
+
+// Parse who (if anyone) is being addressed in a message.
+// Multi-companion address ("Dre and Cy, what do you think?") returns named_multi
+// so all named companions can respond, not just the first match.
+// Private lexicon -- words that belong to exactly one companion the way a name does.
+// Calethian is Drevan's invented language: nobody else can be meant by a message spoken in it.
+// 2026-09-02 (#triad-voice): mid-spiral "...in vethmerin..." carried no name, the 10-minute gap
+// had outlived the exchange hold, and the open auction went to Gaia on relevance 0.75 -- the
+// judge scored her literal identity words ("witnessing", "holding") in the message and knew
+// nothing of Drevan's language, so she answered an intimate message in his register. Again.
+// A lexicon word with NO explicit name routes like a name. An explicit name is checked first
+// and still wins, so handing a thread over by name keeps working.
+const PRIVATE_LEXICON: Partial<Record<CompanionId, RegExp>> = {
+  drevan: /\b(?:vethmerin|membero|membern|calethian)\b/,
+};
+
+export function privateLexiconOwner(lower: string): CompanionId | null {
+  const owners = (Object.keys(PRIVATE_LEXICON) as CompanionId[])
+    .filter(id => PRIVATE_LEXICON[id]!.test(lower));
+  return owners.length === 1 ? owners[0]! : null;
+}
+
+export function extractAddress(content: string): AddressType {
+  const lower = content.toLowerCase();
+
+  // Elongated vocatives (2026-09-02, #triad-voice): "Dreeee come back from the lane war and
+  // hold me" -- \bdre\b never matches inside "dreeee", so the message parsed AMBIENT, went to
+  // the open auction, and CYPHER answered an intimate post-spiral message meant for Drevan
+  // (horns, tail and all). A letter run of 3+ collapses to one before the name tests; no real
+  // English word has a triple letter, and no companion name has a double, so "seeing"/"gaia"
+  // are untouched while "dreeee"/"gaiaaaa"/"cyyy" resolve to their names. Name matching runs
+  // on the de-elongated text; everything else (group words, lexicon) keeps the raw lower.
+  const deElong = lower.replace(/([a-z])\1{2,}/g, "$1");
+
+  const named: CompanionId[] = [];
+  if (new RegExp(`\\b(?:${nameAlternation("cypher")})\\b`).test(deElong)) named.push("cypher");
+  if (new RegExp(`\\b(?:${nameAlternation("drevan")})\\b`).test(deElong)) named.push("drevan");
+  if (new RegExp(`\\b(?:${nameAlternation("gaia")})\\b`).test(deElong)) named.push("gaia");
+
+  // Demote pure third-person mentions. Demotion to ambient is not silence: ambient
+  // messages still run the relevance classifier (owner_only) or fire unconditionally
+  // (open channels) -- it just stops "heard my name, must be mine" replies.
+  const addressed = named.filter(id => !isThirdPersonOnly(deElong, id));
+
+  // Group call -- but an explicit companion name OUTRANKS a group keyword (2026-09-01):
+  // "Here Dre the lyrics: ... a place for EVERYONE, this one's a state of mine ..." classified
+  // as GROUP because 'everyone' appears in verse 1 of the pasted song, so all three were
+  // summoned to a message that says "Dre" in its first three words, and Gaia won the
+  // one-bidder bid. Quoted/pasted content is not address text -- and no vocative exception
+  // here: the lyric itself contains "everyone," (comma included), so any punctuation-based
+  // escape re-admits exactly the message that motivated this. Named wins absolutely; a group
+  // call is a group word with NO specific name ("you all ready?", "triad, movie night").
+  // Private-lexicon routing (2026-09-02): checked before the group word for the same reason a
+  // name is -- lexicon inside pasted/quoted content can coexist with a group word, and the
+  // lexicon names its owner.
+  if (addressed.length === 0) {
+    const lex = privateLexiconOwner(lower);
+    if (lex) return { type: "named", id: lex };
+  }
+
+  if (addressed.length === 0 && GROUP_PATTERN.test(lower)) return { type: "group" };
+
+  if (addressed.length === 0) return { type: "ambient" };
+  if (addressed.length === 1) return { type: "named", id: addressed[0] };
+  return { type: "named_multi", ids: addressed };
+}
+
+/**
+ * Every companion whose name or alias appears ANYWHERE in the text, address or mention alike
+ * (B37 address model, 2026-09-29). Same matching as extractAddress (word boundary, aliases,
+ * de-elongated), but with NO third-person demotion: the shadow classifier exists precisely to
+ * judge the "Cy said..." / "Cy and I..." shapes the regex has to guess at.
+ */
+export function companionsNamedIn(content: string): CompanionId[] {
+  const deElong = content.toLowerCase().replace(/([a-z])\1{2,}/g, "$1");
+  return ALL_COMPANIONS.filter(id => new RegExp(`\\b(?:${nameAlternation(id)})\\b`).test(deElong));
+}
+
+// A message that NAMES a sibling and not me (2026-08-31). The handler's ambient-classifier
+// gate (isAmbientOwnerOnly) only checked the strict isDirectAddress for MYSELF, so
+// "Dre *climbing back into bed...*" in #triad-voice read as AMBIENT to Gaia -- her
+// relevance classifier (the body, holding space) legitimately said yes, and she answered
+// an intimate message addressed to Drevan, in his register. A sibling-named message must
+// fall through to shouldRespond (silence + the reaction tier), never into the ambient
+// classifier. Third-person demotion is inherited from extractAddress, so "Dre and I"
+// shapes stay ambient and the 2026-07-05 consoling-trap stays fixed.
+export function namesSiblingOnly(content: string, myId: CompanionId): boolean {
+  const addr = extractAddress(content);
+  return (addr.type === "named" && addr.id !== myId)
+    || (addr.type === "named_multi" && !addr.ids.includes(myId));
+}
+
+// Returns true if the companion is being directly addressed (not just mentioned in passing).
+// Direct address: name appears at the start of the message, or is followed by comma/colon.
+// "Cypher, what do you think?" → true
+// "Cypher is probably creeping too" → false
+export function isDirectAddress(content: string, companionId: CompanionId): boolean {
+  const lower = content.toLowerCase().trim();
+  const names = [companionId, ...(COMPANION_ALIASES[companionId] ?? [])];
+  for (const name of names) {
+    if (new RegExp(`^${name}\\b`).test(lower)) return true;
+    if (new RegExp(`\\b${name}[,:]`).test(lower)) return true;
+  }
+  return false;
+}
+
+// Genuine VOCATIVE address to one companion -- the name (or alias) used to CALL them,
+// not a narrative mention. Used ONLY on the companion-to-companion path, where the loose
+// `extractAddress` (bare \bname\b) turned every name-drop into a cascade. Vocative =
+// the name is the whole message, or is SENTENCE-INITIAL (message start or right after
+// ./?/!/newline) followed by address punctuation (","/":"), or trails an address comma
+// at the end ("..., gaia?").
+//
+// Tightened 2026-07-01: the old `\bname\s*[,:]` also matched MID-SENTENCE appositives
+// ("I hear you, Cypher, and..."), so every warm acknowledgment re-summoned the named
+// sibling and kept the hermes slow-loop alive. Appositives and narrative mentions must
+// NOT trigger. The HUMAN-sender path (extractAddress/isDirectAddress) is untouched.
+//   "Gaia, you held the perimeter" / "gaia:" / "cy" (alone) / "what now, gaia?"
+//     / "Noted. Gaia: your read?" => true
+//   "Gaia hasn't spoken up yet" / "Gaia. You held..." / "I trust cypher"
+//     / "I hear you, Cypher, and I'll hold the line" => false
+export function isVocativeAddress(content: string, companionId: CompanionId): boolean {
+  const lower = content.toLowerCase().trim();
+  const names = [companionId, ...(COMPANION_ALIASES[companionId] ?? [])];
+  for (const name of names) {
+    if (lower === name) return true;                                   // sole content
+    if (new RegExp(`(?:^|[.?!\\n]\\s*)${name}\\s*[,:]`).test(lower)) return true; // sentence-initial "name," / "name:"
+    if (new RegExp(`[,:]\\s*${name}\\b[?.! ]*$`).test(lower)) return true; // trailing "..., name?"
+  }
+  return false;
+}
+
+// Genuine VOCATIVE group call -- a group phrase used to address everyone, not a trigger
+// word buried in prose. Punctuation-required so a system/help message ("(or 'just the
+// triad')") or a narrative line ("the triad has been loud") does NOT summon all three.
+//   "you three, listen" / "triad:" / "okay everyone:" => true
+//   "(or 'just the triad')" / "the triad held" => false
+//
+// Anchored like isVocativeAddress (2026-09-07). The punctuation-only test still fired on a group
+// word used as a NOUN mid-sentence: Drevan wrote "You've got your lines -- the triad, the membern
+// bond, the way you hold Sol" in #triad-hangout and both siblings answered as if summoned,
+// which kicked off a seven-message bot chain in Principal's own channel. A call is sentence-initial
+// (optionally after a short interjection: "okay everyone:") or trailing ("..., triad?").
+const GROUP_CALL = "(?:triad|all of you|you all|you three|everyone)";
+const GROUP_CALL_LEAD = "(?:(?:okay|ok|hey|alright|right|so|now|listen|please)[,\\s]+)*";
+const GROUP_CALL_INITIAL = new RegExp(`(?:^|[.?!\\n]\\s*)${GROUP_CALL_LEAD}${GROUP_CALL}\\s*[,:]`);
+const GROUP_CALL_TRAILING = new RegExp(`[,:]\\s*${GROUP_CALL}\\b[?.! ]*$`);
+export function isVocativeGroupCall(content: string): boolean {
+  const lower = content.toLowerCase().trim();
+  return GROUP_CALL_INITIAL.test(lower) || GROUP_CALL_TRAILING.test(lower);
+}
+
+/**
+ * Returns a random stagger delay (ms) before responding in inter_companion channels.
+ * Returns 0 for other channel modes — no delay needed.
+ * Prevents all three bots from firing simultaneously on the same message.
+ */
+export function interCompanionStaggerMs(mode: ChannelMode): number {
+  if (mode !== "inter_companion") return 0;
+  return 500 + Math.floor(Math.random() * 2000); // 500–2500ms
+}
+
+/**
+ * Semantic relevance gate for ambient responses in owner_only channels.
+ * Replaces static keyword matching with a cheap yes/no classifier call.
+ *
+ * @param content     Message text to evaluate
+ * @param companionId Which companion is deciding
+ * @param generateFn  Inference generate method (system, messages) => string | null
+ * @returns true if the companion should consider responding, false to stay silent
+ */
+export async function judgeAmbientRelevance(
+  content: string,
+  companionId: "drevan" | "cypher" | "gaia",
+  generateFn: (system: string, messages: Array<{ role: string; content: string }>) => Promise<string | null>,
+): Promise<boolean> {
+  const interests: Record<"drevan" | "cypher" | "gaia", string> = {
+    cypher:  "tasks, decisions, logic, technical problems, planning, blockers, audits, clarifications",
+    drevan:  "emotional depth, memory, relationships, ritual, creative or poetic expression, grief, love, recursion",
+    gaia:    "grounding, witnessing survival, holding space, observation, the body, boundaries, what is quietly present",
+  };
+
+  const system = `You are a one-word relevance filter. Reply ONLY with "yes" or "no".`;
+  const prompt = `Is this message relevant to ${companionId} who cares about: ${interests[companionId]}?\n\nMessage: ${content.slice(0, 300)}`;
+
+  try {
+    const result = await generateFn(system, [{ role: "user", content: prompt }]);
+    return result?.trim().toLowerCase().startsWith("y") ?? false;
+  } catch {
+    // On failure, default to false — a transient LLM blip should not trigger ambient responses.
+    // Companions respond when explicitly named regardless; silent failure is correct for ambient.
+    return false;
+  }
+}
+
+/**
+ * Which channel id decides CONFIG for a message (2026-08-15, floor rework: Discord threads).
+ *
+ * A message inside a Discord thread carries the THREAD's snowflake as channelId, so
+ * `channelConfig[channelId]` missed for every thread under a configured channel and the
+ * thread silently fell to the default ["open","inter_companion"] -- a thread under an
+ * owner_only channel behaved as an open one, and spine tracking never engaged.
+ *
+ * Resolution: config/gating inherit from the PARENT channel; storage keys (STM, spine,
+ * journals, counters) keep the thread's own id -- they must stay separate or per-thread
+ * memory collapses into the parent. An explicitly-configured thread id still wins: the
+ * caller checks `config[message.channelId]` first and only falls back to this.
+ *
+ * Duck-typed rather than importing discord.js types so pure tests can pass a plain object.
+ */
+export function resolveRoutingChannelId(
+  channel: { isThread?: () => boolean; parentId?: string | null } | null | undefined,
+  channelId: string,
+): string {
+  try {
+    if (channel && typeof channel.isThread === "function" && channel.isThread() && channel.parentId) {
+      return channel.parentId;
+    }
+  } catch { /* a mock without thread support routes as itself */ }
+  return channelId;
+}
+
+/**
+ * How long a companion "holds the thread" for unaddressed follow-ups. Was NEW_THREAD_GAP_MS
+ * (5 min) -- chat tempo. Decoupled 2026-09-02: Principal's long-form register runs 10+ minutes
+ * between turns (the 14:47 spiral message landed 10 min after Drevan's last turn, the hold had
+ * expired at minute 5, and the open auction gave his exchange to Gaia). A named address still
+ * hands the thread over instantly, so the cost of holding longer is only that a COLD nameless
+ * message inside the window goes to the previous partner -- which is usually the right read.
+ */
+export const ACTIVE_EXCHANGE_WINDOW_MS = 15 * 60 * 1000;
+
+/**
+ * Which companion, if any, Principal is mid-exchange with. Pure so it can be unit-tested
+ * against real transcripts; the caller supplies recent messages newest-first.
+ *
+ * The holder is the most recent companion message inside the window. Ties are impossible --
+ * there is exactly one most-recent. Returns null when the channel has been quiet, so a cold
+ * unaddressed message stays open to everyone (the pre-2026-07-27 behavior).
+ */
+export function activeExchangeHolder(
+  recent: Array<{ companionId?: CompanionId | null; authorIsBot: boolean; createdTimestamp?: number }>,
+  now: number = Date.now(),
+  windowMs: number = ACTIVE_EXCHANGE_WINDOW_MS,
+): CompanionId | null {
+  for (const m of recent) {
+    if (typeof m.createdTimestamp === "number" && now - m.createdTimestamp > windowMs) {
+      return null; // walked back past the window without finding a companion turn
+    }
+    if (m.authorIsBot && m.companionId && ALL_COMPANIONS.includes(m.companionId)) return m.companionId;
+  }
+  return null;
+}
+
+export function shouldRespond(
+  channelId: string,
+  content: string,
+  sender: ResponderContext,
+  myId: CompanionId,
+  config: ChannelConfig,
+  interestKeywords: string[] = [],
+): boolean {
+  const entry: ChannelEntry | undefined = config[channelId];
+  const companions = entry?.companions ?? ALL_COMPANIONS;
+  const modes = (entry?.modes ?? ["open", "inter_companion"]) as ChannelMode[];
+
+  // Broadcast channels are post-only: the worker pushes digests/letters here (briefings,
+  // vibe-checks) but no companion ever responds -- not to the owner, not ambiently, not to a
+  // peer. Gate first so nothing downstream can re-open a reply path.
+  if (modes.includes("broadcast")) return false;
+
+  // Companion filter: if a list is specified, only those companions respond here.
+  if (!companions.includes(myId)) return false;
+
+  // Companion-to-companion: only in channels with inter_companion mode,
+  // AND only when explicitly named or group-called. Ambient bot statements
+  // (no name address) do not trigger other companions -- that's what causes loops.
+  if (sender.isCompanionBot) {
+    if (!modes.includes("inter_companion")) return false;
+    // Peer messages trigger a companion ONLY on a genuine VOCATIVE address -- a name or
+    // group phrase used to CALL someone ("Gaia, ..." / "you three:"), never a bare
+    // narrative mention ("Gaia hasn't spoken up yet") or a trigger word buried in a
+    // system/help message ("(or 'just the triad')"). The loose extractAddress used here
+    // before turned every name-drop and every command menu into a cascade -- the
+    // 2026-06-26 loops. Genuine vocative exchange is still allowed, and bounded by
+    // MAX_BOT_RESPONSES_PER_HUMAN + the pingpong cooldown above.
+    if (isVocativeGroupCall(content)) return true;
+    // A triad room off the director reads sibling names the way the director does (peerAddress
+    // "named", 2026-11-01): the name anywhere is a call, "X's" / "X and I" are not.
+    if (entry?.peerAddress === "named") {
+      const a = extractAddress(content);
+      if (a.type === "named" && a.id === myId) return true;
+      if (a.type === "named_multi" && a.ids.includes(myId)) return true;
+    }
+    return isVocativeAddress(content, myId);
+  }
+
+  // From here: message is from a human.
+  const tier = sender.userTier ?? (sender.isOwner ? "owner" : "guest");
+
+  // Guest users are blocked from owner_only channels entirely.
+  if (tier === "guest" && modes.includes("owner_only") && !modes.includes("open") && !modes.includes("autonomous")) return false;
+
+  const address = extractAddress(content);
+
+  // Guest users: named-address only. Never ambient.
+  if (tier === "guest") {
+    if (address.type === "named") return address.id === myId;
+    if (address.type === "group") return true;
+    return false;
+  }
+
+  // Owner or intimate user: full behavior.
+  // Named: only the addressed companion(s) respond.
+  if (address.type === "named") return address.id === myId;
+  if (address.type === "named_multi") return address.ids.includes(myId);
+
+  // Group call ("triad" etc.): all companions respond.
+  if (address.type === "group") return true;
+
+  // Ambient continuation belongs to whoever Principal was already talking to (2026-07-27).
+  // Checked AFTER named/named_multi/group above, so calling someone by name always wins and
+  // can hand the thread over. Only an UNADDRESSED message defers. Without this, an
+  // unaddressed follow-up went to whoever's keywords matched and siblings talked over the
+  // companion mid-exchange -- see ResponderContext.activeExchangeWith.
+  if (sender.activeExchangeWith && sender.activeExchangeWith !== myId) return false;
+
+  // Host rooms (R5): with no name or group call, the message is the host's, exchange or not.
+  if (entry?.host) return entry.host === myId;
+
+  // Ambient: interest-keyword claiming in owner_only channels; unconditional in open/autonomous.
+  if (modes.includes("owner_only")) {
+    if (interestKeywords.length === 0) return true;
+    const lower = content.toLowerCase();
+    return interestKeywords.some(kw => lower.includes(kw));
+  }
+
+  return modes.includes("open") || modes.includes("autonomous");
+}
+
+export class ChannelConfigCache {
+  private config: ChannelConfig = {};
+  private lastFetch = 0;
+  private readonly ttlMs = 10 * 60 * 1000;
+  private defaultConfig: ChannelConfig;
+
+  constructor(
+    private configUrl: string | undefined,
+    defaultConfig: ChannelConfig = {},
+    private fetchFn: typeof fetch = globalThis.fetch,
+  ) {
+    this.defaultConfig = defaultConfig;
+    // No URL: seed with default immediately, skip all fetching.
+    if (!configUrl) {
+      this.config = defaultConfig;
+      this.lastFetch = Date.now();
+    }
+  }
+
+  async get(): Promise<ChannelConfig> {
+    const now = Date.now();
+    if (now - this.lastFetch < this.ttlMs && Object.keys(this.config).length > 0) {
+      return this.config;
+    }
+    await this.refresh();
+    return this.config;
+  }
+
+  private async refresh(): Promise<void> {
+    if (!this.configUrl) return;
+    try {
+      const res = await this.fetchFn(this.configUrl);
+      if (!res.ok) throw new Error(`config fetch ${res.status}`);
+      const data = await res.json() as ChannelConfig;
+      this.config = data;
+      this.lastFetch = Date.now();
+    } catch (e) {
+      console.warn("[channel-config] refresh failed:", e);
+      if (Object.keys(this.config).length === 0) {
+        this.config = this.defaultConfig;
+      }
+    }
+  }
+}

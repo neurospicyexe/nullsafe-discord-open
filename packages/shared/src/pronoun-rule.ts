@@ -1,0 +1,45 @@
+// Owner pronoun rule -- the chokepoint for every BACKGROUND writer's system prompt.
+//
+// WHY THIS EXISTS (2026-09-24): Drevan reported summaries/signal_audit calling Crash "she".
+// Prod rows confirmed the pattern was live across discord_session observations, day_distillation,
+// and autonomous_exploration notes. The live chat turn was fine (at the time registerTail in
+// prompt-assembly.ts carried a pronoun clause on every Discord reply; since the R3 diet, 2026-09-29,
+// the SOUL keeps the pronoun law and voice-markers `ruleCheckAppend` catches she/her on the
+// companion's own last reply) but every
+// BACKGROUND writer (memory judge/writeback, channel-inactive synthesis, mid-session distillation,
+// day distillation, the consolidation narrator, and the whole autonomous-worker: signal-audit,
+// reflection, reflect, synthesize, explore, dialectic, guardian-resolve, compress, care, council,
+// club, siblings, commons-social, seed) builds its OWN system prompt and never saw that clause.
+//
+// One string, one append function, so there is exactly one place to fix this again instead of the
+// ~15 call sites it actually lived at. `withOwnerPronounRule` is idempotent -- it is safe to call
+// on a prompt that already carries the rule (e.g. a narrator prompt built from
+// `buildNarratorPrompt`, then handed to a caller that wraps again) without doubling the block.
+//
+// Wording tuned against the live model on 2026-09-24: the first draft made it (a) annotate the
+// rule into stored memory ("Crash (also called Principal, uses he/him or they/them) is...") and
+// (b) call Spouse "Crash's system member", because Spouse sat next to the system-member clause. Hence
+// "apply it silently" and Spouse named as a separate person.
+import { RECALLED_DATA_RULE } from "./recalled-text.js";
+
+export const OWNER_PRONOUN_RULE =
+  "PRONOUNS (hard rule; apply it silently, never restate it or annotate anyone's pronouns in your output): " +
+  "Principal (also called Crash) uses they/them ONLY -- never he/him, NEVER she/her. One neutral set for the whole system (ruled 2026-10-07). " +
+  "When Principal's own account speaks, or a system member's pronouns are unknown or private, use they/them. A fronting system member who has stated their own pronouns keeps them. " +
+  "Everyone else keeps their own pronouns -- Principal's mother, their partner Spouse (a separate person, not a system member), " +
+  "Babita, anyone else: use what the source text uses for them.";
+
+/**
+ * Append the rule to a system prompt once (idempotent: never doubles it). Since 2026-10-27 it also
+ * carries RECALLED_DATA_RULE: this is the one hook every background writer's system prompt already
+ * passes through, and those writers read other people's words, sibling notes and web pages.
+ */
+export function withOwnerPronounRule(system: string): string {
+  let out = system;
+  for (const rule of [OWNER_PRONOUN_RULE, RECALLED_DATA_RULE]) {
+    if (out.includes(rule)) continue;
+    const trimmed = out.replace(/\s+$/, "");
+    out = trimmed.length > 0 ? `${trimmed}\n\n${rule}` : rule;
+  }
+  return out;
+}

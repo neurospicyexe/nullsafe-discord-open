@@ -1,0 +1,301 @@
+// Human address gate (2026-10-10, Principal's rulings).
+//
+// Two humans share these rooms. The old reply path knew only companion names, so "Spouse, did you eat?"
+// read as AMBIENT and a companion answered a question asked of someone else, and an unnamed message
+// from Spouse went to the open bid. Rulings, in the order the reply path applies them:
+//
+//   1. A companion named anywhere in the gathered burst (vocative, @mention, reply-to) -> the
+//      existing fast path. Nothing here changes it.
+//   2. Else a HUMAN named at vocative position who is not the speaker -> every companion silent.
+//      ("Spouse, ..." from Principal; "Principal, ..." from Spouse.)
+//   3. Else the speaker is Spouse and nobody is named -> only the companion holding SPOUSE's own thread
+//      answers. No holder, nobody answers. No bid round for an unaddressed Spouse message.
+//   4. Else the existing owner logic, untouched.
+//
+// The vocabulary is deliberately tiny. PluralKit's 538-member roster is NOT loaded as addressees: most
+// member names are common words and would silence the bots on ordinary sentences. PRINCIPAL_NAMES and
+// SPOUSE_NAMES (comma lists) extend it by hand.
+//
+// Vocative = the name CALLS someone: sole content, message- or sentence-initial (after an optional
+// greeting) followed by address punctuation, or trailing after a comma ("what do you think, spouse?").
+// "I told Spouse about it" and "Spouse is coming over" name a person and call nobody.
+
+import { extractAddress } from "./channel-config.js";
+import type { CompanionId } from "./types.js";
+
+export type HumanSide = "principal" | "spouse";
+
+export interface HumanNames { principal: string[]; spouse: string[] }
+
+const DEFAULT_NAMES: HumanNames = { principal: ["principal", "raz"], spouse: ["spouse"] };
+
+function parseList(raw: string | undefined, fallback: string[]): string[] {
+  const list = (raw ?? "").split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+  return list.length > 0 ? list : fallback;
+}
+
+/** PRINCIPAL_NAMES (default "principal,raz"), SPOUSE_NAMES (default "spouse"). Blank/empty falls back. */
+export function humanNamesFromEnv(env: Record<string, string | undefined> = process.env): HumanNames {
+  return {
+    principal: parseList(env["PRINCIPAL_NAMES"], DEFAULT_NAMES.principal),
+    spouse: parseList(env["SPOUSE_NAMES"], DEFAULT_NAMES.spouse),
+  };
+}
+
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const GREETING = "(?:(?:hey|hi|hello|hiya|yo|oh|ok|okay|so|and|but|well|um|uh|hm+|ah|aw+|ooh|psst|sup|good morning|good night|goodnight|morning)[,!\\s]+)*";
+
+function isVocativeName(lower: string, names: string[]): boolean {
+  if (names.length === 0) return false;
+  const alt = names.map(escapeRe).join("|");
+  const sole = new RegExp(`^${GREETING}(?:${alt})[!?.\\s]*$`);
+  const initial = new RegExp(`(?:^|[.?!\\n]\\s*)${GREETING}(?:${alt})\\s*[,:!?]`);
+  const trailing = new RegExp(`[,:]\\s*(?:${alt})\\b[?.! ]*$`);
+  return sole.test(lower) || initial.test(lower) || trailing.test(lower);
+}
+
+/** Which human, if any, this text CALLS by name. Principal's side is tested first. */
+export function humanAddressee(content: string, names: HumanNames = DEFAULT_NAMES): HumanSide | null {
+  // A letter run of 3+ collapses ("blueee"), same rule as extractAddress.
+  const lower = content.toLowerCase().trim().replace(/([a-z])\1{2,}/g, "$1");
+  if (!lower) return null;
+  if (isVocativeName(lower, names.principal)) return "principal";
+  if (isVocativeName(lower, names.spouse)) return "spouse";
+  return null;
+}
+
+/**
+ * The text the companion-address parsers should read for a gathered burst (ruling 1: a companion named
+ * ANYWHERE in the burst gets the turn). The newest message when it names a companion itself; else the
+ * most recent earlier message that does; else the newest. A burst of one is the identity function, so
+ * with settle off nothing changes.
+ */
+export function burstAddressText(newest: string, earlier: string[]): string {
+  if (extractAddress(newest).type !== "ambient") return newest;
+  for (let i = earlier.length - 1; i >= 0; i--) {
+    if (extractAddress(earlier[i]!).type !== "ambient") return earlier[i]!;
+  }
+  return newest;
+}
+
+export type HumanGateVerdict =
+  | { kind: "proceed" }
+  | { kind: "silent"; addressee: HumanSide }
+  | { kind: "spouse_thread"; holder: CompanionId | null };
+
+export interface HumanGateInput {
+  tier: "owner" | "intimate" | "guest";
+  /** The gathered burst, oldest first, newest last. A single message is a burst of one. */
+  texts: string[];
+  names: HumanNames;
+  /** A companion @mentioned in the newest message or any burst message. */
+  companionMentioned: boolean;
+  /** Any burst message replies to one of this companion's own messages. */
+  replyToCompanion: boolean;
+  /** Humans @mentioned (Discord mention) in the burst. */
+  mentionedHumans: HumanSide[];
+  /** Spouse's per-human thread holder (never Principal's). Only read for an unnamed Spouse message. */
+  spouseHolder: CompanionId | null;
+  /** The human whose message this one is a Discord reply to (reply-context.ts), or null. Only set
+   *  when REPLY_HUMAN_GATE is `on`; in shadow the handler runs the gate twice and logs the difference. */
+  replyToHuman?: HumanSide | null;
+}
+
+/**
+ * Rule 1 of the gate, on its own so the handler can tell a `proceed` that came from a NAME (a
+ * companion named, mentioned or replied to anywhere in the burst) from one that came from Rule 4
+ * (an unnamed owner line): only the second is the live Jev gate's business (human-jev-gate.ts).
+ * extractAddress keeps its third-person demotion, a group call counts, and so does the private lexicon.
+ */
+export function companionNamedIn(input: Pick<HumanGateInput, "texts" | "companionMentioned" | "replyToCompanion">): boolean {
+  return input.companionMentioned || input.replyToCompanion
+    || input.texts.some(t => extractAddress(t).type !== "ambient");
+}
+
+export function humanGate(input: HumanGateInput): HumanGateVerdict {
+  const { tier, texts, names } = input;
+  if (tier !== "owner" && tier !== "intimate") return { kind: "proceed" };
+
+  // Rule 1: a companion named anywhere in the burst.
+  if (companionNamedIn(input)) return { kind: "proceed" };
+
+  const speaker: HumanSide = tier === "owner" ? "principal" : "spouse";
+
+  // Rule 2: the other human is the addressee.
+  for (const side of [...texts.map(t => humanAddressee(t, names)), ...input.mentionedHumans]) {
+    if (side && side !== speaker) return { kind: "silent", addressee: side };
+  }
+
+  // Rule 2b (2026-10-31, Principal: "if I reply to Spouse, then it's just for Spouse"): a Discord reply to the
+  // OTHER human's message is to them. A reply to one's own message says nothing, and Rule 1 already let
+  // a named companion through.
+  if (input.replyToHuman && input.replyToHuman !== speaker) return { kind: "silent", addressee: input.replyToHuman };
+
+  // Rule 3: unnamed Spouse belongs to the companion holding Spouse's thread, else to nobody.
+  if (tier === "intimate") return { kind: "spouse_thread", holder: input.spouseHolder };
+
+  // Rule 4.
+  return { kind: "proceed" };
+}
+
+// ------------------------------------------------------------------ per-human thread hold
+//
+// The 15-minute exchange hold (`activeExchangeHolder`) is per CHANNEL and keyed to Principal: it takes
+// the last companion message in the room. Spouse's thread must be Spouse's own: the companion that replied
+// TO SPOUSE in this channel inside the window. It lives in Redis (shared by all three bots, one key per
+// human per channel). The ids of replies sent to Spouse are kept in a set so Principal's history walk can
+// skip them: a companion answering Spouse must not become the holder of Principal's thread.
+
+export interface HoldRedis {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string, mode: "PX", ms: number): Promise<unknown>;
+  sadd(key: string, ...members: string[]): Promise<unknown>;
+  pexpire(key: string, ms: number): Promise<unknown>;
+  smembers(key: string): Promise<string[]>;
+}
+
+const holdKey = (human: HumanSide, channelId: string) => `ns:humanhold:${human}:${channelId}`;
+const holdIdsKey = (human: HumanSide, channelId: string) => `ns:humanhold:${human}:ids:${channelId}`;
+
+/**
+ * Does this reply to Spouse make me the holder of Spouse's thread? (2026-11-01, movie night.) In a HOSTED room a
+ * sibling who answers a group call ("you guys") is a guest voice, not the new thread owner: Gaia answered one
+ * group call at 11:43, the last-writer-wins hold moved to her for the room's 3h window, and Drevan stood down on
+ * every unnamed Spouse line after it. A non-host takes the hold only when Spouse spoke to it directly (named,
+ * @-mentioned, or replied to its message). The host, and every non-hosted room, keep the old rule.
+ */
+export function takesSpouseHold(o: { host: string | null | undefined; me: string; addressedMe: boolean }): boolean {
+  if (!o.host || o.host === o.me) return true;
+  return o.addressedMe;
+}
+
+/** A companion replied to `human` in `channelId`: it now holds that human's thread. Never throws. */
+export async function recordHumanHold(
+  redis: HoldRedis | null,
+  human: HumanSide,
+  channelId: string,
+  companionId: CompanionId,
+  sentMessageIds: string[],
+  windowMs: number,
+  now: number = Date.now(),
+): Promise<void> {
+  if (!redis) return;
+  try {
+    await redis.set(holdKey(human, channelId), `${companionId}|${now}`, "PX", windowMs);
+    if (sentMessageIds.length > 0) {
+      const k = holdIdsKey(human, channelId);
+      await redis.sadd(k, ...sentMessageIds);
+      // Outlives the hold itself: Principal's walk is bounded by the same window, never longer.
+      await redis.pexpire(k, windowMs * 2);
+    }
+  } catch { /* a lost hold means Spouse is unanswered, never a crash */ }
+}
+
+/** Who holds `human`'s thread in this channel right now, or null (no redis, expired, none). */
+export async function readHumanHold(
+  redis: HoldRedis | null,
+  human: HumanSide,
+  channelId: string,
+  windowMs: number,
+  now: number = Date.now(),
+): Promise<CompanionId | null> {
+  if (!redis) return null;
+  try {
+    const raw = await redis.get(holdKey(human, channelId));
+    if (!raw) return null;
+    const [id, ts] = raw.split("|");
+    if (!id || (id !== "cypher" && id !== "drevan" && id !== "gaia")) return null;
+    if (now - Number(ts) > windowMs) return null;
+    return id;
+  } catch {
+    return null;
+  }
+}
+
+/** Ids of the companion messages that were replies to `human` (for excluding from the other human's holder walk). */
+export async function readHumanHoldIds(redis: HoldRedis | null, human: HumanSide, channelId: string): Promise<Set<string>> {
+  if (!redis) return new Set();
+  try {
+    return new Set(await redis.smembers(holdIdsKey(human, channelId)));
+  } catch {
+    return new Set();
+  }
+}
+
+
+// ── Learned names (2026-10-10, Principal's ruling: "learn from the proxies") ───────────────────────
+// Spouse's system has 393 PluralKit members; loading them all would add everyday words ("The", "Guy",
+// "Max") as addressees. Instead every PK proxy from Spouse's system teaches the gate that front's
+// name, so anyone who has actually fronted is covered, new fronts included, with no upkeep and no
+// reload. Stored in one Redis set shared by all three bots (no expiry); read with a short cache.
+
+/** Words that must never become an addressee even if a front is named that way. */
+const NAME_STOP = new Set([
+  "the", "and", "but", "you", "your", "she", "her", "him", "his", "they", "them", "our", "not",
+  "yes", "no", "hey", "hi", "hello", "baby", "babe", "love", "dear", "guy", "man", "boy", "girl",
+  "kid", "sir", "mom", "dad", "mrs", "miss", "mr", "dr", "the-", "who", "what", "okay", "ok",
+]);
+
+/** Name tokens a front can be called by: its first name and any quoted nickname, lowercased.
+ *  "Rosalind ‘Birdy’ M. || 🍂" -> ["rosalind", "birdy"]; "Dave (the best one) || 🍂" -> ["dave"].
+ *  Tokens under 3 letters or in NAME_STOP are dropped. */
+export function nameTokensFromFront(front: string | null | undefined): string[] {
+  if (!front) return [];
+  let s = front.split("||")[0]!.replace(/\([^)]*\)/g, " ").trim();
+  const out = new Set<string>();
+  for (const m of s.matchAll(/[‘’'"“”]([^‘’'"“”]{2,30})[‘’'"“”]/g)) {
+    const nick = m[1]!.trim().split(/\s+/)[0]!.toLowerCase().replace(/[^a-z-]/g, "");
+    if (nick) out.add(nick);
+  }
+  s = s.replace(/[‘’'"“”][^‘’'"“”]*[‘’'"“”]/g, " ");
+  const first = (s.trim().split(/\s+/)[0] ?? "").toLowerCase().replace(/[^a-z-]/g, "");
+  if (first) out.add(first);
+  return [...out].filter(t => t.length >= 3 && !NAME_STOP.has(t));
+}
+
+export interface NameRedis {
+  sadd(key: string, ...members: string[]): Promise<unknown>;
+  smembers(key: string): Promise<string[]>;
+}
+
+const learnedKey = (side: HumanSide) => `ns:humannames:${side}`;
+const learnedCache = new Map<HumanSide, { at: number; names: string[] }>();
+const LEARNED_TTL_MS = 60_000;
+
+/** Record a proxied front's name tokens. Fire-and-forget; never throws. */
+export async function learnHumanName(redis: NameRedis | null, side: HumanSide, front: string | null | undefined): Promise<string[]> {
+  const tokens = nameTokensFromFront(front);
+  if (!redis || tokens.length === 0) return tokens;
+  try {
+    await redis.sadd(learnedKey(side), ...tokens);
+    const c = learnedCache.get(side);
+    if (c) c.names = [...new Set([...c.names, ...tokens])];
+  } catch { /* a lost learn only means one name is recognised a little later */ }
+  return tokens;
+}
+
+/** Learned names for a side, cached for a minute. Empty on no Redis or error. */
+export async function learnedHumanNames(redis: NameRedis | null, side: HumanSide, now: number = Date.now()): Promise<string[]> {
+  if (!redis) return [];
+  const c = learnedCache.get(side);
+  if (c && now - c.at < LEARNED_TTL_MS) return c.names;
+  try {
+    const names = (await redis.smembers(learnedKey(side))).filter(n => n.length >= 3 && !NAME_STOP.has(n));
+    learnedCache.set(side, { at: now, names });
+    return names;
+  } catch {
+    return c?.names ?? [];
+  }
+}
+
+/** Env names plus learned names (deduped). */
+export function mergeHumanNames(base: HumanNames, learned: Partial<HumanNames>): HumanNames {
+  return {
+    principal: [...new Set([...base.principal, ...(learned.principal ?? [])])],
+    spouse: [...new Set([...base.spouse, ...(learned.spouse ?? [])])],
+  };
+}
+
+/** Test hook: forget the in-memory cache. */
+export function resetLearnedNameCache(): void { learnedCache.clear(); }

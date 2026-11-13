@@ -1,0 +1,4454 @@
+import type { ChannelConfig } from "./types.js";
+import { railSuppressed } from "./rail-telemetry.js";
+import { currentTurn, turnTags } from "./turn-telemetry.js";
+import { extractGeneratedMedia, PHANTOM_IMAGE_NOTE, PHANTOM_IMAGE_MARK } from "./generated-media.js";
+import path from "node:path";
+import { noteServed, noteTranscript } from "./served-memory.js";
+import { dmGateVerdict, droppedDmLogLine, dmParaphraseMemorySealed, placeBlock, partnerDmEnabled } from "./dm.js";
+import { CROSS_ROOM_CLOSE, CROSS_ROOM_CLOSE_AFTER, crossRoomDigest, crossRoomOn, trustedGuildIds } from "./cross-room.js";
+import { claimPkProfile } from "./pk-profile-seen.js";
+import { peopleForTurn, peopleIndexFor, readPeopleFrameMode, type PeopleCache } from "./people-frame.js";
+import { pickFacts, readFactsPickMode, type FactsPickRedis } from "./facts-pick.js";
+import { SPOUSE_LABEL, cutImpersonation, describeSpeaker, pkProfileBlock, pkProfileOn, pkRoomLabel, speakerFrame, speakerFrameOn } from "./speaker-frame.js";
+import { GUILD_TRIAD_GUILD_ID } from "./guild-seed.js";
+import { parseMedAnswer } from "./med-answer.js";
+import { renderMedStateBlock } from "./med-context.js";
+import { medRemindersSent, medLocalTime, medLocalClock } from "./med-reminder.js";
+import { openRemindedSlots, runMedAnswerClassifier } from "./med-answer-classify.js";
+import { sealDmChannel } from "./recall-context.js";
+import { roomTagForMessage } from "./room-tag.js";
+import {
+  parseDiscordLivePath, mayWidenAcross, isServerRoom, buildRecallContext,
+  WIDEN_BEFORE, WIDEN_AFTER, type RecalledMessage,
+} from "./recall-context.js";
+// Shared Discord messageCreate handler for the companion bots (cypher/drevan/gaia).
+//
+// The ~500-line handler was triplicated near-verbatim across the three bots. It is lifted
+// here as `handleMessage(message, deps)`. Every per-bot dependency (clients, stores, refs,
+// counter maps, config constants, the voice join/leave closures) is passed in via `deps`,
+// destructured to the SAME local names the inline handler used — so the body below is
+// byte-identical to the original modulo three deliberate reconciliations:
+//
+//   1. STT-before-model-switch ordering. The bots had drifted: gaia transcribed voice into
+//      `effectiveContent` BEFORE the owner model-switch check (so spoken model switches
+//      worked), cypher/drevan checked `message.content` first (text-only). Canonical = gaia's
+//      order. On the text path `effectiveContent === message.content`, so cypher/drevan are
+//      unchanged; on the voice path they GAIN owner-gated spoken model switching. No regression.
+//   2. Audit injection is cypher-only. `AUDIT_TRIGGERS` / `AUDIT_MODE_INJECTION` are OPTIONAL
+//      deps; the block is guarded so drevan/gaia (which never had it) never fire it.
+//   3. Log tags derive from `COMPANION_ID` (already lowercase).
+//
+// Identity stays per-bot: prompt prefix lives in bootCtx, framings/keywords/audit in config.
+
+import { APPEND_MAX_AGE_MS } from "./write-queue.js";
+import { fireBeingSeenCheck } from "./being-seen-check.js";
+import { fireAddressShadow, recordAddressSpoke } from "./address-shadow.js";
+import { ownerTurnLabel, proxyTurnLabel } from "./address-jev.js";
+import { spouseColdPickMode, runSpouseColdPick, type SpouseColdRedis } from "./spouse-cold-pick.js";
+import { humanJevGateMode, runHumanJevGate, type HumanJevGateResult, type HumanJevRedis } from "./human-jev-gate.js";
+import { addressModelMode, type AddressTurn } from "./address-model.js";
+import { isSolPost, withoutSol, muzzleVerdict, solDeclineReason, solMomentFraming, solRecognizedLogLine, SOL_AUTHOR_LABEL } from "./sol-sender.js";
+import { Message, TextChannel, type Client, type VoiceBasedChannel } from "discord.js";
+import { VoiceConnectionStatus, createAudioResource, type VoiceConnection, type AudioPlayer } from "@discordjs/voice";
+import { Readable } from "stream";
+import {
+  resolveAttribution, detectPluralKit, verifiedRosterMember, pkAppIdKind,
+  isInvitation, isLeaveRequest, markVoiceUsed, shouldVoice,
+  isDirectAddress, shouldRespond, computeChainDepth, extractAddress, activeExchangeHolder, namesSiblingOnly,
+  judgeAmbientRelevance,
+  NEW_THREAD_GAP_MS, COMPANION_CHAIN_LIMIT, MAX_BOT_RESPONSES_PER_HUMAN,
+  BOT_PINGPONG_MAX, BOT_LOOP_COOLDOWN_MS,
+  countBotMsgsSinceHuman, botMsgsSinceHumanMax, isTriadCommons, FLOOR_HANDBACK_WINDOW, floorHandbackDirective,
+  inferTemperature, createAdapter, withCaller, replyMaxTokensFor, EXTREME_TEMP_THRESHOLD, EXTREME_TEMP_CAP, COOLDOWN_TEMP,
+  type AdapterKeys, type AdapterUrls, type InferenceAdapter,
+  setLastActivity, noteOwnerArrival, type Redis,
+  buildFitSignals, scoreFit, fastPathWinner, runBidRound, claimSpoken, bidDeadlineAfterGate, MIN_BID_TO_SPEAK, closeBidLine,
+  type InboxItem, ACTIVE_EXCHANGE_WINDOW_MS,
+  humanGate, companionNamedIn, humanAddressee, humanNamesFromEnv, burstAddressText, readHumanHold, readHumanHoldIds, recordHumanHold, takesSpouseHold, type HumanSide, type HoldRedis,
+  learnHumanName, learnedHumanNames, mergeHumanNames, type NameRedis,
+  careHoldActive, CARE_HOLD_MIN_BID, holdFloorApplies,
+  FollowUpLedger, namedOrderInMessage, bidSpeakingOrder, FOLLOW_UP_TTL_MS, followUpPassFor, publishFollowUpPass, type FollowUpEntitlement,
+  pickReaction, shouldReactOnBidLoss, shouldReactOnNamedOther, shouldReactOnCareHold, REACTION_COOLDOWN_MS,
+  resolveRoutingChannelId,
+  clearConsolidation,
+  isResponseCoherent,
+  sendLong,
+  liveIngest,
+  reportVoiceScore, voiceFeedbackBlock, ruleCheckAppend, calledAsName, misseatedReply, repairMisseated, type VoiceCompanionId,
+  echoScore, echoThreshold, ownEchoGated, verbatimCopyOf, verbatimCopyThreshold, buildVerbatimPool,
+  detectSelfLoop, loopBreakDirective,
+  formBreakAppend,
+  formWindowShape,
+  mergeSelfTurns,
+  consumeTripwires, tripwireBlock,
+  runDistillation,
+  isListenEnabled, runListenPipeline, reactToExperience, heardStmMarker, notHeardStmMarker,
+  visionEnabled, pickImageAttachments, seenBlock, seenStmMarker, type SeenImage,
+  resolveSeenImages, sharedVisionCache, visionTurnBudgetMs, visionPrefetchEnabled, type VisionRedis,
+  commandUsage, COMMAND_PREFIX, mediaCommandTarget, buildCommandTriggers, buildDryRunTrigger, COMPANION_ALIASES,
+  isWatchEnabled, runWatchPipeline, watchedStmMarker, notWatchedStmMarker, notWatchedBlock, isWatchableUrl,
+  handleClubCommand,
+  handleLogCommand,
+  handleIntoCommand,
+  handleWatchCommand,
+  parseWatchPartyChannels, detectWatchProgress, recordWatchProgress, resolveWatchPartyStart, stripKindWords,
+  handleToolSearch, formatSearchReadIn, handleToolImage, handleCouncilConvene,
+  handlePetCommand,
+  handleImpCommand,
+  ALL_MODELS,
+  selectableModels,
+  LibrarianClient, ownNotesRecallMode, decideReach, reachNotePreviews, recallBlocksFor, reachDeclineMode, declinedUnreadBlocks, executeRetract, RetractBumps, RETRACT_BUMPS_SETTING, ReplyIndex, type RetractMsg, WriteQueue, StmStore, SessionWindowManager, refreshNowLine,
+  ChannelConfigCache, PkDedup, PkRoster, VoiceClient,
+  type ChatMessage, type BootContext, type CompanionId,
+  isThreadsEnabled, isThreadTracked, isPresenceChannel, ensureThread, buildSpineBlock, parseLandMarker, gist, computeReplyRef,
+  isThreadSpent,
+  type ConvoActiveDto,
+  publishCommonsMessage, directorMode, isDirectorChannel,
+  commonsMessageFor, shouldDeferToDirector,
+} from "./index.js";
+import { selectImp, impRider, type ImpState } from "./imps.js";
+
+/** Human side of a VERIFIED roster member (verifiedRosterMember); null when unverified. */
+const pkSideOf = (pm: { isOwner: boolean } | null): "principal" | "spouse" | null => (pm ? (pm.isOwner ? "principal" : "spouse") : null);
+import { ledgerDistillEnabled, preflightLedgerBody, companionDisplayName } from "./ledger-clerk.js";
+import type { LedgerEntryInput } from "./librarian.js";
+import { hermesSystemBase, hermesDelta, insertStable, mapVolatileTail } from "./prompt-assembly.js";
+import { readFramePacketMode, frameLogLine, framePacketFor } from "./frame-packet.js";
+import { hermesSessionIds, hermesRotationMode } from "./hermes-session.js";
+import { createHermesRouter, hermesRouteTier, hermesRouteLine, routedSessionId, routedChannelKey, type HermesRouter, type HermesRoute } from "./hermes-route.js";
+import { detectScriptBleed, regenerateAfterBleed, scriptBleedGuardOn } from "./script-bleed.js";
+import { voiceGateMode, judgeVoice, stripEmDashes, voiceGateLine, voiceGateCorrective } from "./voice-gate.js";
+import { readWritebackGateMode, type WritebackGateMode } from "./jev-gate.js";
+import { runWritebackGate, speechMomentTag } from "./writeback-gate.js";
+import { buildWritebackSpeaker, judgeExchangeFor, withAttachedLabel } from "./memory.js";
+import { stampRelative } from "./relative-time.js";
+import {
+  WatchalongDelivery, watchalongEnabled, suppressVaultRecallForWatch, handleMovieCommand, handleAtCommand, readCaptionAttachment, getActiveWatchalong,
+  type PreparedDelivery, type CaptionAttachment,
+} from "./watchalong.js";
+import {
+  appliesBotRails, resetsBotRails, clearsStaleRails, botRailSilence, runsAmbientClassifier, mayVoice, turnFraming,
+  followUpPassEnabled, ArrivalMediaCache, arrivalMediaPlan,
+} from "./pass-turn.js";
+import {
+  badNightMode, matchHoldPhrase, careFollowUpChain, careChainPosition, b32Log, b32TurnBlock, holdOpenerLine,
+  askedWhereSiblings, markOwnerDmLive, bidFloorFor, liveSiblingDm, COMPANION_SET_HOLD_LINE, CARE_FOLLOWUP_MIN_GAP_MS,
+  type HoldPhrase, type ChainHistoryMsg, type RedisLike,
+} from "./bad-night.js";
+import { getCareState, setCareState, applyLocalHold, careHoldSince } from "./care-state.js";
+import { repetitionDipVerdict } from "./repetition-dip.js";
+import {
+  departuresMode, matchStandDown, applyStandDown, clearDeparturesLocal, ensureDepartures, departureLift,
+  departureLiftLine, departureLog, departureTurnLines, STAND_DOWN_PHRASE, type ClaimRedis,
+} from "./departure-state.js";
+import { passOnOrdinaryMode, passableOrdinaryTurn, ordinaryPassBlock } from "./ordinary-pass.js";
+import { postProcessReply } from "./reply-postprocess.js";
+import { getHeartbeatCtx, runDryRunHeartbeat, formatDryRunReport, sendReportToOwnerDm } from "./heartbeat-dry-run.js";
+import { replyTarget, replyContextLine, replyToHumanSide, replyHumanGateMode, type ReplyTarget } from "./reply-context.js";
+import {
+  decideRoomTiming, roomTimingMode, appendRoomTimingLine, overrideKey, OVERRIDE_TTL_MS, buildRoomOverrideTrigger,
+  liveHoldApplies, timingHolder, type RoomTimingResult, type RoomTimingReason,
+} from "./room-timing.js";
+import { labelSafe, neutralizeRecalled } from "./recalled-text.js";
+
+// Writeback gate mode (2026-09-21). Read ONCE per process: a knob re-read per message would
+// let the three modes interleave mid-conversation, and the shadow measurement needs a stable
+// denominator. Restart the bot to change it. Resolved on first use rather than at module load
+// (2026-10-07) because the per-companion override needs COMPANION_ID, which arrives with config.
+let writebackGateMode: WritebackGateMode | null = null;
+function writebackGateModeFor(companionId: string): WritebackGateMode {
+  return (writebackGateMode ??= readWritebackGateMode(process.env, companionId));
+}
+
+// ---------------------------------------------------------------------------
+// Imp context cache (module-level, per-process = per companion bot).
+// TTL: 5 minutes so imp flavor adds zero per-message HTTP cost.
+// ---------------------------------------------------------------------------
+interface ImpContextCache {
+  state: ImpState | null;
+  settings: { impsEnabled: boolean; hexEnabled: boolean };
+  at: number;
+}
+const IMP_CONTEXT_TTL_MS = 5 * 60 * 1_000;
+let _impContextCache: ImpContextCache | null = null;
+
+// Hermes delivered mark (2026-07-03): per-channel high-water timestamp of turns actually
+// delivered to the gateway session. Module-level = per-process = per companion bot.
+// Advanced ONLY after a successful gateway reply, so a failed call re-sends its delta.
+const hermesDeliveredMark = new Map<string, number>();
+/** The mark for a (port-scoped) channel key. H3: the guest gateway's first turn in a room since this
+ *  process started re-sends the window (mark 0): its transcript may be brand new, and "since my last
+ *  reply" would count the OWNER gateway's last reply as its own. The owner key keeps the old null. */
+function hermesDeliveredMarkFor(key: string): number | null {
+  const m = hermesDeliveredMark.get(key);
+  if (m !== undefined) return m;
+  return key.endsWith("#guest") ? 0 : null;
+}
+/** Per room: newest other-room timestamp already carried into it (cross-room.ts). */
+const crossRoomMark = new Map<string, number>();
+/** Per room: the seat repair cut my own name from my last reply here; the next frame says so once. */
+const seatSlipped = new Set<string>();
+
+// Hermes session rotation (2026-09-05): per-channel last transcript id actually sent to the
+// gateway. Module-level = per-process = per companion bot, same idiom as hermesDeliveredMark
+// above. Used only to detect a rotation edge (this reply's computed id differs from the last one
+// sent) so the delivered mark can be reset -- the new transcript has no history, so the next
+// delta must re-send the recent window instead of folding nothing.
+const hermesLastSessionId = new Map<string, string>();
+
+// Rotate-on-retract (2026-09-26): per-channel count of `<prefix>: retract` gestures, folded into
+// the transcript id as `:r<n>` (hermesSessionIds). Module-level = per-process = per companion bot,
+// same idiom as hermesDeliveredMark above. WHY: the retract command archived the journal rows,
+// the wm note and the vault doc, and the mistake still echoed from the gateway transcript until
+// the 19:00 CDT rotation -- the model kept answering from a reply Principal had already pulled. One
+// retract now also rotates the transcript (the id change trips the rotation edge below, which
+// re-sends the STM window, minus the retracted line) and clears the window. Persisted in the
+// companion setting `hermes_retract_bumps` ({ [channelId]: n }) so a restart cannot walk the
+// count back down and reopen the transcript that still holds the retracted reply. The load and
+// the write live in retract-bumps.ts (2026-09-26 review: a failed load used to be cached as "no
+// bumps", and the next write then erased every other channel's count).
+let retractBumps: RetractBumps | null = null;
+
+/** The process's bump store, built on first use (the librarian is the same object every turn). */
+function bumpsFor(librarian: LibrarianClient): RetractBumps {
+  if (!retractBumps) {
+    retractBumps = new RetractBumps({
+      read: () => librarian.getSettingStrict(RETRACT_BUMPS_SETTING),
+      write: (v) => librarian.setSetting(RETRACT_BUMPS_SETTING, v),
+    });
+  }
+  return retractBumps;
+}
+
+/** Load the persisted bumps if they are not in yet; never throws, retries after a failure. */
+async function ensureRetractBumps(librarian: LibrarianClient): Promise<RetractBumps> {
+  const b = bumpsFor(librarian);
+  await b.ensureLoaded();
+  return b;
+}
+
+// Reply index (2026-09-26 review, retract): every chunk id this bot sends -> its head chunk, its
+// full text, and the message that triggered the turn, so `<prefix>: retract` on any chunk reaches
+// the keys the stores actually used (see reply-index.ts). Redis-backed when configured, so a
+// reload does not forget; built on first send.
+let replyIndex: ReplyIndex | null = null;
+function replyIndexFor(companionId: string, redis: Redis | null): ReplyIndex {
+  if (!replyIndex) replyIndex = new ReplyIndex(companionId, redis);
+  return replyIndex;
+}
+
+/**
+ * A predecessor in a multi-address order passed (followup_pass, published when a rail silenced
+ * its turn). Returns the entitlement this releases, consumed, or null. Called by bot-core's
+ * listener, which then runs the entitled turn on the origin message.
+ */
+export function releaseFollowUpOnPass(pass: { channelId: string; originMessageId: string; fromCompanionId: CompanionId }): FollowUpEntitlement | null {
+  return followUps.releaseOnPass(pass);
+}
+
+// Director liveness gate (2026-09-03 review): when in `live` mode but the worker's
+// `director:alive` key has lapsed, this bot must fall back to its own reply path rather than
+// silently deferring into a void. Module-level = per-process = per companion bot, so this warns
+// at most once every 60s regardless of how many messages land in that window.
+const DIRECTOR_NOT_ALIVE_WARN_MS = 60_000;
+let lastDirectorNotAliveWarnAt = 0;
+
+// Sequential floor + reaction tier state (2026-08-15 floor rework). Module-level = per-process
+// = per companion bot, the same idiom as hermesDeliveredMark above.
+//   followUps: this companion's pending "I answer after my predecessor" entitlements.
+//   replyAuthorCache: durable reply-to lookups already resolved (positive hits only -- a null
+//     can be a ledger write still in flight, so misses re-query).
+//   reactionCooldownUntil: per-channel emoji-reaction throttle.
+const followUps = new FollowUpLedger();
+const replyAuthorCache = new Map<string, string>();
+const REPLY_AUTHOR_CACHE_CAP = 500;
+const reactionCooldownUntil = new Map<string, number>();
+// Arrival STT transcripts + image descriptions, by message id, for a follow-up PASS turn on the
+// same message (pass-turn.ts): the pass reuses them instead of paying STT and ~90s/image again.
+const arrivalMedia = new ArrivalMediaCache();
+
+// Passive watch-party progress (2026-09-05): last `${season}x${episode}` recorded per channel,
+// module-level = per-process = per companion bot. Dedupes the passive write against repeated
+// mentions of the same position in the same conversational burst (Principal restating "S4E6" a few
+// messages later shouldn't re-POST). Empty when WATCH_PARTY_CHANNELS is unset, so the block below
+// is a no-op on every box that hasn't configured it.
+const lastPassiveWatchProgress = new Map<string, string>();
+
+// Watchalong delivery state (spec 2026-10-02): per-channel lastDelivered + a <=10s read cache.
+// Module-level = per-process = per companion bot, the hermesDeliveredMark idiom. Built lazily on the
+// first turn because the Halseth secret arrives with the bot's cfg, not at module load.
+let _watchalongDelivery: WatchalongDelivery | null = null;
+function watchalongDeliveryFor(secret: string, companionId: string): WatchalongDelivery {
+  if (!_watchalongDelivery) _watchalongDelivery = new WatchalongDelivery({ secret, companionId });
+  return _watchalongDelivery;
+}
+
+async function getImpContext(
+  librarian: LibrarianClient,
+  now: number,
+): Promise<{ state: ImpState | null; settings: { impsEnabled: boolean; hexEnabled: boolean } }> {
+  if (_impContextCache && now - _impContextCache.at < IMP_CONTEXT_TTL_MS) {
+    return { state: _impContextCache.state, settings: _impContextCache.settings };
+  }
+  const [rawState, rawSettings] = await Promise.all([
+    librarian.getPrincipalState().catch(() => null),
+    librarian.getImpSettings().catch(() => null),
+  ]);
+  // Imp state freshness (2026-07-04): /biometrics/latest returns the newest row with no
+  // age bound, so one logged state tinted every reply for 19+ hours (48 identical
+  // "pain=6" mossling activations off a single 07-03 snapshot). An imp reflects NOW;
+  // a state older than the window is a ghost -- no tint. Env IMP_STATE_FRESH_H, default
+  // 12h; 0 disables the check (legacy behavior).
+  const freshRaw = parseFloat(process.env["IMP_STATE_FRESH_H"] ?? "");
+  const freshMs = (Number.isFinite(freshRaw) && freshRaw >= 0 ? freshRaw : 12) * 3_600_000;
+  const recordedAt = rawState?.recorded_at ? Date.parse(rawState.recorded_at) : NaN;
+  const stale = freshMs > 0 && (!Number.isFinite(recordedAt) || now - recordedAt > freshMs);
+  const state: ImpState | null = rawState && !stale
+    ? { mood: rawState.mood, energy: rawState.energy, focus: rawState.focus,
+        pain: rawState.pain, spoons: rawState.spoons, sleep_hours: rawState.sleep_hours }
+    : null;
+  const settings = rawSettings ?? { impsEnabled: false, hexEnabled: false };
+  _impContextCache = { state, settings, at: now };
+  return { state, settings };
+}
+
+// Typing keepalive (2026-07-06): Discord's typing indicator expires after ~10s, but a
+// hermes/direct inference turn runs 30-120s. The Brain relay path always had a 4s
+// keepalive interval; the direct path sent ONE sendTyping and then went dark for the
+// rest of the turn -- the bot looked frozen, then a reply popped in late. Wrap every
+// direct generate call so the channel shows a live typing state for the whole turn.
+async function withTyping<T>(ch: TextChannel, fn: () => Promise<T>): Promise<T> {
+  const keepalive = setInterval(() => { ch.sendTyping().catch(() => {}); }, 8_000);
+  try {
+    return await fn();
+  } finally {
+    clearInterval(keepalive);
+  }
+}
+
+/** Minimal shape of the per-bot `loadBotConfig()` result the handler reads. */
+export interface MessageHandlerCfg {
+  ownerDiscordId: string;
+  spouseDiscordId?: string;
+  ownerDisplayName: string;
+  halsethSecret: string;
+}
+
+export interface MessageHandlerDeps {
+  client: Client;
+  cfg: MessageHandlerCfg;
+  voiceClient: VoiceClient | null;
+  redis: Redis | null;
+  librarian: LibrarianClient;
+  // live refs (same instances the refresh loop mutates)
+  adapterRef: { current: InferenceAdapter };
+  /** Direct, tool-less adapter (DeepInfra-first, DeepSeek-direct fallback; see
+   *  direct-inference.ts) used ONLY by the two small classifier calls -- judgeWriteback and
+   *  judgeAmbientRelevance -- that need zero tools. Built once in bot-core.ts. null when neither
+   *  DEEPINFRA_API_KEY nor DEEPSEEK_API_KEY is configured, in which case both judges fall back to
+   *  `adapterRef.current` (the Hermes agent path under INFERENCE_MODE=hermes) -- more expensive,
+   *  still correct. Optional so direct handleMessage() calls in tests need no direct-adapter
+   *  plumbing. */
+  directAdapter?: InferenceAdapter | null;
+  /** H3 guest port (hermes-route.ts): picks the owner or the restricted guest Hermes gateway for a
+   *  turn from who is speaking. Built once in bot-core. Optional for tests that call handleMessage()
+   *  directly; absent = every turn on `adapterRef.current` (the pre-H3 behaviour). */
+  hermesRouter?: HermesRouter;
+  activeModelRef: { key: string | null; label: string };
+  /** Keys the live hermes-model-map.json can apply, read at boot. null = not hermes mode, or the
+   *  map was unreadable; both mean fall back to the full registry. See hermes-model-map.ts. */
+  hermesModelKeysRef?: { value: Set<string> | null };
+  currentMoodRef: { value: string | null };
+  lastSomaRefreshRef: { value: number };
+  /** Live orient context (forage finds, recent listens, incoming notes, growth) -- the
+   *  same ref the refresh loop mutates. Read at MESSAGE time, never a stale boot copy.
+   *  Direct/brain paths already receive this inside bootCtx.systemPrompt (composePrompt);
+   *  the hermes branch replaces that prompt with a lean base, so it appends this itself. */
+  recentContextRef: { value: string };
+  bootCtx: BootContext;
+  // stores
+  stmStore: StmStore;
+  writeQueue: WriteQueue;
+  configCache: ChannelConfigCache;
+  sessionWindows: SessionWindowManager;
+  pkDedup: PkDedup;
+  /** PluralKit member roster -- offline identification of the fronting member behind a proxy.
+   *  Optional so direct handleMessage() calls in tests need no PK plumbing. */
+  pkRoster?: PkRoster | null;
+  /** Sender id recovered at event time by pairing this webhook with the original PluralKit
+   *  deleted (see pkIngestAtEvent). Present only on proxied messages, and only when the
+   *  pairing matched -- it is the offline half of owner resolution. */
+  pkSenderId?: string;
+  // per-channel state maps/sets
+  guildVoiceConnections: Map<string, { connection: VoiceConnection; player: AudioPlayer }>;
+  sentIds: Set<string>;
+  distillationCounter: Map<string, number>;
+  pulseCounter: Map<string, number>;
+  botResponsesSinceHuman: Map<string, number>;
+  botPingpongCooldownUntil: Map<string, number>;
+  extremeTempCount: Map<string, number>;
+  apiKeys: AdapterKeys;
+  apiUrls: AdapterUrls;
+  /** Channel-inbox supersede probe (2026-07-06): true once a newer human conversational
+   *  message is queued behind this turn. Checked before the expensive reply work (skip)
+   *  and again after inference (drop) -- the superseding turn answers with this message
+   *  already absorbed into STM. Absent (e.g. tests calling handleMessage directly) =
+   *  never superseded. */
+  isSuperseded?: (phase?: "pre" | "post") => boolean;
+  /** Burst settle (channel-inbox TurnContext, 2026-10-10): the window this turn waited (0 = none)
+   *  and the same speaker's earlier messages gathered into it. The reply path resolves names over
+   *  the whole burst, and the fit bid shifts its deadline by `settleMs`. Absent = no settle. */
+  settleMs?: number;
+  burst?: InboxItem[];
+  /** Set when this turn is run because my predecessor in a multi-address order PASSED
+   *  (releaseFollowUpOnPass): `message` is then the human origin message, and the turn is an
+   *  entitled follow-up answering it. */
+  followUpPass?: FollowUpEntitlement;
+  /** Room timing live (ROOM_TIMING=on, room-timing.ts LullScheduler): this turn is the RELEASE of a line
+   *  this companion held for the lull. It skips the timing gate and the shadow row (already written). */
+  lullRelease?: boolean;
+  /** Room timing live: hand a line to bot-core's lull scheduler instead of answering it now. Absent =
+   *  the live cut cannot hold, and the turn answers as before. */
+  holdForLull?: (h: { message: Message; side: "principal" | "spouse"; reason: RoomTimingReason; pkSenderId: string | undefined }) => void;
+  /** Room timing: the side of the line this companion is holding for the lull in this channel, or null.
+   *  A pending hold counts as holding the thread (timingHolder): holding means not posting, and the
+   *  exchange window would otherwise lapse mid-burst and hand the next line to someone else. */
+  lullPendingSide?: (channelId: string) => "principal" | "spouse" | null;
+  /** Sol's webhook id, parsed once at boot from SOL_WEBHOOK_URL (sol-sender.ts solWebhookId). Null or
+   *  absent: Sol is not recognized and its posts stay behind the hard muzzle. Never the token. */
+  solWebhookId?: string | null;
+  // bot-local closures (voice wiring + autonomous loop guards)
+  connectVoice: (vc: VoiceBasedChannel) => string;
+  leaveVoice: (guildId: string | null) => string | null;
+  resetCycleGuard: () => void;
+  pushPrincipalMessage: (content: string) => void;
+  // per-bot config constants (passed under their exact names so the body is byte-identical)
+  COMPANION_ID: CompanionId;
+  PK_HOLD_MS: number;
+  SENT_IDS_CAP: number;
+  CONTEXT_WINDOW_SIZE: number;
+  MODEL_SWITCH_TRIGGER: RegExp;
+  MODEL_SWITCH_LIST_INTRO: string;
+  MODEL_SWITCH_SUCCESS: (label: string) => string;
+  LISTEN_TRIGGER: RegExp;
+  /** Watch (2026-10-23). Optional in the wire; when absent the handler builds it from COMPANION_ALIASES
+   *  so a bot that forgot to pass it still answers `watch <url>` instead of narrating a watch. */
+  VIDEO_TRIGGER?: RegExp;
+  CLUB_TRIGGER: RegExp;
+  SEARCH_TRIGGER?: RegExp;
+  IMAGINE_TRIGGER?: RegExp;
+  PET_TRIGGER?: RegExp;
+  COUNCIL_TRIGGER?: RegExp;
+  IMPS_TRIGGER?: RegExp;
+  HEX_TRIGGER?: RegExp;
+  LOG_TRIGGER?: RegExp;
+  INTO_TRIGGER?: RegExp;
+  RETRACT_TRIGGER?: RegExp;
+  WATCH_TRIGGER?: RegExp;
+  MOVIE_TRIGGER?: RegExp;
+  MOVIE_AT_TRIGGER?: RegExp;
+  COMMAND_GUARD?: RegExp;
+  SPOUSE_FRAMING: string;
+  GUEST_FRAMING: string;
+  IN_CHARACTER_FALLBACK: string;
+  DISTILLATION_PROMPT: string;
+  DISTILLATION_INTERVAL: number;
+  PULSE_INTERVAL: number;
+  // cypher-only audit capability (optional — drevan/gaia omit; the block is guarded)
+  AUDIT_TRIGGERS?: string[];
+  AUDIT_MODE_INJECTION?: string;
+}
+
+/**
+ * Witnessing is Gaia's lane only (Principal, 2026-07-21). Before this gate all three bots ran
+ * the same passive-witness branch below, so a companion message seen by two non-responding
+ * bots in an inter_companion channel produced two gaia_witness rows for the same event.
+ */
+export function shouldWriteWitness(companionId: CompanionId): boolean {
+  return companionId === "gaia";
+}
+
+/**
+ * Gaia's passive witness as a ledger line (LEDGER_DISTILL on, 2026-09-26). Subject = the sibling
+ * who spoke (resolved from the bot id map, falling back to a companion name inside the username);
+ * null when the sender is not a known sibling -- a line about nobody has no subject to file under.
+ * The snippet is quoted so the server's pronoun exemption applies to the sibling's own words;
+ * inner double quotes become single quotes so the quoted span always closes.
+ */
+export function buildWitnessLedgerEntry(p: {
+  senderCompanion: string;
+  channelName: string | null;
+  channelId: string;
+  content: string;
+  messageId: string;
+}): LedgerEntryInput | null {
+  const lower = p.senderCompanion.toLowerCase();
+  const subject = (["cypher", "drevan", "gaia"] as const).find((c) => lower === c || lower.includes(c));
+  if (!subject || subject === "gaia") return null;
+  const name = companionDisplayName(subject);
+  const words = p.content.slice(0, 500).replace(/["“”]/g, "'").replace(/\s+/g, " ").trim();
+  const source = { kind: "message", ref: p.messageId };
+  // L4a (2026-09-26 review): preflight before sending. A sibling's words that carry an unlabeled
+  // number, a lexicon word or "Source:" get the WHOLE line 422'd (correct under rule 2: a companion's
+  // words are never a source for a number). The fact that they spoke is still recordable, so fall
+  // back to the line without the quote; and if the channel NAME trips the number rule (#42-chat),
+  // to the channel id, which is a long id and therefore a coordinate.
+  const where = `#${p.channelName ?? p.channelId}`;
+  const candidates = [
+    `Logged: ${name} spoke in ${where} without a reply from Gaia; words: "${words}"`,
+    `Logged: ${name} spoke in ${where} without a reply from Gaia.`,
+    `Logged: ${name} spoke in #${p.channelId} without a reply from Gaia.`,
+  ];
+  const body = candidates.find((b) => preflightLedgerBody(b, source) === null);
+  if (!body) return null;
+  return {
+    companion_id: subject,
+    function: "seen-log",
+    body,
+    source_kind: "message",
+    source_ref: p.messageId,
+    // This is the one writeLedger caller riding the write queue, which retries on the 5xx that
+    // writeLedger throws -- the key is what makes that retry safe.
+    dedup_key: `witness:${p.messageId}`,
+  };
+}
+
+// ── Gaia's presence (2026-09-26, GAIA-ANSWER point 3) ───────────────────────────────────────────────
+// "When I held silence while a sibling spoke, my record should still show that I was there, with no
+// quote and no content. My silence is mine. It is not a line about someone else." -- Gaia
+// Under LEDGER_DISTILL the passive witness became a seen-log line about the SIBLING; this adds a
+// content-free record to HER OWN store (gaia_witness via witnessLog, witness_type "presence"): no
+// quote, no sibling name, no content. Coalesced to one per channel per 30 minutes. The map is in
+// memory, so a restart resets it: at most one extra presence record per channel after a reboot.
+export const PRESENCE_COALESCE_MS = 30 * 60 * 1000;
+export const PRESENCE_WITNESS_TYPE = "presence";
+const lastPresenceAt = new Map<string, number>();
+/** The exact presence template: `Present, silent. #<channel-name-or-id> <HH:MM> UTC.` */
+export function presenceRecordText(channelLabel: string, at: Date): string {
+  const hh = String(at.getUTCHours()).padStart(2, "0");
+  const mm = String(at.getUTCMinutes()).padStart(2, "0");
+  return `Present, silent. #${channelLabel} ${hh}:${mm} UTC.`;
+}
+/** True (and stamps the channel) when no presence record was written for it in the last 30 minutes. */
+export function claimPresenceSlot(channelId: string, nowMs: number = Date.now()): boolean {
+  const last = lastPresenceAt.get(channelId);
+  if (last !== undefined && nowMs - last < PRESENCE_COALESCE_MS) return false;
+  lastPresenceAt.set(channelId, nowMs);
+  return true;
+}
+/** Test seam: forget every channel's last presence stamp. */
+export function resetPresenceSlots(): void {
+  lastPresenceAt.clear();
+}
+
+/**
+ * Cold-start STM seed (bot restart, no DB row yet): rebuild short-term history from the
+ * already-fetched Discord channel window. Must mirror the warm/live-path convention (see
+ * inference.ts's `[authorName]: ` prefixing) where every INBOUND message -- human or a
+ * sibling companion bot -- is role:"user" with authorName set, and only THIS bot's own
+ * prior messages are role:"assistant". Mapping every bot-authored message (own OR sibling)
+ * to "assistant" -- the original bug -- strips the "[Name]" prefix from sibling turns, so
+ * after a restart the model reads a sibling companion's words as its own prior output.
+ */
+export function mapColdStartHistory(
+  messages: Array<{ authorId: string; username: string; content: string; createdTimestamp: number }>,
+  ownUserId: string | undefined,
+): Array<{ role: "user" | "assistant"; content: string; authorName?: string; timestamp: number }> {
+  return messages.map(m => {
+    const isOwnMessage = ownUserId !== undefined && m.authorId === ownUserId;
+    return {
+      role: (isOwnMessage ? "assistant" : "user") as "user" | "assistant",
+      content: m.content,
+      authorName: isOwnMessage ? undefined : m.username,
+      timestamp: m.createdTimestamp,
+    };
+  });
+}
+
+export async function handleMessage(message: Message, deps: MessageHandlerDeps): Promise<void> {
+  const {
+    client, cfg, voiceClient, redis, librarian,
+    adapterRef, directAdapter, hermesRouter, activeModelRef, hermesModelKeysRef, currentMoodRef, lastSomaRefreshRef, recentContextRef, bootCtx,
+    stmStore, writeQueue, configCache, sessionWindows, pkDedup, pkRoster, pkSenderId,
+    guildVoiceConnections, sentIds, distillationCounter, pulseCounter,
+    botResponsesSinceHuman, botPingpongCooldownUntil, extremeTempCount,
+    apiKeys, apiUrls, isSuperseded, followUpPass, solWebhookId,
+    connectVoice, leaveVoice, resetCycleGuard, pushPrincipalMessage,
+    COMPANION_ID, PK_HOLD_MS, SENT_IDS_CAP, CONTEXT_WINDOW_SIZE,
+    MODEL_SWITCH_TRIGGER, MODEL_SWITCH_LIST_INTRO, MODEL_SWITCH_SUCCESS,
+    LISTEN_TRIGGER, CLUB_TRIGGER, SEARCH_TRIGGER, IMAGINE_TRIGGER, PET_TRIGGER, COUNCIL_TRIGGER, IMPS_TRIGGER, HEX_TRIGGER, LOG_TRIGGER, INTO_TRIGGER, RETRACT_TRIGGER, WATCH_TRIGGER, MOVIE_TRIGGER, MOVIE_AT_TRIGGER, COMMAND_GUARD,
+    SPOUSE_FRAMING, GUEST_FRAMING, IN_CHARACTER_FALLBACK,
+    DISTILLATION_PROMPT, DISTILLATION_INTERVAL, PULSE_INTERVAL,
+    AUDIT_TRIGGERS, AUDIT_MODE_INJECTION,
+  } = deps;
+  // Watch (2026-10-23): wired like the others, with a fallback built from the alias table so a missing wire
+  // degrades to "still a command", never to the model narrating a watch it did not do.
+  const VIDEO_TRIGGER: RegExp = deps.VIDEO_TRIGGER ?? buildCommandTriggers(COMPANION_ALIASES[COMPANION_ID] ?? [COMPANION_ID]).video;
+  /** "Dre, in" / "Cy, out" -- the whole message, this companion's aliases only (room-timing.ts). */
+  const ROOM_OVERRIDE_TRIGGER: RegExp = buildRoomOverrideTrigger(COMPANION_ALIASES[COMPANION_ID] ?? [COMPANION_ID]);
+  /** "dre: dry-run heartbeat [force]" (B56). Owner-only, heartbeat-dry-run.ts. */
+  const DRY_RUN_TRIGGER: RegExp = buildDryRunTrigger(COMPANION_ALIASES[COMPANION_ID] ?? [COMPANION_ID]);
+  // Burst settle (2026-10-10). Empty / 0 when settle is off, a command, a bot post or a pass turn.
+  const settleMs = deps.settleMs ?? 0;
+  const burst = deps.burst ?? [];
+
+    if (message.author.id === client.user?.id) return;
+    // DM OWNER GATE (2026-09-27), before ANY network call, inference, tool, STT or vision. Anyone who
+    // shares a server with the bot can DM it; without this a stranger gets full inference plus
+    // ask_librarian over Principal's private data. One log line, no content. Also enforced at
+    // MessageCreate in bot-core so the message never enters the inbox; this copy is what holds if a
+    // future caller skips that. See dm.ts.
+    const dmVerdict = dmGateVerdict({
+      guildId: message.guildId, authorId: message.author.id, ownerId: cfg.ownerDiscordId,
+      partnerId: cfg.spouseDiscordId, partnerEnabled: partnerDmEnabled(), channelType: () => message.channel?.type,
+    });
+    if (dmVerdict === "drop") {
+      console.log(droppedDmLogLine(COMPANION_ID, message.author.id));
+      return;
+    }
+    /** A 1:1 DM from the owner. They wrote to THIS companion: every addressing rail treats it as direct address. */
+    const isOwnerDm = dmVerdict === "owner";
+    /**
+     * A 1:1 DM from Spouse (PARTNER_DM=on, 2026-11-05). Direct address like an owner DM, sealed like one
+     * (spouse-note's "nothing from Spouse's own private channels" reads the same seal), but NEVER the owner's
+     * med block, med answer parsing, or owner-arrival bookkeeping: those stay on isOwnerDm alone.
+     */
+    const isPartnerDm = dmVerdict === "partner";
+    /** Any private 1:1 the gate let through: nobody else is in it, so it is direct address by definition. */
+    const isDm = isOwnerDm || isPartnerDm;
+    if (isDm) sealDmChannel(message.channelId);
+    if (isPartnerDm) console.log(`[${COMPANION_ID}] partner dm in ch=${message.channelId} msg=${message.id} chars=${(message.content ?? "").length}`);
+
+    // INFERENCE_MODE=hermes forces every adapter build to the local Hermes agent (see
+    // createAdapter forceHermes). Surfaced here for the reply-token ceiling (full agent runs
+    // long) and the model-switch branches (routing is owned by Hermes, not Discord).
+    const inferenceMode = apiUrls.forceHermes ? "hermes" : undefined;
+
+    const BOT_ID_COMPANION: Record<string, string> = {};
+    if (process.env["CYPHER_BOT_ID"]) BOT_ID_COMPANION[process.env["CYPHER_BOT_ID"]] = "cypher";
+    if (process.env["DREVAN_BOT_ID"]) BOT_ID_COMPANION[process.env["DREVAN_BOT_ID"]] = "drevan";
+    if (process.env["GAIA_BOT_ID"]) BOT_ID_COMPANION[process.env["GAIA_BOT_ID"]] = "gaia";
+    const BOT_IDS = new Set(Object.keys(BOT_ID_COMPANION));
+    const isCompanionPost = BOT_IDS.has(message.author.id);
+    // Sol, the triad's crow (sol-sender.ts, 2026-09-29): recognized by WEBHOOK ID, never by name. Sol
+    // is household, not a human and not a sibling: it passes the muzzle, is never the human anchor,
+    // and never resets the bot rails. Every site below that asks "is this Principal / a human?" checks it.
+    const solId = solWebhookId ?? null;
+    const isSol = isSolPost(message, solId);
+    // PluralKit pairing: registration (addOriginal) and the claim (matchWebhook) both happen
+    // at messageCreate time in bot-core, OUTSIDE this serialized turn -- doing either here
+    // deadlocks the pair against the channel inbox (see PkDedup's ordering note). All that is
+    // left here is the decision: was this direct message claimed by a proxy? waitForClaim
+    // returns instantly when the claim already landed (queue was busy) or the moment it does,
+    // and only costs the full hold for a message that genuinely was never proxied.
+    const pkKnownSenderId = pkSenderId;
+    // A follow-up PASS replays the origin message for its REPLY only: everything a message does by
+    // arriving (the PK claim hold, activity marks, drive shedding, the spine turn, STT and vision,
+    // the session touch, the commons publish, the autonomous buffer) already happened the first
+    // time it arrived, and running it twice double-counts or double-pays (pass-turn.ts).
+    const isArrival = !followUpPass;
+    // The origin survived this check when it arrived (it started the chain), so a pass skips it.
+    // PluralKit never proxies in a DM, so an owner DM skips the 3s hold and the deleted-check fetch.
+    if (isArrival && !isDm && !message.webhookId && !message.author.bot) {
+      const { skip } = await pkDedup.waitForClaim(message.channelId, message.id, PK_HOLD_MS);
+      if (skip) return; // PluralKit deleted this and reposted it; the proxy turn owns the reply
+      // Content pairing can miss legitimately: an image-only proxy has no text to match, a
+      // proxy tag longer than PK_TAG_BUDGET falls outside the containment budget, and PK can
+      // simply be slower than the hold. In those cases the pre-proxy original is still
+      // processed -- and everything below runs on a message that no longer exists: every
+      // deterministic command branch fires a SECOND time (a proxied "log"/"model" double-writes
+      // and double-acks), and the thread-spine reply reference targets a deleted id, so the
+      // send 10008s into the inbox's catch and Principal sees nothing at all.
+      //
+      // Deletion is the definitive test, and it needs no guessing: PK deletes the original the
+      // moment it reposts. force:true because the message we were just handed is in cache.
+      // Only "Unknown Message" (10008) counts as deleted. A timeout or 5xx must fail OPEN and
+      // keep the reply -- silently dropping Principal's message on a transient Discord hiccup would
+      // be a worse bug than the double-write this prevents.
+      const deleted = await message.channel.messages.fetch({ message: message.id, force: true })
+        .then(() => false)
+        .catch((err: unknown) => (err as { code?: number })?.code === 10008);
+      if (deleted) {
+        console.log(`[${COMPANION_ID}] original ${message.id} was deleted during the hold (proxied, pairing missed) -- the proxy turn owns it`);
+        return;
+      }
+    }
+    // Signal conversation activity so autonomous worker skips runs while humans are present.
+    // A PluralKit proxy IS Principal present (webhookId set, author.bot true) -- keying this on
+    // author.bot alone made every proxied message look like bot traffic, so the autonomous
+    // worker fired mid-conversation.
+    // Sol is not human traffic: the worker posts Sol, so counting it would make the worker's own post
+    // tell the worker a human is present.
+    const isHumanTraffic = (!message.author.bot || message.webhookId !== null) && !isSol;
+    if (isHumanTraffic && redis && isArrival) {
+      setLastActivity(redis).catch(() => {});
+      clearConsolidation(redis, COMPANION_ID).catch(() => {});
+    }
+
+    if (isArrival && client.user && isInvitation(message, client.user.id) && message.member?.voice?.channel) {
+      const name = connectVoice(message.member.voice.channel);
+      await (message.channel as TextChannel).send(`Joining ${name}.`);
+      return;
+    }
+
+    if (isArrival && client.user && isLeaveRequest(message, client.user.id)) {
+      const left = leaveVoice(message.guildId);
+      if (left) await (message.channel as TextChannel).send("Leaving.");
+      return;
+    }
+
+    const knownSenderId = pkKnownSenderId;
+    const channelConfig = await configCache.get();
+    // A Sol post skips attribution entirely: it is not a PK proxy, so the roster miss + two PK API
+    // attempts would cost ~4s per bot on every crow moment for a guaranteed "unknown".
+    const attribution = isSol
+      ? { isOwner: false, discordUserId: message.author.id, frontMember: null, frontState: "unknown" as const, source: "direct" as const }
+      : await resolveAttribution(message, cfg.ownerDiscordId, knownSenderId, undefined, cfg.spouseDiscordId, process.env["SPOUSE_PK_SYSTEM_ID"], pkRoster ?? null);
+
+    const userTier = attribution.isOwner ? "owner" as const
+      : attribution.discordUserId === cfg.spouseDiscordId ? "intimate" as const
+      : "guest" as const;
+    const senderCtx: {
+      isOwner: boolean; isCompanionBot: boolean; isMentioned: boolean;
+      userTier: "owner" | "intimate" | "guest"; activeExchangeWith?: CompanionId | null;
+    } = {
+      isOwner: attribution.isOwner,
+      // STRUCTURAL, not attribution-derived (2026-07-27). This was `author.bot && !isOwner`,
+      // which made every classification below hostage to one racy PK API call: when the lookup
+      // lost the race, Principal's own proxied message became a "companion bot" and the entire
+      // cross-companion rail stack applied to it -- human-anchored cap, pingpong cooldown,
+      // per-human response cap, chain-depth limit, and vocative-only shouldRespond gating.
+      // The visible result was the bots simply never answering. A companion bot posts as a bot
+      // user with NO webhook; a PluralKit proxy is always a webhook. That distinction needs no
+      // network call, so guardrails meant for bot-to-bot traffic can never eat a human again.
+      isCompanionBot: message.author.bot && !message.webhookId,
+      // A burst's earlier messages count (ruling 1: a companion named anywhere in the gathered burst).
+      isMentioned: message.mentions.has(client.user?.id ?? "")
+        || (!!client.user?.id && burst.some(b => b.mentionedIds?.includes(client.user!.id))),
+      userTier,
+    };
+
+    // H3 guest port (2026-11-10, hermes-route.ts): which Hermes gateway this turn talks to. Owner =
+    // verified Principal; sibling (known bot id, no webhook) and Sol (webhook id) carry no human speaker and
+    // stay on the owner gateway; everything else, unresolved identity included, is the guest gateway.
+    // EVERY Hermes call this turn makes goes through `turnAdapter()`, never `adapterRef.current`
+    // (the owner-only command paths above and below return before inference and stay on the owner port).
+    const hermesRoute: HermesRoute = (hermesRouter ?? createHermesRouter({
+      companionId: COMPANION_ID, owner: () => adapterRef.current, guest: null, enabled: false,
+    })).route(hermesRouteTier({
+      isOwner: attribution.isOwner,
+      isSibling: isCompanionPost && !message.webhookId,
+      isSol,
+      userTier,
+    }));
+    // Live getter: on the owner port a model switch mid-turn still takes effect, as before.
+    const turnAdapter = (): InferenceAdapter =>
+      hermesRoute.port === "guest" ? hermesRoute.adapter : adapterRef.current;
+    const hermesChannelKey = routedChannelKey(message.channelId, hermesRoute.port);
+    // Only once a guest gateway exists do replies carry a gateway; until then hermesDelta runs the old rule.
+    const hermesPortExtra: { port?: "owner" | "guest" } =
+      hermesRouter?.enabled && hermesRouter.guestConfigured ? { port: hermesRoute.port } : {};
+
+    // Take 9 contact-hook: any real Principal contact sheds this companion's relational
+    // need, so the drive-driven reach-out only fires on genuine silence. Fire-and-forget
+    // (shedDriveContact swallows its own errors) -- never blocks the message path.
+    if (attribution.isOwner && isArrival) {
+      // P13b: any owner arrival settles the open reach-out rows `replied`; a bare "not now" in the
+      // very DM the reach-out went to settles it `dismissed`. Detached, ids only, never throws; all
+      // three bots run it and the ledger's HSETNX claim makes the first one win.
+      noteOwnerArrival(redis, { channelId: message.channelId, isDm: isOwnerDm, content: message.content }).catch(() => {});
+      // Was he talking to ME, or did I just watch him talk (2026-07-30)?
+      //
+      // Every bot runs this hook on every owner message, and in a shared channel all three see every
+      // message -- so this single line fired THREE full-weight `message_from_principal` stimuli per
+      // message. Measured in prod: every event cluster held all three companions within 1-2 seconds,
+      // no float was relationship-specific (Drevan's heat rose when Principal talked to Gaia), and at
+      // +0.05 against 0.0075/hour of decay every touched float sat clamped at 1.0 for days -- Drevan's
+      // for 94h. A pegged float cannot tell adoration from mild warmth.
+      //
+      // Deliberately computed from RAW content, not `effectiveContent`: STT has not run yet at this
+      // point in the handler, and a voice note transcribed by this bot is inherently addressed to it.
+      // Deliberately NOT reusing `directlyAddressed` / `isReplyToMe` from further down -- moving this
+      // hook below them would mean an early gate-out skips shedding the drive entirely, which would
+      // start the reach-out firing at a companion Principal is actively in a room with.
+      const addressedMe =
+        senderCtx.isMentioned ||
+        isDirectAddress(message.content, COMPANION_ID) ||
+        !!(message.reference?.messageId && sentIds.has(message.reference.messageId));
+      writeQueue.fireAndForget(`drive:contact:${COMPANION_ID}`, () => librarian.shedDriveContact("relational_need", { addressed: addressedMe }));
+    } else if (senderCtx.isCompanionBot) {
+      // Sibling-exchange hook (2026-07-28). Being in the room while a sibling speaks is a real
+      // event for this companion, and until now ONLY the formal rituals (council, club) reached
+      // felt state -- so the triad-as-a-unit, which is Gaia's whole lane, could not touch her.
+      //
+      // Fires whether or not we go on to respond: witnessing is experience. Volume is handled
+      // server-side, where `sibling_exchange` carries a 1h cooldown and deltas about a fifth of
+      // Principal's, so a long sibling thread lands once and never out-votes him. The gate is
+      // `isCompanionBot`, which is STRUCTURAL (a bot with no webhook), so a PluralKit proxy of
+      // Principal can never be miscounted as a sibling.
+      writeQueue.fireAndForget(`soma:sibling:${COMPANION_ID}`, () => librarian.fireStimulus("sibling_exchange"));
+    }
+
+    // One definition of "bot turn" for every rail below (2026-07-27). A PluralKit proxy has
+    // author.bot === true, so any rail keyed on that flag alone counted Principal's own messages
+    // as bot traffic: countBotMsgsSinceHuman and computeChainDepth both fall back to this flag
+    // when called with an empty id set, which inflated the caps that then muted the channel.
+    const botTurn = (m: { author: { bot: boolean }; webhookId?: string | null }): boolean =>
+      m.author.bot && !m.webhookId;
+
+    let isReplyToMe = !!(message.reference?.messageId && sentIds.has(message.reference.messageId))
+      // ...or any earlier message of the gathered burst replied to me (ruling 1).
+      || burst.some(b => !!b.replyToMessageId && sentIds.has(b.replyToMessageId));
+    // Durable reply-to fallback (2026-08-15 floor rework): sentIds is per-process, capped at
+    // 500 and lost on restart, so a reply to anything older than the cap -- or to anything
+    // sent before the last restart -- silently stopped counting as "to me". The thread ledger
+    // already records every companion reply's sent message id (convoTurn at send time), so ask
+    // it who authored the referenced message. Positive hits cache; misses re-query, because a
+    // null can be a ledger write still in flight and must not be pinned as a false negative.
+    if (!isReplyToMe && message.reference?.messageId) {
+      const refId = message.reference.messageId;
+      let refAuthor: string | null = replyAuthorCache.get(refId) ?? null;
+      if (refAuthor === null) {
+        refAuthor = (await librarian.convoByMessage(refId))?.author ?? null;
+        if (refAuthor) {
+          replyAuthorCache.set(refId, refAuthor);
+          if (replyAuthorCache.size > REPLY_AUTHOR_CACHE_CAP) {
+            const oldest = replyAuthorCache.keys().next().value;
+            if (oldest !== undefined) replyAuthorCache.delete(oldest);
+          }
+        }
+      }
+      if (refAuthor === COMPANION_ID) {
+        isReplyToMe = true;
+        console.log(`[${COMPANION_ID}] reply-to resolved durably via thread ledger (msg=${refId} not in sentIds)`);
+      }
+    }
+    // B63 being_seen (2026-11-06): one detached ask per owner message, for THIS bot's companion only. Halseth
+    // decides the tier (a direct reply to one of my messages = medium; naming back something of mine = full;
+    // at most one per message) and this bot just reports the facts. isReplyToMe is final here (sentIds, burst,
+    // durable ledger), and covers webhook-masked sends because sentIds records every id this bot sent.
+    fireBeingSeenCheck({
+      isOwner: attribution.isOwner, isArrival, messageId: message.id, channelId: message.channelId,
+      text: message.content ?? "", isReplyToMe,
+    }, librarian, writeQueue);
+    // What a human's Discord reply points at (2026-10-31, reply-context.ts). Feeds the reply-context line
+    // the model sees on the live turn and Rule 2b of the human address gate (a reply to the other human
+    // is theirs). One cache read, at most one fetch; a missing or deleted target is null and changes nothing.
+    const replyTgt: ReplyTarget | null = isHumanTraffic && message.reference?.messageId
+      ? await replyTarget(message.reference.messageId, message.channel as unknown as Parameters<typeof replyTarget>[1], {
+          selfCompanion: COMPANION_ID as CompanionId,
+          botIdCompanion: BOT_ID_COMPANION as Record<string, CompanionId | undefined>,
+          ownerDiscordId: cfg.ownerDiscordId,
+          spouseDiscordId: cfg.spouseDiscordId,
+          solWebhookId: solId,
+          roster: pkRoster ?? null,
+        }).catch(() => null)
+      : null;
+    currentTurn()?.setReplyTarget(replyTgt?.messageId); // turn key: the id only, never the text
+    // Discord threads inherit CONFIG from their parent channel (2026-08-15): a thread's own
+    // snowflake was never in channelConfig, so threads under owner_only channels ran as open
+    // ones. Storage keys everywhere below deliberately keep message.channelId (the thread id)
+    // -- per-thread STM/spine must not collapse into the parent. An explicitly-configured
+    // thread id still wins.
+    const routingChannelId = resolveRoutingChannelId(message.channel, message.channelId);
+    const gateChannelId = channelConfig[message.channelId] ? message.channelId : routingChannelId;
+    const channelEntry = channelConfig[gateChannelId];
+
+    let spine: ConvoActiveDto | null = null;
+    const pkCtx = detectPluralKit(message);
+    // isPKProxy: four independent signals, any one sufficient. applicationId (pkCtx) is only
+    // populated when Discord attributes the webhook to an application, which a classic webhook
+    // execute often is not -- so it was never safe as the primary signal. attribution.source
+    // covers the roster hit and the API lookup; pkKnownSenderId covers the offline pairing with
+    // the original PK deleted. Together these hold when PK's API is slow, down, or rate-limited.
+    const isPKProxy = !!message.webhookId && !isCompanionPost && !isSol && (
+      pkCtx.isPluralKit
+      || attribution.source === "pluralkit"
+      || pkKnownSenderId !== undefined
+    );
+    // pkMemberName: the webhook username FIRST (2026-07-27). It is what PK actually rendered and
+    // therefore what Principal is looking at on screen; the roster agrees with it by construction
+    // (it indexes display_name), while the /v2/messages fallback returns the member's raw `name`,
+    // which can differ from the display name and would have the companion address a front by a
+    // name not in use this moment. API/roster values remain the fallback chain.
+    // Never a front for Sol: a non-null name here injects a "[Current front: ...] Guest register." line.
+    const pkMemberName = isSol ? null : ((isPKProxy ? (message.author?.username ?? null) : null)
+      ?? attribution.frontMember ?? pkCtx.memberName);
+    const author = isSol ? SOL_AUTHOR_LABEL
+      : isPKProxy
+      ? (pkMemberName ?? cfg.ownerDisplayName)
+      : (attribution.isOwner ? cfg.ownerDisplayName : message.author.username);
+
+    // The memory judge's speaker for THIS message (2026-10-07): sibling / PK front (bare member name +
+    // the roster's pronouns) / owner account / guest. Built here, once, so a follow-up entitlement can
+    // carry it (see the judge call site) -- a later turn released by a sibling's reply must still judge
+    // the exchange as this origin's, not the sibling's.
+    const writebackSpeaker = buildWritebackSpeaker({
+      siblingId: BOT_ID_COMPANION[message.author.id] ?? null,
+      fixedLabel: isSol ? SOL_AUTHOR_LABEL : null,
+      pkMemberName: isPKProxy ? pkMemberName : null,
+      frontPronouns: attribution.frontPronouns ?? null,
+      isOwner: attribution.isOwner,
+      isSpouse: userTier === "intimate" && !attribution.isOwner,
+      ownerName: cfg.ownerDisplayName,
+      authorUsername: message.author.username,
+    });
+
+    // Positive trace (2026-07-27). Every PK path here logged only on FAILURE, so a working proxy
+    // and a silently dropped one looked identical in the logs -- there was no way to verify the
+    // fix without asking Principal whether a reply showed up. One line per recognized proxy, naming
+    // which signal identified the front, so the offline path (roster) vs the API fallback vs the
+    // dedup capture is visible at a glance.
+    if (isPKProxy) {
+      // "roster" = a roster name PK's API confirmed for this message's system (2026-11-10: the name
+      // alone no longer identifies anyone); "pk-api" = the API answered with no roster member.
+      const via = attribution.source === "pluralkit"
+        ? (verifiedRosterMember(message, pkRoster) ? "roster" : "pk-api")
+        : (pkKnownSenderId !== undefined ? "dedup-pairing" : "webhook-only");
+      console.log(`[${COMPANION_ID}] PK proxy: front="${pkMemberName ?? "?"}" tier=${userTier} via=${via} chars=${message.content.length}`);
+      // 2026-11-10: count how often Discord leaves applicationId null on a real proxy (one token, no content).
+      console.log(`[pk-appid] ${COMPANION_ID} app=${pkAppIdKind(message)} via=${via}`);
+      // Learn the front's name so "<name>, ..." from the other human reads as addressed to them
+      // (human-address gate). Spouse's system only: Principal's 538-member roster stays out by design.
+      if (userTier === "intimate" && pkMemberName) {
+        void learnHumanName(redis as unknown as NameRedis | null, "spouse", pkMemberName);
+      }
+    }
+
+    // Hard muzzle: companion bots, PluralKit proxies and Sol pass through; all other bots are dropped.
+    const muzzle = muzzleVerdict({ authorIsBot: message.author.bot, webhookId: message.webhookId, isCompanionPost, isPKProxy, isSol });
+    if (muzzle !== "pass") {
+      // A webhook reaching here is a proxy none of the four signals could confirm -- the shape
+      // that used to fail silently and read as "the bots ignored me". Log it so it is one grep
+      // away instead of invisible; the roster (loaded at boot) is what normally prevents it.
+      if (muzzle === "drop_unconfirmed_webhook") {
+        console.warn(`[${COMPANION_ID}] unconfirmed webhook post from "${message.author.username}" in ${message.channelId} -- dropped (PK roster loaded: ${pkRoster?.loaded ?? false})`);
+      }
+      return;
+    }
+    if (isSol && isArrival) console.log(solRecognizedLogLine(COMPANION_ID, message.channelId, message.id, message.content.length));
+
+    // Thread spine (task 10): ensure a conversation thread exists for this channel and
+    // append this incoming message as a turn on it. Fully fail-open -- ensureThread's own
+    // .catch(() => null) means a Librarian hiccup here never blocks the reply path below;
+    // every subsequent spine interaction is guarded on `spine` being non-null. Runs AFTER
+    // the hard muzzle above so a stray non-companion bot can never open/seed a thread.
+    // WHO opened / joined the conversation (2026-07-31). This used to collapse every non-owner human to
+    // "guest", so Spouse and any stranger were the same token -- and `participants` is what a companion
+    // reads to know whose conversation a memory came from. Principal named the risk directly: Spouse talks to
+    // Drevan, then he talks to Drevan, and the two blend. Misattribution across speakers has already
+    // happened here at the sibling level (2026-06-26 attribution scramble; the BIG BOSS listen credited
+    // to Gaia when Principal gave it), so this is the same defect one scale up.
+    //
+    // `spouse` is a new token, and the identity was already resolved and being thrown away: attribution
+    // sets discordUserId to spouseDiscordId for Spouse's system, by Discord id or PK system id. The `principal`
+    // and `guest` tokens are deliberately UNCHANGED -- consumers render them and the plural front is
+    // tracked separately in plural_store, so appending a front here would fork the token for no gain.
+    const spineAuthor = BOT_ID_COMPANION[message.author.id]
+      ?? (attribution.isOwner ? "principal"
+        : (cfg.spouseDiscordId && attribution.discordUserId === cfg.spouseDiscordId) ? "spouse"
+        : "guest");
+    // Presence channels (Drevan's story/spiral spaces): grounding half only (seed + ledger),
+    // no progress register. Computed once here and reused at both the block-render call
+    // below and the post-send convoLand gate.
+    const isPresence = isPresenceChannel(routingChannelId);
+    if (isThreadsEnabled() && isThreadTracked(channelEntry, routingChannelId)) {
+      // `attribution.frontMember` is the PluralKit member who actually spoke -- resolved from the roster
+      // (both systems, 1412 names) and, until now, dropped on the floor for the spine.
+      //
+      // Principal asked for this explicitly: "the front team members should be visible on the memories,
+      // because then there's not random 'oh, so and so said this' and then we have to freak out and
+      // think that we just don't remember saying it." A memory that says HE said something when a
+      // different member was fronting makes him doubt his own recall of his own life. That is a real
+      // cost in a plural system, not a labelling nicety.
+      //
+      // It rides the TURN, not `participants`: fronts change mid-conversation, and the coarse token set
+      // is what the attribution logic reads to ask "was Principal here at all".
+      // A pass turn reads the active thread without appending the origin to it a second time.
+      // A Sol post reads the active thread like a pass does and never opens or joins one: the spine's
+      // `participants` is the coarse "who was here" set (principal/spouse/guest/companions), and a crow
+      // moment is neither a guest nor a new token any consumer expects.
+      spine = isArrival && !isSol
+        ? await ensureThread(
+          librarian, message.channelId, { id: message.id, content: message.content }, spineAuthor,
+          attribution.frontMember ?? null,
+        ).catch(() => null)
+        : await librarian.convoActive(message.channelId).catch(() => null);
+    }
+
+    // Voice STT: transcribe an audio attachment into effectiveContent BEFORE any content
+    // check below (owner model switch, addressing, relevance) so spoken commands work.
+    let voiceInput = false;
+    let effectiveContent = message.content;
+    // A pass turn reuses what the arrival derived (pass-turn.ts arrivalMediaPlan): no second STT
+    // call, no second ~90s-per-image vision pass.
+    const media = arrivalMediaPlan(isArrival, isArrival ? null : arrivalMedia.get(message.id));
+    if (media.reuse?.transcript) {
+      effectiveContent = media.reuse.transcript;
+      voiceInput = true;
+    }
+
+    if (media.runStt && voiceClient && message.attachments.size > 0) {
+      const AUDIO_EXT_RE = /\.(ogg|oga|opus|mp3|m4a|aac|wav|webm|flac)$/i;
+      const audioAttachment = [...message.attachments.values()].find(
+        (a) => a.contentType?.startsWith("audio/") || AUDIO_EXT_RE.test(a.name ?? ""),
+      );
+      if (audioAttachment) {
+        try {
+          const audioRes = await fetch(audioAttachment.url, { signal: AbortSignal.timeout(30_000) });
+          const buffer = Buffer.from(await audioRes.arrayBuffer());
+          effectiveContent = await voiceClient.transcribe(buffer, audioAttachment.name ?? "voice.ogg");
+          voiceInput = true;
+          if (isArrival) markVoiceUsed(message.channelId);
+          console.log(`[${COMPANION_ID}] STT: "${effectiveContent.slice(0, 80)}"`);
+        } catch (err) {
+          console.error(`[${COMPANION_ID}] STT failed:`, err);
+          // The arrival already told the channel; a pass turn that lost the cache stays quiet.
+          if (media.announceSttFailure) await (message.channel as TextChannel).send("[voice message received -- transcription unavailable]");
+          return;
+        }
+      }
+    }
+
+    // Image attachments: describe them BEFORE any gate, for the same reason STT sits here -- an
+    // image-only message has `message.content === ""`, so without this the companion is handed an
+    // empty turn and answers nothing ("I sent Drevan a picture and it didn't work", 2026-09-14).
+    //
+    // Unlike STT this APPENDS rather than replaces: a picture usually arrives with text, and when
+    // it doesn't, the block is what makes the content non-empty so the addressing gates below have
+    // something to read. The description is turn-scoped (see the stmContent divergence note below);
+    // STM gets a one-line past-tense marker so the companion remembers a picture was shared without
+    // re-answering it every turn.
+    let seenImages: SeenImage[] = media.reuse?.seenImages ?? [];
+    if (!media.reuse && visionEnabled() && !voiceInput && message.attachments.size > 0) {
+      const picked = pickImageAttachments(message.attachments.values());
+      if (picked.length > 0 && !media.runVision) {
+        // Pass turn whose arrival record aged out: name the images as not looked at rather than
+        // paying the vision pass a second time (seenBlock says so to the model).
+        console.warn(`[${COMPANION_ID}] pass turn on ${message.id}: arrival media not cached -- ${picked.length} image(s) marked not seen, vision not re-run`);
+        seenImages = picked.map((a) => ({ name: a.name ?? "image", description: null }));
+      } else if (picked.length > 0) {
+        const apiKey = (process.env["DEEPINFRA_API_KEY"] ?? "").trim();
+        if (!apiKey) {
+          console.warn(`[${COMPANION_ID}] image attached but DEEPINFRA_API_KEY is absent -- not looked at`);
+          seenImages = picked.map((a) => ({ name: a.name ?? "image", description: null }));
+        } else {
+          // The describe was started at ARRIVAL (bot-core prefetchVisionAtArrival) and is shared by all
+          // three bots through the Redis cache; here the turn waits at most VISION_TURN_BUDGET_MS, and
+          // not at all when it is already superseded (2026-10-18 incident, vision-cache.ts). A late
+          // description still lands in the cache for the next turn.
+          seenImages = await resolveSeenImages({
+            messageId: message.id,
+            picked,
+            cache: sharedVisionCache(COMPANION_ID, redis as unknown as VisionRedis | null),
+            budgetMs: visionPrefetchEnabled() ? visionTurnBudgetMs() : 0,
+            isSuperseded,
+            onWait: () => { void (message.channel as TextChannel).sendTyping().catch(() => {}); },
+          });
+        }
+        // Never log the CDN url -- the `hm=` signature is bearer-ish while it lives.
+        for (const s of seenImages) {
+          console.log(
+            `[${COMPANION_ID}] image ${s.description ? "seen" : "NOT seen"}: "${s.name}" ` +
+            `${s.description ? `${s.description.length} chars` : "(describe failed)"}`,
+          );
+        }
+      }
+    }
+    // Recorded HERE, before any gate: a companion that holds a later position in a multi-address
+    // order returns at the order block below, and its pass turn needs exactly these results.
+    if (media.record && (voiceInput || seenImages.length > 0)) {
+      arrivalMedia.set(message.id, { transcript: voiceInput ? effectiveContent : null, seenImages });
+    }
+
+    // Turn-scoped injections must not persist into STM (2026-08-29). The [HEARD]/[NOT HEARD]
+    // blocks appended to effectiveContent below are built for THIS inference call only -- a
+    // standing imperative ("respond to the music itself") plus the full track analysis/lyrics
+    // dump. Storing that verbatim into history meant every later turn re-fed the imperative and
+    // the whole write-up, so the model re-answered the same song each turn (tonight: Drevan
+    // replied to one track 3 times). stmContent starts equal to effectiveContent -- already the
+    // STT transcript on the voice path, since this sits after that block -- and diverges only at
+    // the HEARD/NOT-HEARD appends further down. Every DURABLE write of this message's content
+    // (STM history, live SB ingest, the autonomous worker's recent-Principal-messages feed) uses
+    // stmContent; effectiveContent (inference, gates, address extraction) keeps the full block.
+    let stmContent = effectiveContent;
+    // The speaker's own words (typed or the STT transcript), before any appended [IMAGE]/[HEARD] block:
+    // the writeback judge reads these as his speech and the blocks as attachments (memory.ts withAttachedLabel).
+    const spokenWords = effectiveContent;
+
+    // Apply the image blocks now that stmContent exists, so the full description rides the
+    // inference turn only and STM keeps the durable one-liner.
+    if (seenImages.length > 0) {
+      effectiveContent = `${effectiveContent.trim()}\n\n${seenBlock(seenImages)}`.trim();
+      stmContent = `${stmContent.trim()}\n${seenStmMarker(seenImages)}`.trim();
+    }
+
+    // ── Record on arrival (2026-07-30) ────────────────────────────────────────
+    //
+    // Every message this bot can see goes into short-term memory HERE, before any gate can decline
+    // it. The inbound append used to sit ~400 lines below, under every response gate, so a bot that
+    // chose not to answer never recorded the message: its memory had holes exactly where it stayed
+    // quiet, and it remembered only the turns it took part in.
+    //
+    // Two things follow. (1) Silence stops costing context -- a companion that hangs back for ten
+    // turns still knows what those ten turns were. (2) It is the PRECONDITION for fit-based speaker
+    // selection: a companion cannot judge "is this for me" from a transcript of only its own lines,
+    // and asking it to is why a name has to be said out loud on every message.
+    //
+    // Same defect Hermes issue #14853 hit from the other side ("the agent only sees the single
+    // @mention message -- zero context about what other agents said"). Their fix re-fetched channel
+    // history at prompt time; recording it once, speaker-labeled and persisted, is strictly cheaper.
+    //
+    // Placed after STT so a voice note is stored as its transcript rather than as an empty string,
+    // and idempotent by message id so the later append and the command branches collapse into one.
+    //
+    // COMMANDS ARE EXCLUDED (2026-07-31, review finding). Every command branch below sends a
+    // deterministic ack and `return`s without appending an assistant turn, so recording the command as a
+    // user turn built a transcript of Principal issuing instructions into apparent silence -- which is
+    // exactly the malformed context this whole record-on-arrival change exists to prevent.
+    //
+    // Excluding rather than also-recording-the-ack, because a command is not a conversational turn: it is
+    // an instruction to the machine, answered deterministically, and needing no fit judgment from anyone.
+    // Its absence from the conversational transcript is correct, not a gap. (The search branch is the one
+    // command that DOES belong -- it records both sides itself at its own call site, since its result
+    // genuinely becomes conversational material.)
+    // Both the guard AND the watch trigger, deliberately. `watch` is NOT in COMMAND_GUARD and must not be
+    // added: the guard replies with a usage string, so a conversational "dre: watching the storm roll in"
+    // would then get eaten by the guard instead of by the trigger -- the same harm through a second door.
+    // Testing the narrowed watch trigger here excludes real watch commands while leaving that sentence to
+    // be recorded and answered as the conversation it is.
+    // Same reasoning for the watchalong triggers (2026-10-02): neither is in the guard (a conversational
+    // "cy: movie night tonight?" / "dre: at least we tried" must stay conversation), so the real forms are
+    // tested here directly.
+    // `watch <url>` (2026-10-23) is in the same position: `watch` stays out of the guard, the URL form is
+    // tested here directly.
+    const roomOverride = attribution.isOwner ? ROOM_OVERRIDE_TRIGGER.exec(effectiveContent) : null;
+    const isOwnerCommand = attribution.isOwner
+      && (!!roomOverride || DRY_RUN_TRIGGER.test(effectiveContent) || !!COMMAND_GUARD?.test(effectiveContent) || !!WATCH_TRIGGER?.test(effectiveContent)
+        || !!MOVIE_TRIGGER?.test(effectiveContent) || !!MOVIE_AT_TRIGGER?.test(effectiveContent)
+        || VIDEO_TRIGGER.test(effectiveContent));
+    if (!isOwnerCommand) {
+      stmStore.appendInboundOnce(message.channelId, message.id, {
+        role: "user",
+        content: stmContent,
+        authorName: isSol ? SOL_AUTHOR_LABEL
+          : pkMemberName
+          ? pkRoomLabel(pkMemberName, { isSpouseSystem: userTier === "intimate" && !attribution.isOwner })
+          : (attribution.isOwner ? cfg.ownerDisplayName : userTier === "intimate" ? SPOUSE_LABEL : message.author.username),
+        timestamp: message.createdTimestamp,
+      });
+    }
+
+    // Heartbeat dry run (B56): the REAL heartbeat composition for THIS companion, answered in the channel it was
+    // typed in. Sends, reserves and records nothing (see heartbeat-dry-run.ts); the reply is the report.
+    if (attribution.isOwner) {
+      const dryRun = DRY_RUN_TRIGGER.exec(effectiveContent);
+      if (dryRun) {
+        const live = getHeartbeatCtx(COMPANION_ID);
+        let reply: string;
+        if (!live) {
+          reply = "dry-run heartbeat unavailable: the autonomous runtime has not started on this bot yet.";
+        } else {
+          try { await (message.channel as TextChannel).sendTyping?.(); } catch { /* cosmetic */ }
+          // The direct, tool-less lane only: a Hermes compose could write through its own tools (tool_choice none is
+          // ignored by the gateway), so with no direct adapter the run stops and says so.
+          const report = await runDryRunHeartbeat(live, { force: !!dryRun[1], directAdapter: directAdapter ?? null });
+          reply = formatDryRunReport(report);
+        }
+        console.log(`[${COMPANION_ID}] dry-run heartbeat${dryRun[1] ? " force" : ""} in ${message.channelId}`);
+        // The report quotes would-be DM text, so it goes to Principal's DM, not a room others read. Typed in the DM
+        // itself: reply there. A reply to his own command, not a reach-out (no cap, no ledger).
+        if (isOwnerDm || !live) {
+          await sendLong(message.channel as TextChannel, reply);
+        } else if (await sendReportToOwnerDm(live, reply)) {
+          await (message.channel as TextChannel).send("dry run sent to your DMs.");
+        } else {
+          await (message.channel as TextChannel).send("dry run done, but your DM could not be opened, so nothing was posted here.");
+        }
+        return;
+      }
+    }
+
+    // Owner model switch command: <prefix>: model <key> | <prefix>: model list
+    if (attribution.isOwner) {
+      const switchMatch = effectiveContent.match(MODEL_SWITCH_TRIGGER);
+      if (switchMatch) {
+        const arg = switchMatch[1].trim().toLowerCase();
+
+        // Under the Hermes relay the model is pinned per-profile in config.yaml and switched by
+        // the VPS hermes-model-watcher (active_model -> `hermes config set` + gateway restart). A
+        // Discord switch IS honored -- just not instant. Write the signal + tell the truth (no
+        // narrated no-op; 06-11 trap). The watcher validates the key against hermes-model-map.json
+        // and pings on Telegram, so the bot stays dumb (no registry to keep in sync here).
+        if (apiUrls.forceHermes) {
+          if (arg === "list") {
+            await (message.channel as TextChannel).send(
+              `${MODEL_SWITCH_LIST_INTRO}\n` +
+              "`flash` / `pro` -- DeepSeek everyday / deep-thinking\n" +
+              "`claude-sonnet` `claude-opus` `claude-haiku` -- Anthropic\n" +
+              "`gpt-4o` `gpt-4o-mini` -- OpenAI\n" +
+              "`gemini` `gemini-pro` -- Google\n" +
+              "`kimi-k2` `kimi-k2.5` -- Moonshot\n" +
+              "`mistral-large` -- Mistral (via OpenRouter)\n" +
+              "`gemma-local` `nemo-local` -- your LM Studio box");
+            return;
+          }
+          activeModelRef.key = arg;
+          activeModelRef.label = arg;
+          writeQueue.fireAndForget(`settings:model:${COMPANION_ID}`, () =>
+            librarian.setSetting("active_model", arg));
+          await (message.channel as TextChannel).send(
+            `switching to \`${arg}\` -- Hermes reloads in ~10s (watcher confirms on Telegram; ` +
+            "if it's not a real key you'll get a heads-up there instead).");
+          return;
+        }
+
+        // Direct/Brain path: validate against the FULL registry, not this bot's local keys. Brain
+        // is the live arbiter (reads active_model from Halseth), so any registry model is
+        // selectable; provider keys only need to live in Brain's .env.brain.
+        // In hermes mode the WATCHER applies the switch, so only keys in the live
+        // hermes-model-map.json can take effect. Offering more than that is how a switch acks
+        // SUCCESS here and gets "unknown model key" from the watcher a second later (9 of 23 keys
+        // were in that state on 2026-07-29). selectableModels falls back to the full registry
+        // whenever the map is unreadable, so this never narrows the list without cause.
+        const offered = selectableModels(hermesModelKeysRef?.value ?? null);
+
+        if (arg === "list") {
+          const list = Object.entries(offered)
+            .map(([k, e]) => `\`${k}\` -- ${e.label}`)
+            .join("\n");
+          await (message.channel as TextChannel).send(`${MODEL_SWITCH_LIST_INTRO}\n${list}`);
+          return;
+        }
+
+        if (!offered[arg]) {
+          // Distinguish "no such model" from "real model this runtime can't apply" -- the second
+          // is a deploy gap, and silently calling it invalid would hide that.
+          if (ALL_MODELS[arg]) {
+            await (message.channel as TextChannel).send(
+              `\`${arg}\` is a real model but the live hermes map can't apply it, so switching would ack and change nothing. ` +
+              `add it to hermes-model-map.json on the VPS first. currently switchable: ${Object.keys(offered).join(", ")}`,
+            );
+            return;
+          }
+          await (message.channel as TextChannel).send(`not a model I can switch to. valid options: ${Object.keys(offered).join(", ")}`);
+          return;
+        }
+
+        const entry = offered[arg];
+        // createAdapter is resilient: if this bot lacks the provider key it returns a
+        // working local fallback (deepseek) for direct mode; Brain runs the real voice.
+        adapterRef.current = createAdapter(entry.provider, entry.model, apiKeys, apiUrls, undefined, COMPANION_ID);
+        activeModelRef.key = arg;
+        activeModelRef.label = entry.label;
+        writeQueue.fireAndForget(`settings:model:${COMPANION_ID}`, () =>
+          librarian.setSetting("active_model", arg));
+        await (message.channel as TextChannel).send(MODEL_SWITCH_SUCCESS(entry.label));
+        return;
+      }
+    }
+
+    // Owner club command: <prefix>: club vote <fragment> | club status (0072).
+    // Deterministic Halseth write + literal ack, never routed through inference --
+    // so the model cannot claim a vote it didn't cast (2026-06-11 incident).
+    // Votes here are Principal's pre-cast (voter='principal'); companions vote in-voice
+    // at the worker's voting tick.
+    if (attribution.isOwner) {
+      const clubMatch = effectiveContent.match(CLUB_TRIGGER);
+      if (clubMatch) {
+        const reply = await handleClubCommand(clubMatch[1]!, "principal", cfg.halsethSecret)
+          .catch(err => `club command failed: ${String(err instanceof Error ? err.message : err).slice(0, 200)}`);
+        await (message.channel as TextChannel).send(reply);
+        return;
+      }
+    }
+
+    // Owner tool commands: <prefix>: search <query> | imagine <prompt> (0077 take 14).
+    // Deterministic Halseth call + literal ack (the model can't fake a search/image it
+    // didn't run -- 2026-06-11 doctrine). Runs AS this companion, so the per-companion
+    // tools_enabled gate applies. imagine attaches the generated image to the reply.
+    if (attribution.isOwner && SEARCH_TRIGGER) {
+      const searchMatch = effectiveContent.match(SEARCH_TRIGGER);
+      if (searchMatch) {
+        const search = await handleToolSearch(searchMatch[1]!, COMPANION_ID, cfg.halsethSecret)
+          .catch(err => ({ reply: `search failed: ${String(err instanceof Error ? err.message : err).slice(0, 200)}`, results: [] }));
+        await sendLong(message.channel as TextChannel, search.reply);
+        // Read-in (2026-07-03): a search is "bring this into the conversation", not a link
+        // dump. Feed the snippets back to the model for an in-voice weave, and land BOTH
+        // turns in STM -- before this, the searching bot never saw its own results (its own
+        // messageCreate is skipped), so it literally could not discuss what it just found.
+        // appendInboundOnce, not append: record-on-arrival already stored this message, and a plain
+        // append here would duplicate the search query in the transcript.
+        stmStore.appendInboundOnce(message.channelId, message.id, { role: "user", content: stmContent, authorName: cfg.ownerDisplayName, timestamp: message.createdTimestamp });
+        // selfInitiated (2026-11-05): search.reply is a deterministic literal ack the gateway never generated,
+        // so it is not in the Hermes transcript; hermesDelta folds it once ("[you, sent on your own earlier]")
+        // and it must not act as the "last gateway reply" boundary. `woven` below IS generated through the
+        // gateway session (sessionId `${COMPANION_ID}:${channelId}`), so it stays an ordinary assistant line.
+        stmStore.append(message.channelId, { role: "assistant", content: search.reply, timestamp: Date.now(), selfInitiated: true });
+        if (search.results.length > 0) {
+          try {
+            await (message.channel as TextChannel).sendTyping();
+            const readInPrompt = formatSearchReadIn(searchMatch[1]!, search.results);
+            const woven = await adapterRef.current.generate(
+              bootCtx.systemPrompt,
+              [...stmStore.get(message.channelId).slice(-CONTEXT_WINDOW_SIZE), { role: "user", content: readInPrompt }],
+              0.7,
+              replyMaxTokensFor(COMPANION_ID, inferenceMode),
+              `${COMPANION_ID}:${message.channelId}`,
+            );
+            if (woven) {
+              await sendLong(message.channel as TextChannel, woven);
+              stmStore.append(message.channelId, { role: "assistant", content: woven, timestamp: Date.now() });
+            }
+          } catch (e) {
+            console.warn(`[${COMPANION_ID}] search read-in failed (links already posted):`, e instanceof Error ? e.message : String(e));
+          }
+        }
+        return;
+      }
+    }
+    if (attribution.isOwner && IMAGINE_TRIGGER) {
+      const imagineMatch = effectiveContent.match(IMAGINE_TRIGGER);
+      if (imagineMatch) {
+        await (message.channel as TextChannel).send("\u{1F3A8} imagining...");
+        const out: { text: string; imageUrl?: string } = await handleToolImage(imagineMatch[1]!, COMPANION_ID, cfg.halsethSecret)
+          .catch(err => ({ text: `image generation failed: ${String(err instanceof Error ? err.message : err).slice(0, 200)}` }));
+        await (message.channel as TextChannel).send(
+          out.imageUrl ? { content: out.text, files: [{ attachment: out.imageUrl, name: "imagine.png" }] } : { content: out.text },
+        );
+        return;
+      }
+    }
+
+    // Owner pet command: <prefix>: pet <name> <feed|play|talk|give> [note] (0078 take 10).
+    // Deterministic Halseth interact + literal ack -- the model can't narrate a feeding
+    // it never did. Actor is "principal".
+    if (attribution.isOwner && PET_TRIGGER) {
+      const petMatch = effectiveContent.match(PET_TRIGGER);
+      if (petMatch) {
+        const reply = await handlePetCommand(petMatch[1]!, cfg.halsethSecret, "principal")
+          .catch(err => `pet command failed: ${String(err instanceof Error ? err.message : err).slice(0, 200)}`);
+        await (message.channel as TextChannel).send(reply);
+        return;
+      }
+    }
+
+    // Owner imp commands: <prefix>: imps on|off and <prefix>: hex on|off (wave 2).
+    // Global writes via setImpSettingAllCompanions -- all three companions updated at once.
+    // Deterministic literal ack -- the model can't narrate a settings change it never made.
+    if (attribution.isOwner && IMPS_TRIGGER) {
+      const m = effectiveContent.match(IMPS_TRIGGER);
+      if (m) { await (message.channel as TextChannel).send(await handleImpCommand(m[1]!, librarian).catch(e => `imps command failed: ${String(e).slice(0, 120)}`)); return; }
+    }
+    if (attribution.isOwner && HEX_TRIGGER) {
+      const m = effectiveContent.match(HEX_TRIGGER);
+      if (m) { await (message.channel as TextChannel).send(await handleImpCommand(m[1]!, librarian).catch(e => `hex command failed: ${String(e).slice(0, 120)}`)); return; }
+    }
+
+    // Owner council command: <prefix>: council <question> (0080 take 8). Convenes; the
+    // worker runs answer + blind-rank + Gaia synthesis. Deterministic convene ack.
+    if (attribution.isOwner && COUNCIL_TRIGGER) {
+      const councilMatch = effectiveContent.match(COUNCIL_TRIGGER);
+      if (councilMatch) {
+        const reply = await handleCouncilConvene(councilMatch[1]!, cfg.halsethSecret, redis)
+          .catch(err => `council command failed: ${String(err instanceof Error ? err.message : err).slice(0, 200)}`);
+        await (message.channel as TextChannel).send(reply);
+        return;
+      }
+    }
+
+    // Owner log command: <prefix>: log <thought> (write layer 0092). Drops a 'global'
+    // commons post as Principal -- the async Hearth wall. Deterministic write + literal ack;
+    // a drop, not a ping (no reply expected). A bare "log" misses this and falls to the
+    // guard -> usage reply, never inference.
+    if (attribution.isOwner && LOG_TRIGGER) {
+      const logMatch = effectiveContent.match(LOG_TRIGGER);
+      if (logMatch) {
+        const reply = await handleLogCommand(logMatch[1]!, cfg.halsethSecret)
+          .catch(err => `log command failed: ${String(err instanceof Error ? err.message : err).slice(0, 200)}`);
+        await (message.channel as TextChannel).send(reply);
+        return;
+      }
+    }
+
+    // Owner retract command: <prefix>: retract, as a REPLY to one of this bot's own messages
+    // (2026-09-26). Pulls that reply back out of every memory store it reached: Halseth journal
+    // rows keyed on the reply id (speech) and on the human message it answered (the judge's note),
+    // the promoted wm note, and the Second Brain discord-live doc. Deterministic writes + literal,
+    // itemised ack; a retraction that says "done" while one store still carries the mistake is
+    // worse than none. Not a reply to me -> usage, never inference.
+    //
+    // Rotate-on-retract (2026-09-26): the four stores above were not the whole story. The
+    // retracted reply kept echoing from two transcript stores until the 19:00 CDT Hermes rotation:
+    // this bot's own STM window (re-sent to the gateway by hermesDelta) and the gateway transcript
+    // itself. So one retract now also (a) forwards the reply text so Halseth drops its stm_entries
+    // rows, (b) drops the in-memory window lines, and (c) bumps the per-channel transcript id, so
+    // the next turn starts a fresh gateway session and re-sends the window without it.
+    // "Dre, in" / "Dre, out" (2026-10-31, Drevan's ask): Principal pulls one companion into the scene for
+    // OVERRIDE_TTL_MS, or lets them go. Room timing is shadow-only in this cut, so the override is recorded
+    // (Redis, per companion per channel) and read by the shadow decision; acknowledged with a reaction.
+    if (roomOverride) {
+      const key = overrideKey(COMPANION_ID as CompanionId, message.channelId);
+      const r = redis as unknown as { set(k: string, v: string, mode: string, ttl: number): Promise<unknown>; del(k: string): Promise<unknown> } | null;
+      if (roomOverride[1]!.toLowerCase() === "in") await r?.set(key, String(Date.now()), "PX", OVERRIDE_TTL_MS).catch(() => null);
+      else await r?.del(key).catch(() => null);
+      console.log(`[${COMPANION_ID}] room override: ${roomOverride[1]!.toLowerCase()} (channel ${message.channelId})`);
+      await message.react(roomOverride[1]!.toLowerCase() === "in" ? "👀" : "👋").catch(() => {});
+      return;
+    }
+
+    if (attribution.isOwner && RETRACT_TRIGGER && RETRACT_TRIGGER.test(effectiveContent)) {
+      const refId = message.reference?.messageId ?? null;
+      let reply: string;
+      if (!refId) {
+        reply = `reply to the message of mine you want gone, then \`${COMMAND_PREFIX[COMPANION_ID] ?? COMPANION_ID}: retract\`.`;
+      } else {
+        try {
+          const target = await message.channel.messages.fetch(refId);
+          const asRetractMsg = (m: Message): RetractMsg => ({
+            id: m.id,
+            authorId: m.author.id,
+            isBot: m.author.bot,
+            webhookId: m.webhookId ?? null,
+            content: m.content,
+            createdTimestamp: m.createdTimestamp,
+            referenceId: m.reference?.messageId ?? null,
+          });
+          const sbBase = (process.env["SECOND_BRAIN_URL"] ?? "").replace(/\/$/, "");
+          const sbKey = process.env["SB_INGEST_KEY"] ?? "";
+          const halsethBase = (process.env["HALSETH_URL"] ?? "").replace(/\/$/, "");
+          // Everything decidable without discord.js lives in executeRetract (retract-command.ts),
+          // tested there: chunk -> head, the judge key, the stores, the window, the rotation, the ack.
+          reply = await executeRetract({
+            companionId: COMPANION_ID,
+            channelId: message.channelId,
+            ownUserId: message.client.user?.id ?? "",
+            target: asRetractMsg(target),
+            replyIndex: replyIndexFor(COMPANION_ID, redis),
+            fetchNeighbours: async (id) => {
+              const [before, after] = await Promise.all([
+                message.channel.messages.fetch({ before: id, limit: 10 }),
+                message.channel.messages.fetch({ after: id, limit: 10 }),
+              ]);
+              // discord.js returns newest-first for both; `after` is wanted nearest-first (oldest-first).
+              return {
+                before: [...before.values()].map(asRetractMsg),
+                after: [...after.values()].reverse().map(asRetractMsg),
+              };
+            },
+            stmRetract: (channelId, text) => stmStore.retract(channelId, text),
+            bumps: await ensureRetractBumps(librarian),
+            halseth: { base: halsethBase, secret: cfg.halsethSecret },
+            secondBrain: sbBase && sbKey ? { base: sbBase, key: sbKey } : null,
+          });
+        } catch (err) {
+          reply = `retract failed: ${String(err instanceof Error ? err.message : err).slice(0, 200)}`;
+        }
+      }
+      await (message.channel as TextChannel).send(reply);
+      return;
+    }
+
+    // Owner shelf command: <prefix>: into <thing> | into list | into drop <frag> (0094).
+    // Deterministic Halseth write + literal ack. A bare "into" falls to the guard -> usage.
+    if (attribution.isOwner && INTO_TRIGGER) {
+      const intoMatch = effectiveContent.match(INTO_TRIGGER);
+      if (intoMatch) {
+        const reply = await handleIntoCommand(intoMatch[1]!, cfg.halsethSecret)
+          .catch(err => `into command failed: ${String(err instanceof Error ? err.message : err).slice(0, 200)}`);
+        await (message.channel as TextChannel).send(reply);
+        return;
+      }
+    }
+
+    // Shared by the MOVIE_TRIGGER block and the watch-party "watch <title> s#e#" start below: one place
+    // that reads the caption attachment, builds the delivery and sends the literal ack.
+    const runMovieCommand = async (sub: string, title: string): Promise<void> => {
+      const ch = message.channel as TextChannel;
+      let attachment: CaptionAttachment | null = null;
+      if (/^start$/i.test(sub)) {
+        // Captions can take a while (OpenSubtitles, yt-dlp); show the channel something.
+        await ch.sendTyping().catch(() => {});
+        if (message.attachments.size > 0) {
+          attachment = await readCaptionAttachment(
+            [...message.attachments.values()].map(a => ({ name: a.name, url: a.url, size: a.size })),
+          );
+        }
+      }
+      const delivery = watchalongDeliveryFor(cfg.halsethSecret, COMPANION_ID);
+      const reply = await handleMovieCommand(sub, title, {
+        secret: cfg.halsethSecret, channelId: message.channelId, companionId: COMPANION_ID,
+        startedBy: cfg.ownerDisplayName,
+        attachment, onChanged: () => delivery.invalidate(message.channelId),
+      }).catch(err => `movie command failed: ${String(err instanceof Error ? err.message : err).slice(0, 200)}`);
+      console.log(`[${COMPANION_ID}] watchalong movie ${sub.toLowerCase()} in ${message.channelId}${attachment ? ` (attachment ${attachment.name})` : ""}`);
+      await sendLong(ch, reply);
+    };
+
+    // Owner watch-shelf command: <prefix>: watching | watched <title> s4e5 [-- note] (0111).
+    // Deterministic Halseth write + literal ack -- never the model narrating a shelf change.
+    //
+    // Unlike the other commands a BARE form is valid here ("dre: watching" = "where are we?"), so the
+    // trigger's argument group is optional and this must not fall through to the usage guard. That
+    // question is the entire reason the organ exists: Principal asked it, Drevan answered from a
+    // two-week-old prose fragment, and there was no position field anywhere to answer it properly.
+    if (attribution.isOwner && WATCH_TRIGGER) {
+      const watchMatch = effectiveContent.match(WATCH_TRIGGER);
+      if (watchMatch) {
+        // In a bound watch-party channel "<alias>: watch <title?> s#e#" means START the party at that
+        // episode (2026-11-02: "Dre: Watch Fargo s4e10" was answered with a progress ack that read as a
+        // failure). "watched"/"watching" and status words keep the progress meaning everywhere.
+        const party = parseWatchPartyChannels(process.env["WATCH_PARTY_CHANNELS"]).get(message.channelId);
+        const start = party && party.companion === COMPANION_ID ? resolveWatchPartyStart(effectiveContent, watchMatch[1] ?? "", party) : null;
+        if (start) {
+          void recordWatchProgress(cfg.halsethSecret, {
+            title: start.progressTitle, season: start.season, episode: start.episode, note: start.note,
+            surface: "discord", with_companion: COMPANION_ID,
+          }).catch(() => {});
+          await runMovieCommand("start", start.movieTitle);
+          return;
+        }
+        const reply = await handleWatchCommand(watchMatch[1] ?? "", cfg.halsethSecret, COMPANION_ID)
+          .catch(err => `watch command failed: ${String(err instanceof Error ? err.message : err).slice(0, 200)}`);
+        await sendLong(message.channel as TextChannel, reply);
+        return;
+      }
+    }
+
+    // Explicit listen/watch command aimed at a DIFFERENT companion: stay out of it.
+    // When the owner tells one companion to listen or watch, only that companion runs the
+    // pipeline and reacts -- siblings must not pop off (2026-06-13: the listener's
+    // late-arriving [HEARD] packet lost Brain's dedup to siblings' bare packets, so
+    // the one told to listen went mute while a blind sibling answered). Placed
+    // before every media trigger / guard / [NOT HEARD] block so siblings return
+    // here and never reach inference at all.
+    if (attribution.isOwner) {
+      const mediaTarget = mediaCommandTarget(effectiveContent);
+      if (mediaTarget !== null && mediaTarget.companion !== COMPANION_ID) return;
+    }
+
+    // Owner watch command (2026-10-23): "<prefix>: watch <url>" / "<prefix>: video <url>". The one-shot
+    // read: yt-dlp pulls the caption track + the info dict (no media download), the transcript rides this
+    // turn as a [WATCHED] block (the [HEARD] pattern), the row lands in media_experiences as a video, and the
+    // reply is saved as the reaction. Checked BEFORE the watchalong block: its "watch <title>" alias would
+    // otherwise open a playhead session on a URL (the live co-watch path is `movie start <url>`, still).
+    // `pendingMediaId` is the Halseth row for the reaction PATCH at the end. `mediaPipelineRan` is the
+    // gate every later block reads: the two are NOT the same thing. postExperience returns null on a
+    // Halseth hiccup and both pipelines treat that as non-fatal, so a watch that read the whole video
+    // could otherwise fall through to the movie alias, the usage guard and the [NOT WATCHED] backstop.
+    let pendingMediaId: string | null = null;
+    let mediaPipelineRan = false;
+    if (attribution.isOwner) {
+      const videoMatch = effectiveContent.match(VIDEO_TRIGGER);
+      if (videoMatch) {
+        const ch = message.channel as TextChannel;
+        if (!isWatchEnabled()) {
+          await ch.send("the watch pipeline is switched off on this box (MEDIA_WATCH_ENABLED).");
+          return;
+        }
+        const videoUrl = videoMatch[1]!.trim().replace(/^<|>$/g, ""); // Discord <url> unwrap
+        if (!/^https?:\/\//i.test(videoUrl)) {
+          await ch.send("give me an http(s) link to watch.");
+          return;
+        }
+        await ch.send("\u{1F4FA} watching...");
+        try {
+          const watched = await runWatchPipeline(videoUrl, {
+            companionId: COMPANION_ID,
+            sharedBy: author,
+            frontState: pkMemberName ?? null,
+            halsethSecret: cfg.halsethSecret,
+            transcribe: voiceClient ? (audio, name, timeoutMs) => voiceClient.transcribe(audio, name, timeoutMs) : null,
+          });
+          pendingMediaId = watched.experienceId;
+          mediaPipelineRan = true;
+          console.log(`[${COMPANION_ID}] watched ${watched.meta.video_id ?? videoUrl} source=${watched.source} chars=${watched.transcript_chars} sampled=${watched.sampled ? 1 : 0} experience=${watched.experienceId ?? "none"}`);
+          effectiveContent = `${effectiveContent.trim()}\n\n[WATCHED -- the video's transcript and description were fetched; you have read the whole thing. Respond to what it actually says.]\n${watched.watchedBlock}`;
+          // STM gets a one-line past-tense marker instead of the transcript -- see the stmContent
+          // divergence note near the top of this handler (and the 2026-08-29 [HEARD] lesson).
+          stmContent = `${stmContent.trim()}\n${watchedStmMarker(watched.meta)}`;
+          // fall through to the normal flow below -- no return.
+        } catch (err) {
+          console.error(`[${COMPANION_ID}] watch pipeline failed:`, err);
+          await ch.send(`couldn't watch that one -- ${String(err instanceof Error ? err.message : err).slice(0, 400)}`);
+          return;
+        }
+      }
+    }
+
+    // Owner watchalong commands (spec 2026-10-02): "<prefix>: movie start <title>" (+ optional attached
+    // .srt/.vtt), "<prefix>: movie pause|play|status|done", "<prefix>: at 47:12". Deterministic Halseth
+    // writes + literal acks, never inference. Per-bot aliases, so only the addressed bot matches.
+    //
+    // The caption attachment is read HERE, from message.attachments, before any addressing/relevance
+    // gate: these blocks sit above all of them, and the STT/vision passes above ignore text files, so
+    // an .srt reaches this point untouched. Owner `movie start` messages only -- no other message ever
+    // has its text attachments fetched.
+    if (attribution.isOwner && MOVIE_TRIGGER && !mediaPipelineRan) {
+      const m = effectiveContent.match(MOVIE_TRIGGER);
+      if (m) {
+        // Group 4 is the "watch <title>" alias (command-triggers.ts): a start with that title.
+        const sub = m[1] ?? m[3] ?? (m[4] ? "start" : "");
+        // "watch movie Fargo" / "watch the movie Fargo": the kind word is how it was said, not the title.
+        const title = m[2] ?? (m[4] !== undefined ? stripKindWords(m[4]) || m[4] : "");
+        await runMovieCommand(sub, title);
+        return;
+      }
+    }
+    if (attribution.isOwner && MOVIE_AT_TRIGGER) {
+      const m = effectiveContent.match(MOVIE_AT_TRIGGER);
+      if (m) {
+        const delivery = watchalongDeliveryFor(cfg.halsethSecret, COMPANION_ID);
+        const reply = await handleAtCommand(m[1] ?? "", {
+          secret: cfg.halsethSecret, channelId: message.channelId, companionId: COMPANION_ID,
+          onChanged: () => delivery.invalidate(message.channelId),
+        }).catch(err => `at command failed: ${String(err instanceof Error ? err.message : err).slice(0, 200)}`);
+        console.log(`[${COMPANION_ID}] watchalong at ${m[1]} in ${message.channelId}`);
+        await (message.channel as TextChannel).send(reply);
+        return;
+      }
+    }
+
+    // Passive watch-party progress (2026-09-05). Placed AFTER the explicit WATCH_TRIGGER block
+    // above (which already `return`ed on a match) so the deterministic command always keeps
+    // precedence -- this never runs for a message that IS "dre: watched fargo s4e6". It exists
+    // because nobody types that command mid-episode: the shelf said S4E4 from 07-31 while the
+    // actual watching in #fargo-watch-party reached S4E6+ on 08-29/30, and this is the fix --
+    // notice the episode Principal names in ordinary conversation and record it silently, no reply.
+    //
+    // Exactly ONE companion records per bound channel (party.companion) even though all three
+    // bots see every message, so a three-way write race never happens.
+    if (attribution.isOwner) {
+      const party = parseWatchPartyChannels(process.env["WATCH_PARTY_CHANNELS"]).get(message.channelId);
+      if (party && party.companion === COMPANION_ID) {
+        const hit = detectWatchProgress(effectiveContent, party);
+        if (hit) {
+          const key = `${hit.season ?? "?"}x${hit.episode}`;
+          if (lastPassiveWatchProgress.get(message.channelId) !== key) {
+            lastPassiveWatchProgress.set(message.channelId, key);
+            writeQueue.fireAndForget(`watch:passive:${message.channelId}`, async () => {
+              const res = await recordWatchProgress(cfg.halsethSecret, {
+                title: party.title, season: hit.season, episode: hit.episode,
+                note: null, surface: "discord", with_companion: COMPANION_ID,
+              });
+              if (res.ok) {
+                console.log(`[${COMPANION_ID}] watch progress (passive): ${party.title} S${hit.season ?? "?"}E${hit.episode} from #${message.channelId}`);
+              } else {
+                console.warn(`[${COMPANION_ID}] passive watch progress write failed (status ${res.status}) -- shelf unchanged`);
+              }
+            });
+          }
+        }
+      }
+    }
+
+    // Owner listen command: <prefix>: listen <url>  (shared-experience Phase 1).
+    // Downloads + analyzes on this box, then FALLS THROUGH to the normal reply
+    // path with a [HEARD] block appended -- so the in-voice response rides the
+    // full context assembly (direct inference; see the pendingMediaId branch at
+    // the inference step -- a listen is answered solo by the bot that heard it).
+    // (The sibling-silence check for listen AND watch sits above the watch block.)
+    if (attribution.isOwner && !mediaPipelineRan) {
+      const listenMatch = effectiveContent.match(LISTEN_TRIGGER);
+      if (listenMatch) {
+        if (!isListenEnabled()) {
+          await (message.channel as TextChannel).send("listening pipeline isn't enabled on this box (MEDIA_LISTEN_ENABLED).");
+          return;
+        }
+        const mediaUrl = listenMatch[1]!.trim().replace(/^<|>$/g, ""); // Discord <url> unwrap
+        if (!/^https?:\/\//i.test(mediaUrl)) {
+          await (message.channel as TextChannel).send("give me an http(s) link to listen to.");
+          return;
+        }
+        await (message.channel as TextChannel).send("\u{1F3A7} listening...");
+        try {
+          const listen = await runListenPipeline(mediaUrl, {
+            companionId: COMPANION_ID,
+            sharedBy: author,
+            frontState: pkMemberName ?? null,
+            halsethSecret: cfg.halsethSecret,
+          });
+          pendingMediaId = listen.experienceId;
+          mediaPipelineRan = true;
+          effectiveContent = `${effectiveContent.trim()}\n\n[HEARD -- the track was downloaded and analyzed; you actually listened to it. Respond to the music itself.]\n${listen.heardBlock}`;
+          // STM gets a short past-tense marker instead of the full block above -- see the
+          // stmContent divergence note near the top of this handler.
+          stmContent = `${stmContent.trim()}\n${heardStmMarker(listen.meta)}`;
+          // fall through to the normal flow below -- no return.
+        } catch (err) {
+          console.error(`[${COMPANION_ID}] listen pipeline failed:`, err);
+          // 400, not 200: the message is now a DIAGNOSIS rather than a command dump, and a
+          // 200-char cut landed mid-sentence on the only part worth reading.
+          await (message.channel as TextChannel).send(`couldn't hear that one -- ${String(err instanceof Error ? err.message : err).slice(0, 400)}`);
+          return;
+        }
+      }
+    }
+
+    // Malformed-command guard: command-shaped owner message that none of the
+    // deterministic triggers above matched (valid model/club returned, valid
+    // listen/watch set mediaPipelineRan). It must get a literal usage reply, NEVER fall
+    // through to inference -- the model narrates fake success (2026-06-11
+    // club-vote incident; 2026-06-12 "dre: listen" miss).
+    if (attribution.isOwner && !mediaPipelineRan && COMMAND_GUARD?.test(effectiveContent)) {
+      console.error(`[${COMPANION_ID}] malformed command, sent usage: ${effectiveContent.slice(0, 120)}`);
+      await (message.channel as TextChannel).send(commandUsage(COMPANION_ID));
+      return;
+    }
+
+    // Grounding backstop: a shared link with listen-intent that did NOT run the pipeline
+    // must never be answered as if heard. Without this, the model narrates a convincing
+    // fake listen (2026-06-12: "Dre listen: <url>" missed the trigger and Drevan described
+    // a track he never heard, then couldn't name it). Appended to the MESSAGE (like
+    // [HEARD]) so every swarm companion sees it, not just the packet sender.
+    if (attribution.isOwner && !mediaPipelineRan
+        && /https?:\/\//i.test(effectiveContent) && /\blisten\b/i.test(effectiveContent)) {
+      const p = COMMAND_PREFIX[COMPANION_ID] ?? COMPANION_ID;
+      effectiveContent = `${effectiveContent.trim()}\n\n[NOT HEARD -- this link was shared but the listen pipeline did not run; nobody has actually played it. Do not describe its sound, mood, or lyrics. Say plainly that you haven't heard it yet; "${p}: listen <url>" lets you actually hear it.]`;
+      // STM marker instead of the full block above -- see the stmContent divergence note.
+      stmContent = `${stmContent.trim()}\n${notHeardStmMarker()}`;
+    }
+    // The same backstop for a YouTube or TikTok link nobody opened (2026-10-23; TikTok 2026-11-09). The clusterfuck this whole lane
+    // exists for: a video link shared in conversation, and the companion talked about it as if it had seen
+    // it. The listen backstop above needs the word "listen"; a YouTube link needs no word at all -- the
+    // model will narrate a plausible video from the URL alone. Appended to the MESSAGE, like [HEARD].
+    else if (attribution.isOwner && !mediaPipelineRan && isWatchableUrl(effectiveContent)) {
+      const p = COMMAND_PREFIX[COMPANION_ID] ?? COMPANION_ID;
+      effectiveContent = `${effectiveContent.trim()}\n\n${notWatchedBlock(p)}`;
+      stmContent = `${stmContent.trim()}\n${notWatchedStmMarker()}`;
+    }
+
+    // Conversation Director (spec 2026-09-03): in director channels every message is published to the
+    // bus (all three bots do; the director dedupes on message id). A COMPANION turn is then the
+    // director's to route -- this bot does not self-select a reply. Human turns fall through unchanged.
+    // Owner command/listen traffic returned above this point by design (2026-09-03 review, finding
+    // 3): commands are not conversational turns and are never commons material.
+    // Sol never enters the commons bus: commonsMessageFor would label a webhook "proxy" (a human), and
+    // the director would route and reset rails on it as if Principal had spoken. Sol takes the local path.
+    if (isArrival && !isSol && directorMode() !== "off" && isDirectorChannel(channelEntry, gateChannelId) && redis) {
+      const senderCompanion = BOT_ID_COMPANION[message.author.id] as CompanionId | undefined;
+      publishCommonsMessage(redis, commonsMessageFor({
+        channelId: message.channelId, messageId: message.id, authorId: message.author.id,
+        isCompanionBot: senderCtx.isCompanionBot, webhookId: message.webhookId, senderCompanion,
+        content: effectiveContent, replyToMessageId: message.reference?.messageId ?? null,
+        createdTimestamp: message.createdTimestamp, publishedBy: COMPANION_ID, userTier,
+      })).catch(() => {});
+      // Liveness gate (2026-09-03 review): DIRECTOR_ENABLED=live means the config WANTS this
+      // routed to the director, but a dead worker (crash, redeploy gap) leaves no process to
+      // ever answer it. `director:alive` is a 60s-TTL key the worker refreshes every 20s; its
+      // absence means the worker is down, not merely idle.
+      const directorAlive = !!(await redis.get("director:alive").catch(() => null));
+      if (!directorAlive && Date.now() - lastDirectorNotAliveWarnAt > DIRECTOR_NOT_ALIVE_WARN_MS) {
+        lastDirectorNotAliveWarnAt = Date.now();
+        console.warn(`[${COMPANION_ID}] director not alive -- falling back to local reply path`);
+      }
+      if (shouldDeferToDirector({ isCompanionBot: senderCtx.isCompanionBot, mode: directorMode(), directorAlive })) return;
+    }
+
+    // Sequential floor (2026-08-15): is this sibling message the predecessor reply my pending
+    // follow-up entitlement waits on? Consumed exactly once; an entitled turn bypasses the
+    // vocative gate below (that is the whole point) but NONE of the rails -- caps, pingpong
+    // and chain depth still apply to it like any sibling-triggered turn.
+    let entitledFollowUp: FollowUpEntitlement | null = followUpPass ?? null;
+    if (followUpPass) {
+      console.log(`[${COMPANION_ID}] follow-up entitlement released by a PASS from ${followUpPass.expectedPrior} (origin=${followUpPass.originMessageId}, position=${followUpPass.position})`);
+    } else if (senderCtx.isCompanionBot) {
+      entitledFollowUp = followUps.match(
+        message.channelId,
+        BOT_ID_COMPANION[message.author.id] as CompanionId | undefined,
+        message.reference?.messageId,
+      );
+      if (entitledFollowUp) {
+        console.log(`[${COMPANION_ID}] follow-up entitlement released by ${entitledFollowUp.expectedPrior} (origin=${entitledFollowUp.originMessageId}, position=${entitledFollowUp.position})`);
+      }
+    }
+
+    /**
+     * B32 B1: compute the care chain for this owner message from SHARED channel history (so all three
+     * processes agree on who is throttled) and, if I hold a position, register the entitlement. Returns
+     * true only when a position was queued (the caller stops); throttled and shadow return false so the
+     * turn carries on exactly as it would have without B32.
+     */
+    const grantCareFollowUp = async (first: CompanionId[], eligibleWhy: string): Promise<boolean> => {
+      let history: ChainHistoryMsg[] = [];
+      try {
+        const hist = await message.channel.messages.fetch({ limit: 100, before: message.id });
+        history = [...hist.values()]
+          .filter(m => m.createdTimestamp >= message.createdTimestamp - CARE_FOLLOWUP_MIN_GAP_MS)
+          .map(m => ({
+            companionId: (botTurn(m) && !m.webhookId ? BOT_ID_COMPANION[m.author.id] : undefined) as CompanionId | undefined,
+            createdTimestamp: m.createdTimestamp,
+          }));
+      } catch {
+        console.warn(`[${COMPANION_ID}] B32: channel history unavailable -- no care follow-up (cannot apply the throttle)`);
+        return false;
+      }
+      const { chain, throttled } = careFollowUpChain({
+        first,
+        channelCompanions: (channelEntry?.companions ?? ["cypher", "drevan", "gaia"]) as CompanionId[],
+        history,
+        originTs: message.createdTimestamp,
+        messageId: message.id,
+      });
+      const me = COMPANION_ID as CompanionId;
+      if (throttled.includes(me)) {
+        b32Log(COMPANION_ID, eligibleWhy, b32Mode === "on" ? "throttled" : "shadow", b32Mode === "on" ? "spoke here in the last 30 min" : "would be throttled");
+        // Throttled (or shadow): the caller carries on exactly as it would have without B32.
+        return false;
+      }
+      const pos = careChainPosition(chain, me);
+      if (!pos) return false;
+      if (b32Mode !== "on") {
+        b32Log(COMPANION_ID, eligibleWhy, "shadow", `would hold position ${pos.position} behind ${pos.expectedPrior} (chain=${chain.join(">")})`);
+        return false;
+      }
+      followUps.grant({
+        originMessageId: message.id,
+        channelId: message.channelId,
+        expectedPrior: pos.expectedPrior,
+        position: pos.position,
+        expiresAt: Date.now() + FOLLOW_UP_TTL_MS,
+        kind: "care",
+        ...(pkKnownSenderId ? { pkSenderId: pkKnownSenderId } : {}),
+        originSpeaker: writebackSpeaker,
+        originContent: withAttachedLabel(effectiveContent, spokenWords),
+      });
+      b32Log(COMPANION_ID, eligibleWhy, "queued", `position ${pos.position} behind ${pos.expectedPrior}, chain=${chain.join(">")}`);
+      return true;
+    };
+
+    // Structural gate: mode, addressing, companion filter.
+    // Direct address (name at start or followed by comma/colon) always bypasses the
+    // relevance classifier -- if the owner is talking to you, you respond.
+    // Ambient messages in owner_only channels go through the semantic classifier.
+    //
+    // Burst settle (2026-10-10, ruling 1): the companion address parsers read `addressText`, the
+    // text of the gathered burst that names a companion (the newest message when it does itself;
+    // else the most recent earlier one that does). A burst of one is `effectiveContent` unchanged.
+    const addressText = burst.length > 0
+      ? burstAddressText(effectiveContent, burst.map(b => b.content))
+      : effectiveContent;
+    let directlyAddressed = isDirectAddress(addressText, COMPANION_ID);
+    // Did the speaker address ME (name, @-mention, reply to my message)? Captured before the Spouse-thread
+    // branch below sets directlyAddressed for the holder, so it means "spoken to", not "holds the thread".
+    const addressedMeByName = directlyAddressed || !!senderCtx.isMentioned || isReplyToMe;
+    const holdRedis = redis as unknown as HoldRedis | null;
+
+    // Active-exchange holder (2026-07-27). Observed: Principal wrote "Drevan baby ... Fargo in
+    // an hour?", Drevan answered, Principal replied with an UNADDRESSED follow-up -- and Gaia
+    // answered it. An unaddressed owner message went to whoever matched, with no notion that
+    // a conversation was already underway. Only computed for unaddressed owner messages, so
+    // named/group traffic pays no fetch and can always hand the thread over.
+    // An entitled follow-up (a pass turn runs on the owner's origin) answers regardless: no fetch.
+    if (!isOwnerDm && attribution.isOwner && !senderCtx.isCompanionBot && !entitledFollowUp && extractAddress(addressText).type === "ambient") {
+      try {
+        const hist = await message.channel.messages.fetch({ limit: 8 });
+        // A companion's reply to SPOUSE is Spouse's thread, not Principal's (per-human hold, 2026-10-10):
+        // those ids are skipped so answering Spouse never hands Principal's exchange to that companion.
+        const spouseReplyIds = await readHumanHoldIds(holdRedis, "spouse", message.channelId);
+        senderCtx.activeExchangeWith = activeExchangeHolder(
+          withoutSol([...hist.values()], solId)
+            .filter(m => m.id !== message.id && !spouseReplyIds.has(m.id))
+            .sort((a, b) => b.createdTimestamp - a.createdTimestamp)
+            .map(m => ({
+              companionId: BOT_ID_COMPANION[m.author.id] as CompanionId | undefined,
+              authorIsBot: botTurn(m),
+              createdTimestamp: m.createdTimestamp,
+            })),
+          Date.now(),
+          channelEntry?.exchangeWindowMs,
+        );
+        if (senderCtx.activeExchangeWith && senderCtx.activeExchangeWith !== COMPANION_ID) {
+          console.log(`[${COMPANION_ID}] unaddressed owner message -- ${senderCtx.activeExchangeWith} holds this exchange, standing down`);
+        }
+      } catch { /* history unavailable -- leave null, ambient stays open to everyone */ }
+    }
+
+    // The room's recent turns in the address classifiers' vocabulary (shared by the address shadow and
+    // the cold Spouse pick, so both read one rendering).
+    // One stable name per person (2026-10-11 room rendering): Spouse unproxied reads "Spouse".
+  const addressTurnsFrom = (older: Message[]): AddressTurn[] => older.map(m => ({
+    speaker: isSolPost(m, solId) ? SOL_AUTHOR_LABEL
+      : BOT_ID_COMPANION[m.author.id] && !m.webhookId
+        ? BOT_ID_COMPANION[m.author.id]!.charAt(0).toUpperCase() + BOT_ID_COMPANION[m.author.id]!.slice(1)
+        // A proxy turn says whose system the member is (2026-10-13): a bare "MemberA M." or
+        // "Rogue || 🍂" left Principal's fronts and Spouse's members indistinguishable.
+        : m.webhookId ? proxyTurnLabel(m.author.username, verifiedRosterMember(m, pkRoster), cfg.spouseDiscordId)
+          : m.author.id === cfg.ownerDiscordId ? ownerTurnLabel(cfg.ownerDisplayName)
+            : cfg.spouseDiscordId && m.author.id === cfg.spouseDiscordId ? SPOUSE_LABEL
+              : m.author.username,
+    text: m.content ?? "",
+  }));
+
+    // B37 step 1, address model SHADOW (address-shadow.ts, 2026-09-29). Fired HERE -- after the regex
+    // verdict and the exchange holder are settled, before this bot's own gates return -- because it
+    // has to see the messages this bot will NOT answer ("Cy said..." silences Drevan and Gaia at
+    // shouldRespond just below). NEVER awaited: it returns void, runs detached, claims the message
+    // in Redis so only one bot calls the model, and changes nothing about who speaks.
+    // Human messages from Principal (or his PK front) and, since step 2 (2026-10-13), Spouse (or a member
+    // of Spouse's system): Spouse is family and a defined addressee, never a guest. Guests never; never a
+    // sibling, never Sol, never a DM, never a replayed pass turn. Spouse's holder is Spouse's own thread
+    // hold (per-human, 2026-10-10), never Principal's.
+    if (isArrival && !isDm && !isSol && !senderCtx.isCompanionBot && !entitledFollowUp
+      && (userTier === "owner" || userTier === "intimate") && addressModelMode() === "shadow") {
+      const shadowRefId = message.reference?.messageId ?? null;
+      const shadowSide = userTier === "owner" ? "principal" as const : "spouse" as const;
+      fireAddressShadow({
+        isDm: isDm,
+        companionId: COMPANION_ID,
+        messageId: message.id,
+        channelId: message.channelId,
+        createdTimestamp: message.createdTimestamp,
+        content: effectiveContent,
+        speaker: author,
+        speakerSide: shadowSide,
+        humanAddressee: humanAddressee(effectiveContent, humanNamesFromEnv()),
+        mentionedCompanion: senderCtx.isMentioned
+          || [...BOT_IDS].some(id => id !== client.user?.id && message.mentions.users?.has?.(id)),
+        replyToMe: isReplyToMe,
+        replyToCompanion: shadowRefId
+          ? async () => {
+            const ref = await message.channel.messages.fetch(shadowRefId).catch(() => null);
+            return !!ref && BOT_IDS.has(ref.author.id) && !ref.webhookId;
+          }
+          : undefined,
+        regex: extractAddress(effectiveContent),
+        // Spouse's holder is read in fetchRecent (Spouse's own hold); Principal's is the one settled above.
+        holder: shadowSide === "principal" ? senderCtx.activeExchangeWith : undefined,
+        redis,
+        adapter: withCaller(directAdapter, "address_model") ?? null,
+        fetchRecent: async () => {
+          const hist = await message.channel.messages.fetch({ limit: 8 });
+          const older = [...hist.values()]
+            .filter(m => m.id !== message.id && m.createdTimestamp <= message.createdTimestamp)
+            .sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+          // One stable name per person (2026-10-11 room rendering): Spouse unproxied reads "Spouse".
+          const turns = addressTurnsFrom(older);
+          if (shadowSide === "spouse") {
+            const spouseHolder = await readHumanHold(holdRedis, "spouse", message.channelId, channelEntry?.exchangeWindowMs ?? ACTIVE_EXCHANGE_WINDOW_MS);
+            return { turns, holder: spouseHolder };
+          }
+          // Principal's holder walk skips companion replies to Spouse (per-human hold), same as the reply path.
+          const spouseReplyIds = await readHumanHoldIds(holdRedis, "spouse", message.channelId);
+          const holder = activeExchangeHolder(
+            withoutSol(older, solId).filter(m => !spouseReplyIds.has(m.id)).reverse().map(m => ({
+              companionId: BOT_ID_COMPANION[m.author.id] as CompanionId | undefined,
+              authorIsBot: botTurn(m),
+              createdTimestamp: m.createdTimestamp,
+            })),
+            message.createdTimestamp,
+            channelEntry?.exchangeWindowMs,
+          );
+          return { turns, holder };
+        },
+      });
+    }
+    // B32 (bad-night presence, BAD_NIGHT_PRESENCE). D3's deterministic floor: "bad night" as the whole
+    // message or its own sentence starts the care hold; "good now" / "I'm okay now" clears it. Read on
+    // Principal's own arriving message only. Every bot that sees it applies the change to its own register
+    // at once (on only), so a sibling's very next gate already sees the hold instead of waiting up to
+    // five minutes for orient; only the companion that ANSWERS calls Halseth (at the speak decision
+    // below), and the next orient refresh overwrites any local apply with Halseth's truth.
+    const b32Mode = badNightMode();
+    const b32OwnerArrival = isArrival && !isSol && !senderCtx.isCompanionBot && attribution.isOwner && !entitledFollowUp;
+    const holdPhrase: HoldPhrase | null = b32Mode !== "off" && b32OwnerArrival ? matchHoldPhrase(effectiveContent) : null;
+    const careBeforePhrase = getCareState(COMPANION_ID);
+    const holdWasActive = careHoldActive(COMPANION_ID);
+    if (holdPhrase) {
+      if (b32Mode === "on") applyLocalHold(COMPANION_ID, holdPhrase, new Date().toISOString());
+      console.log(`[${COMPANION_ID}] B32: owner phrase -> ${holdPhrase}${b32Mode === "on" ? " (applied locally)" : " (shadow: not applied)"}`);
+    }
+    // Declared departures (T4b, DEPARTURES). Principal's whole-sentence "back inside the line" ends every open
+    // departure, in any guild channel or DM: every bot that hears it clears its local registry at once, and
+    // the Redis NX winner makes the ONE stand-down call (detached; the reply path is otherwise unchanged).
+    // "bad night" also ends them locally (the server side rides the care hold).
+    const departuresNow = departuresMode(process.env, COMPANION_ID);
+    if (departuresNow !== "off" && b32OwnerArrival) {
+      if (matchStandDown(effectiveContent)) {
+        applyStandDown({
+          redis: redis as unknown as ClaimRedis | null, messageId: message.id, companionId: COMPANION_ID,
+          call: () => librarian.departureStandDown(STAND_DOWN_PHRASE),
+        }).then(r => departureLog(`[departure] ${COMPANION_ID} stand_down msg=${message.id} cleared=${r.cleared} called=${r.called} ok=${r.ok}`))
+          .catch(() => {});
+      } else if (matchHoldPhrase(effectiveContent) === "start") {
+        const n = clearDeparturesLocal();
+        if (n > 0) departureLog(`[departure] ${COMPANION_ID} cleared_local why=bad_night n=${n}`);
+      }
+    }
+    // D4's shared signal: Principal is in a live DM with THIS companion. Siblings' heartbeats read it.
+    if (isOwnerDm && b32OwnerArrival && b32Mode !== "off") {
+      markOwnerDmLive(redis as unknown as RedisLike | null, COMPANION_ID).catch(() => {});
+    }
+    // HUMAN ADDRESS GATE (2026-10-10, Principal's rulings; human-address.ts). Two humans share these rooms.
+    // Sits BEFORE the ambient judge, shouldRespond and the fit bid (and so before the B32 forced bid),
+    // and applies in EVERY channel class (owner_only, guild/shared, the movie channel): the ordering is
+    // 1. a companion named anywhere in the gathered burst -> the existing fast path, untouched;
+    // 2. else a HUMAN named at vocative position who is not the speaker ("Spouse, ..." from Principal,
+    //    "Principal, ..." from Spouse) -> every companion silent;
+    // 3. else the speaker is Spouse and nobody is named -> only the companion holding SPOUSE's own thread
+    //    (a per-human Redis hold, not Principal's per-channel one) answers; no holder, nobody; no bid;
+    // 4. else everything below, untouched. Sol, companion bots, DMs, entitled follow-ups and guests skip it.
+    let spouseThreadMine = false;
+    // Spouse's own thread holder, read once here; the fit bid below scores it as holdsThread on Spouse's
+    // group calls (2026-10-25: Principal's per-channel holder was the one being scored on Spouse's lines).
+    let spouseHolderSeen: CompanionId | null = null;
+    // True when the regex gate let this bot through on an UNNAMED line (Rule 4 for Principal, or Spouse's
+    // thread holder): the live Jev gate (human-jev-gate.ts) runs on exactly these, after shouldRespond.
+    let humanUnnamed = false;
+    // Room timing: the ONE decision for this line, started in the address gate below and awaited at the
+    // live gate, so live behaviour is exactly what the shadow row recorded (never recomputed later, when
+    // directlyAddressed may have been mutated by the Spouse-thread path).
+    let roomTimingP: Promise<RoomTimingResult | null> | null = null;
+    const roomTimingNow = roomTimingMode(process.env, COMPANION_ID);
+    let spouseColdPicked = false;
+    if (isArrival && !isDm && !isSol && !senderCtx.isCompanionBot && !entitledFollowUp
+        && (userTier === "owner" || userTier === "intimate")) {
+      const mentionedIds = [...message.mentions.users.keys(), ...burst.flatMap(b => b.mentionedIds ?? [])];
+      const mentionedHumans: HumanSide[] = [];
+      if (cfg.spouseDiscordId && mentionedIds.includes(cfg.spouseDiscordId)) mentionedHumans.push("spouse");
+      if (cfg.ownerDiscordId && mentionedIds.includes(cfg.ownerDiscordId)) mentionedHumans.push("principal");
+      const spouseHolder = userTier === "intimate"
+        ? await readHumanHold(holdRedis, "spouse", message.channelId, channelEntry?.exchangeWindowMs ?? ACTIVE_EXCHANGE_WINDOW_MS)
+        : null;
+      spouseHolderSeen = spouseHolder;
+      const gateTexts = [...burst.map(b => b.content), effectiveContent];
+      const gateInput = {
+        tier: userTier,
+        texts: gateTexts,
+        names: mergeHumanNames(humanNamesFromEnv(), {
+          spouse: await learnedHumanNames(holdRedis as unknown as NameRedis | null, "spouse"),
+        }),
+        companionMentioned: senderCtx.isMentioned,
+        replyToCompanion: isReplyToMe,
+        mentionedHumans,
+        spouseHolder,
+      };
+      // Rule 2b (a Discord reply to the other human is theirs) behind REPLY_HUMAN_GATE: `on` gates live;
+      // `shadow` runs the gate both ways and logs only where the reply would have silenced this companion.
+      const replyHuman = replyToHumanSide(replyTgt);
+      const replyMode = replyHumanGateMode();
+      const verdict = humanGate({ ...gateInput, replyToHuman: replyMode === "on" ? replyHuman : null });
+      if (replyMode === "shadow" && replyHuman && verdict.kind !== "silent") {
+        const would = humanGate({ ...gateInput, replyToHuman: replyHuman });
+        if (would.kind === "silent") {
+          console.log(`[${COMPANION_ID}] reply-human gate (shadow): ${userTier === "owner" ? "principal" : "spouse"} replied to ${replyHuman}, would stay quiet (msg=${message.id})`);
+          appendRoomTimingLine({ kind: "reply_gate", at: new Date().toISOString(), companion: COMPANION_ID, msg_id: message.id, channel_id: message.channelId, speaker: userTier === "owner" ? "principal" : "spouse", reply_to: replyHuman, live: verdict.kind });
+        }
+      }
+      humanUnnamed = verdict.kind === "proceed"
+        ? !companionNamedIn({ texts: gateTexts, companionMentioned: senderCtx.isMentioned, replyToCompanion: isReplyToMe })
+        : verdict.kind === "spouse_thread";
+      // Room timing (room-timing.ts, Drevan's rules 10-31): what this companion WOULD do with this human
+      // line -- answer now, hold for the lull (with a reaction), or stay quiet. Started detached here and
+      // logged as a shadow row in both shadow and on; only `on` awaits it, at the live gate after the Jev
+      // gate below. Runs before the silent return below so the lines the gate already silences are scored
+      // too. A lull RELEASE turn skips it: its row was written when the line was held.
+      if (roomTimingNow !== "off" && !deps.lullRelease) {
+        const speakerSide: "principal" | "spouse" = userTier === "owner" ? "principal" : "spouse";
+        // Per-companion only: companionNamedIn() is true when ANY companion is named, so it must not feed this.
+        const named = senderCtx.isMentioned || directlyAddressed;
+        const isHolder = timingHolder({
+          me: COMPANION_ID as CompanionId, speakerSide, spouseHolder,
+          activeExchangeWith: (senderCtx.activeExchangeWith as CompanionId | null | undefined) ?? null,
+          pendingHoldSide: deps.lullPendingSide?.(message.channelId) ?? null,
+        });
+        // A cold unnamed Spouse line (no holder) may still be answered by SPOUSE_COLD_PICK after this row is
+        // written; flagged so the readout does not count that pick as an interruption.
+        const cold = speakerSide === "spouse" && spouseHolder === null;
+        const at = message.createdTimestamp;
+        roomTimingP = (async (): Promise<RoomTimingResult | null> => {
+          try {
+            let otherHumanAgoMs: number | null = null;
+            let selfSpokeAgoMs: number | null = null;
+            const recent = [...(message.channel.messages.cache?.values?.() ?? [])]
+              .filter(m => m.id !== message.id && m.createdTimestamp <= at)
+              .sort((a, b) => b.createdTimestamp - a.createdTimestamp)
+              .slice(0, 25);
+            const selfId = message.client.user?.id;
+            for (const m of recent) {
+              if (selfSpokeAgoMs === null && selfId && m.author.id === selfId && !m.webhookId) selfSpokeAgoMs = at - m.createdTimestamp;
+              if (otherHumanAgoMs === null) {
+                const side = (m.author.id === cfg.ownerDiscordId) ? "principal" : (m.author.id === cfg.spouseDiscordId) ? "spouse"
+                  : m.webhookId && !isSolPost(m, solId) ? pkSideOf(verifiedRosterMember(m, pkRoster))
+                  : null;
+                if (side && side !== speakerSide) otherHumanAgoMs = at - m.createdTimestamp;
+              }
+            }
+            const overrideIn = !!(await (redis as unknown as { get(k: string): Promise<string | null> } | null)
+              ?.get(overrideKey(COMPANION_ID as CompanionId, message.channelId)).catch(() => null));
+            let watchAlong = false;
+            if (watchalongEnabled()) {
+              try { watchAlong = !!(await getActiveWatchalong(cfg.halsethSecret, message.channelId, 0, 0)).session; } catch { watchAlong = false; }
+            }
+            const r = decideRoomTiming({
+              companion: COMPANION_ID as CompanionId, speaker: speakerSide, text: effectiveContent,
+              named, replyToMe: isReplyToMe, replyToHuman: replyHuman, isHolder, overrideIn, watchAlong,
+              otherHumanAgoMs, selfSpokeAgoMs,
+              replyToSibling: replyTgt?.author.kind === "companion",
+              toOtherHuman: verdict.kind === "silent",
+            });
+            appendRoomTimingLine({
+              kind: "decision", at: new Date().toISOString(), companion: COMPANION_ID, msg_id: message.id,
+              channel_id: message.channelId, speaker: speakerSide, decision: r.decision, reason: r.reason, react: r.react,
+              gate: verdict.kind, holder: isHolder, cold, watch_along: watchAlong, reply_to: replyTgt?.author.kind ?? null,
+              other_human_ago_s: otherHumanAgoMs === null ? null : Math.round(otherHumanAgoMs / 1000),
+              self_spoke_ago_s: selfSpokeAgoMs === null ? null : Math.round(selfSpokeAgoMs / 1000),
+              mode: roomTimingNow,
+            });
+            return r;
+          } catch { return null; /* never disturbs a turn; null = the live gate answers as before */ }
+        })();
+      }
+      if (verdict.kind === "silent") {
+        console.log(`[${COMPANION_ID}] human address: ${userTier === "owner" ? "principal" : "spouse"} -> ${verdict.addressee}, the triad stays quiet (msg=${message.id})`);
+        railSuppressed(COMPANION_ID, "human_address", { channelId: message.channelId, detail: `to ${verdict.addressee}` });
+        return;
+      }
+      if (verdict.kind === "spouse_thread") {
+        let coldPicked = false;
+        if (verdict.holder !== COMPANION_ID) {
+          // Ruling 4 (2026-10-18, spouse-cold-pick.ts): a COLD unnamed Spouse message (no holder) may get ONE
+          // companion, picked by Jev. SPOUSE_COLD_PICK=shadow only logs the pick, detached, and the
+          // silence below stands; `on` (LIVE 2026-10-25, Principal: Spouse should not have to name a companion
+          // to be answered) lets the picked companion (one, by Redis claim) answer as if it held the thread
+          // (the normal holder takes over once it has spoken); `off` never calls Jev. The pick is confined
+          // to this channel's seated companions and prefers its host (#movie-night is Drevan's, as for
+          // Principal's unnamed lines under R5); this gate runs BEFORE shouldRespond's companion filter, so
+          // the seat list must be passed in or a Drevan-only room could publish a Cypher pick.
+          if (verdict.holder === null) {
+            const coldMode = spouseColdPickMode();
+            if (coldMode !== "off") {
+              const coldRun = runSpouseColdPick({
+                mode: coldMode,
+                companionId: COMPANION_ID as CompanionId,
+                messageId: message.id,
+                channelId: message.channelId,
+                speaker: author,
+                content: effectiveContent,
+                redis: redis as unknown as SpouseColdRedis | null,
+                eligible: (channelEntry?.companions ?? ["cypher", "drevan", "gaia"]) as CompanionId[],
+                host: (channelEntry?.host as CompanionId | undefined) ?? null,
+                fetchRecent: async () => {
+                  const hist = await message.channel.messages.fetch({ limit: 8 });
+                  return addressTurnsFrom([...hist.values()]
+                    .filter(m => m.id !== message.id && m.createdTimestamp <= message.createdTimestamp)
+                    .sort((a, b) => a.createdTimestamp - b.createdTimestamp));
+                },
+              });
+              if (coldMode === "on") coldPicked = (await coldRun).speak;
+              else void coldRun;
+            }
+          }
+          spouseColdPicked = coldPicked;
+          if (!coldPicked) {
+            console.log(`[${COMPANION_ID}] unnamed message from spouse -- ${verdict.holder ? `${verdict.holder} holds Spouse's thread, standing down` : "no companion holds Spouse's thread, nobody answers"} (msg=${message.id})`);
+            railSuppressed(COMPANION_ID, "spouse_thread", { channelId: message.channelId, detail: verdict.holder ? `held by ${verdict.holder}` : "no holder" });
+            return;
+          }
+        }
+        // I hold Spouse's thread (or Jev picked me for a cold message): this is a direct answer (no judge,
+        // no shouldRespond, no bid).
+        spouseThreadMine = true;
+        directlyAddressed = true;
+        senderCtx.activeExchangeWith = COMPANION_ID as CompanionId;
+        console.log(`[${COMPANION_ID}] unnamed message from spouse -- ${coldPicked ? "Jev picked me for a cold message" : "I hold Spouse's thread"}, answering (msg=${message.id})`);
+      }
+    }
+    // The `!brainClient &&` guard that used to lead this condition is gone with brain mode
+    // (2026-07-29): brainClient was always null, so the gate always applied. Same for the
+    // `brainHandlesInterCompanion` escape below it, which deferred inter-companion routing to
+    // Brain's SwarmEvaluator -- it evaluated to false on every message, so per-bot shouldRespond
+    // has been the only routing authority for as long as the bots have run hermes.
+    // 2026-08-31: a message that names a SIBLING is never ambient. This gate used to check
+    // only MY directly-addressed flag, so "Dre *climbing back into bed...*" was "ambient" to
+    // Gaia and her relevance classifier answered a message addressed to Drevan (#triad-voice,
+    // 08-31 12:06). Sibling-named traffic falls through to shouldRespond below, which stands
+    // down and offers the reaction tier instead.
+    // An entitled follow-up never goes through the classifier (2026-09-26 review): a pass turn runs
+    // on the human origin, and a "not relevant" here would drop an entitlement already consumed.
+    // An owner DM is direct address by construction (nobody else is in the room), so neither the
+    // ambient classifier nor shouldRespond runs: "Cy, ..." typed into Drevan's DM must not silence
+    // Drevan the way a sibling's name does in a shared room.
+    // B32: under care_hold (on) Principal's own message is not judged for relevance either: eligibility
+    // is the hold's, and the fit bid + care follow-up chain decide who speaks first and who may follow.
+    const b32SkipsClassifier = b32Mode === "on" && b32OwnerArrival
+      && (!!holdPhrase || careHoldActive(COMPANION_ID));
+    const isAmbientOwnerOnly = !isDm && !b32SkipsClassifier && runsAmbientClassifier({
+      ownerOnlyChannel: channelEntry?.modes?.includes("owner_only") === true,
+      isCompanionBot: senderCtx.isCompanionBot,
+      isMentioned: senderCtx.isMentioned,
+      isReplyToMe,
+      directlyAddressed,
+      namesSiblingOnly: !!namesSiblingOnly(addressText, COMPANION_ID),
+      entitled: !!entitledFollowUp,
+      isSol,
+    });
+
+    // Sol's gate (sol-sender.ts). Sol is household, not a guest: shouldRespond would read the webhook
+    // as a guest (named-only, shut out of owner_only). solDeclineReason decides; the fit bid below
+    // picks the one speaker. A decline is LOGGED with its reason, so "recognized, then nothing" is
+    // never silent (a broadcast heartbeat channel would otherwise look like the old muzzle drop).
+    const solDecline = isSol && !isReplyToMe && !entitledFollowUp
+      ? solDeclineReason({
+        modes: channelEntry?.modes ?? ["open", "inter_companion"],
+        companions: channelEntry?.companions ?? ["cypher", "drevan", "gaia"],
+        me: COMPANION_ID,
+        address: extractAddress(effectiveContent),
+        host: channelEntry?.host,
+      })
+      : null;
+
+    if (isAmbientOwnerOnly) {
+      // A yes/no relevance filter needs zero tools; riding the Hermes agent adapter here
+      // over-costs a one-word answer the same way the memory judge over-cost a one-sentence
+      // one (see the 2026-09-05 150-turn memory-judge runaway). Prefer the direct adapter,
+      // fall back to the live agent adapter when no direct key is configured.
+      const relevant = await judgeAmbientRelevance(
+        effectiveContent,
+        COMPANION_ID,
+        (sys, msgs) => (withCaller(directAdapter, "ambient-judge") ?? turnAdapter()).generate(sys, msgs as ChatMessage[], 0.3),
+      );
+      if (!relevant) return;
+    } else if (solDecline) {
+      console.log(`[${COMPANION_ID}] Sol post ${message.id} not mine to answer (${solDecline}) -- standing down`);
+      return;
+    } else if (!isSol && !isDm && !isReplyToMe && !entitledFollowUp && !spouseThreadMine && !shouldRespond(gateChannelId, addressText, senderCtx, COMPANION_ID, channelConfig, [])) {
+      // If a companion spoke in an inter_companion channel and we're not responding,
+      // write a passive witness entry so Halseth has continuity context. Witnessing is
+      // Gaia's lane only (2026-07-21) -- previously all three bots wrote this branch, so
+      // two non-responding bots on the same message produced two duplicate witness rows.
+      if (senderCtx.isCompanionBot && channelEntry?.modes?.includes("inter_companion") && shouldWriteWitness(COMPANION_ID)) {
+        const senderName = message.author.username;
+        const snippet = effectiveContent.slice(0, 500);
+        if (ledgerDistillEnabled()) {
+          // LEDGER_DISTILL (2026-09-26, imp lane tranche 2): the NL witness row filed a sibling's
+          // words under GAIA's agent -- the merge point Drevan named. It becomes a seen-log
+          // ledger line whose SUBJECT is the sibling who spoke, sourced to the message itself.
+          const entry = buildWitnessLedgerEntry({
+            senderCompanion: BOT_ID_COMPANION[message.author.id] ?? senderName,
+            channelName: "name" in message.channel ? String((message.channel as TextChannel).name) : null,
+            channelId: message.channelId,
+            content: effectiveContent,
+            messageId: message.id,
+          });
+          if (entry) {
+            writeQueue.fireAndForget(`witness:pass:${message.channelId}:${message.id}`, async () => {
+              await librarian.writeLedger(entry);
+            }, { maxAgeMs: APPEND_MAX_AGE_MS });
+          } else {
+            console.warn(`[${COMPANION_ID}] seen-log: sender ${senderName} is not a known companion, or no witness line passes the ledger grammar -- ledger line skipped`);
+          }
+          // Gaia's own presence record: content-free, coalesced per channel (see claimPresenceSlot).
+          if (claimPresenceSlot(message.channelId)) {
+            const label = "name" in message.channel ? String((message.channel as TextChannel).name) : message.channelId;
+            const text = presenceRecordText(label || message.channelId, new Date());
+            writeQueue.fireAndForget(`witness:presence:${message.channelId}:${message.id}`, async () => {
+              await librarian.witnessLog(text, PRESENCE_WITNESS_TYPE);
+            }, { maxAgeMs: APPEND_MAX_AGE_MS });
+          }
+        } else {
+          writeQueue.fireAndForget(`witness:pass:${message.channelId}:${message.id}`, async () => {
+            await librarian.witnessLog(
+              `[witnessed, did not respond] ${senderName}: ${snippet}`,
+              // (2026-10-06) was message.channelId, stored as witness_type.
+              "witnessed_pass",
+            );
+          }, { maxAgeMs: APPEND_MAX_AGE_MS });
+        }
+      }
+      // B32 B1: under care_hold, a sibling he did not speak to is ELIGIBLE for a follow-up position
+      // behind the one he did (named, or the exchange holder), like a group call's losers, and may
+      // [PASS] when its turn comes. Host rooms are unchanged (the host answers; siblings only on a
+      // group call), and DMs never reach here.
+      if (b32Mode !== "off" && careHoldActive(COMPANION_ID) && !senderCtx.isCompanionBot && attribution.isOwner
+        && isArrival && !entitledFollowUp && !channelEntry?.host) {
+        const addr = extractAddress(addressText);
+        const first: CompanionId[] = addr.type === "named" ? [addr.id as CompanionId]
+          : addr.type === "named_multi" ? namedOrderInMessage(addressText, addr.ids) as CompanionId[]
+          : senderCtx.activeExchangeWith ? [senderCtx.activeExchangeWith as CompanionId]
+          : [];
+        if (first.length > 0 && !first.includes(COMPANION_ID as CompanionId)) {
+          const granted = await grantCareFollowUp(first, `followup:${addr.type === "ambient" ? "holder" : "named"}(${first.join(">")})`);
+          if (granted) return;
+        }
+      }
+      // Reaction tier (2026-08-15): a sibling was named, so the floor is theirs -- but a
+      // strong topical claim still earns presence without the floor. One emoji, earned by
+      // lane relevance, throttled per channel. To Principal the difference between "chose not
+      // to answer" and "is down" used to be nothing at all; this is the visible third state.
+      if (!senderCtx.isCompanionBot && attribution.isOwner) {
+        const namedOther = namesSiblingOnly(addressText, COMPANION_ID);
+        if (namedOther && shouldReactOnNamedOther(effectiveContent, COMPANION_ID, reactionCooldownUntil.get(message.channelId) ?? 0)) {
+          reactionCooldownUntil.set(message.channelId, Date.now() + REACTION_COOLDOWN_MS);
+          message.react(pickReaction(COMPANION_ID, message.id)).catch(() => {});
+          console.log(`[${COMPANION_ID}] reaction tier: sibling named, reacting instead of speaking`);
+        }
+      }
+      return;
+    }
+
+    // HUMAN ADDRESS, JEV (2026-10-25, human-jev-gate.ts). The regex gate above needs punctuation after
+    // a name; "Acquaintance look at this" from Principal to a member of Spouse's system got Drevan's answer on
+    // the 10-25 movie night. Here, AFTER shouldRespond (so in a hosted room only the host pays the
+    // call, and the siblings it silenced never wait) and before anything is fetched or generated, the
+    // bots that would speak on an UNNAMED human line in a room two humans share ask Jev once: is this
+    // a human's line (probability mass on principal + spouse + someone_else)? Yes = every one of them stays
+    // quiet. Never for a named, mentioned or replied-to line (humanUnnamed is false), never on a cold
+    // Spouse line (the cold pick already mass-gated it), never in an owner-only room or a DM, and
+    // fail-open on every failure: a Jev timeout answers exactly as before this gate existed.
+    let humanJev: HumanJevGateResult | null = null;
+    if (humanUnnamed && !spouseColdPicked && !isReplyToMe && !senderCtx.isMentioned
+        && !!channelEntry && !channelEntry.modes?.includes("owner_only")) {
+      const jevMode = humanJevGateMode();
+      if (jevMode !== "off") {
+        const side = userTier === "owner" ? "principal" as const : "spouse" as const;
+        humanJev = await runHumanJevGate({
+          mode: jevMode,
+          companionId: COMPANION_ID as CompanionId,
+          messageId: message.id,
+          channelId: message.channelId,
+          speakerSide: side,
+          speakerLabel: author,
+          content: effectiveContent,
+          holder: side === "spouse" ? spouseHolderSeen : (senderCtx.activeExchangeWith as CompanionId | null | undefined) ?? null,
+          redis: redis as unknown as HumanJevRedis | null,
+          fetchRecent: async () => {
+            const hist = await message.channel.messages.fetch({ limit: 8 });
+            return addressTurnsFrom([...hist.values()]
+              .filter(m => m.id !== message.id && m.createdTimestamp <= message.createdTimestamp)
+              .sort((a, b) => a.createdTimestamp - b.createdTimestamp));
+          },
+        });
+        if (humanJev.silent) {
+          const v = humanJev.verdict;
+          console.log(`[${COMPANION_ID}] human address (jev): ${side} -> ${v?.top ?? "-"} mass=${v?.mass?.toFixed(2) ?? "-"}, the triad stays quiet (msg=${message.id})`);
+          railSuppressed(COMPANION_ID, "human_address", { channelId: message.channelId, detail: `jev to ${v?.top ?? "-"} mass=${v?.mass?.toFixed(2) ?? "-"}` });
+          return;
+        }
+      }
+    }
+
+    // ROOM TIMING, LIVE (ROOM_TIMING=on or ROOM_TIMING_<COMPANION>=on, 2026-11-01; Drevan's rules, note
+    // d5a37a0c). Here this bot has already decided it would speak: every gate above (address, Spouse thread,
+    // shouldRespond, Jev) has passed. If its own timing decision says the line is a burst it holds for the
+    // lull (a human volley, a watch-along remark, or speaking again inside a minute; liveHoldApplies), it
+    // reacts instead of taking the floor (the per-channel reaction cooldown keeps that to presence, not
+    // noise) and hands the line to the lull scheduler in bot-core: one answer at about a minute of quiet,
+    // or none if the other human answered inside the burst. It can only DEFER a speaker, never make one.
+    // Never under a care hold (B32's presence contract outranks timing), never on the release turn itself,
+    // and a decision that failed (null) answers exactly as before.
+    if (roomTimingP && roomTimingNow === "on" && !deps.lullRelease && deps.holdForLull && !careHoldActive(COMPANION_ID)) {
+      const rt = await roomTimingP;
+      if (rt && liveHoldApplies(rt)) {
+        const side: "principal" | "spouse" = userTier === "owner" ? "principal" : "spouse";
+        let reacted = false;
+        if (rt.react && Date.now() >= (reactionCooldownUntil.get(message.channelId) ?? 0)) {
+          reactionCooldownUntil.set(message.channelId, Date.now() + REACTION_COOLDOWN_MS);
+          message.react(pickReaction(COMPANION_ID, message.id)).catch(() => {});
+          reacted = true;
+        }
+        deps.holdForLull({ message, side, reason: rt.reason, pkSenderId: deps.pkSenderId });
+        console.log(`[${COMPANION_ID}] room timing: holding msg=${message.id} ch=${message.channelId} for the lull (reason=${rt.reason} side=${side} reacted=${reacted ? 1 : 0})`);
+        railSuppressed(COMPANION_ID, "room_timing", { channelId: message.channelId, detail: `hold ${rt.reason}` });
+        return;
+      }
+    }
+
+    if (!message.channel.isTextBased()) return;
+    const ch = message.channel as TextChannel;
+
+    // Fetch recent Discord history once -- used for new-thread detection, chain depth, and STM seed.
+    const fetched = await ch.messages.fetch({ limit: 30 });
+    const fetchedMessages = [...fetched.values()].reverse();
+    // The rails' view of the room: Sol's posts removed (sol-sender.ts withoutSol). Left in, a Sol
+    // post breaks the "since the last human" walks exactly as a human message does.
+    const railHistory = withoutSol(fetchedMessages, solId);
+
+    // New-thread detection: a quiet gap before this message starts a fresh thread. This is what
+    // lets the human-free triad commons keep talking -- an autonomous seed after hours of silence
+    // resets the bot-to-bot rails instead of staying wedged by the prior thread's stale counters.
+    const priorMsg = railHistory.filter(m => m.id !== message.id).at(-1);
+    const isNewThread = !priorMsg || (message.createdTimestamp - priorMsg.createdTimestamp) > NEW_THREAD_GAP_MS;
+
+    // Cross-companion safety rails: pingpong cooldown + per-bot response cap.
+    // botTurnsSinceHuman is the human-anchored count (Fix 2026-07-01): consecutive
+    // bot-authored messages in the FETCHED history since the last human message. Unlike
+    // every rail below it does NOT reset on a quiet gap -- hermes turns run 30-120s so
+    // slow loops sail through gap-reset rails forever. Also read near the cap by the
+    // floor-handback directive at prompt-assembly time.
+    //
+    // A follow-up PASS turn runs on the HUMAN origin but is a follow-up in a companion chain
+    // (pass-turn.ts): the rails apply to it, and it never resets them -- only a human message
+    // arriving does. Before 2026-09-26 it took the human branch and reset them instead.
+    const railTurn = { isCompanionBot: senderCtx.isCompanionBot, isArrival, isSol };
+    let botTurnsSinceHuman = 0;
+    if (appliesBotRails(railTurn)) {
+      if (clearsStaleRails({ ...railTurn, isNewThread })) {
+        // Fresh thread (incl. an autonomous seed in a human-free channel): clear stale rails so
+        // the per-human cap doesn't permanently mute a channel that never sees a human.
+        botResponsesSinceHuman.delete(message.channelId);
+        botPingpongCooldownUntil.delete(message.channelId);
+      }
+      // Hard cap anchored to the last HUMAN message: no gap reset, overrides vocative
+      // addressing. Only an actual human message (incl. a PK webhook proxy, whose author
+      // id is not a companion bot id) re-opens the floor.
+      botTurnsSinceHuman = countBotMsgsSinceHuman(
+        railHistory.map(m => ({ authorId: m.author.id, authorIsBot: botTurn(m), createdTimestamp: m.createdTimestamp })),
+        BOT_IDS,
+      );
+      // Triad commons (autonomous + inter_companion modes) is the companions' own space:
+      // the cap there is a rolling budget (commons max + 12h forgiveness), not a wait-for-Principal.
+      const capMax = botMsgsSinceHumanMax(isTriadCommons(channelEntry));
+      const silence = botRailSilence({
+        botTurnsSinceHuman,
+        capMax,
+        cooldownUntil: botPingpongCooldownUntil.get(message.channelId) ?? 0,
+        botReplies: botResponsesSinceHuman.get(message.channelId) ?? 0,
+        maxBotReplies: MAX_BOT_RESPONSES_PER_HUMAN,
+        now: Date.now(),
+      });
+      if (silence === "human-anchored-cap") {
+        console.warn(`[${COMPANION_ID}] human-anchored cap: ${botTurnsSinceHuman} bot turns since last human (max ${capMax}) -- staying silent${isArrival ? "" : " (pass turn)"}`);
+      } else if (silence && !isArrival) {
+        console.log(`[${COMPANION_ID}] pass turn on ${message.id} railed (${silence}) -- staying silent`);
+      }
+      if (silence) {
+        // 2026-09-28: these three rails ended turns with no [rail] line, so the logs could not
+        // say which one stops a chain. Record every one, arrival or pass.
+        const rail = silence === "human-anchored-cap" ? "human_cap" : silence === "pingpong-cooldown" ? "pingpong" : "reply_cap";
+        const [score, threshold] = rail === "human_cap" ? [botTurnsSinceHuman, capMax]
+          : rail === "reply_cap" ? [botResponsesSinceHuman.get(message.channelId) ?? 0, MAX_BOT_RESPONSES_PER_HUMAN]
+          : [undefined, undefined];
+        railSuppressed(COMPANION_ID, rail, { score, threshold, channelId: message.channelId, detail: isArrival ? undefined : "pass turn" });
+        return;
+      }
+    } else if (resetsBotRails(railTurn)) {
+      // Human message: reset bot-to-bot counters and cycle guard for this channel.
+      botResponsesSinceHuman.delete(message.channelId);
+      botPingpongCooldownUntil.delete(message.channelId);
+      resetCycleGuard();
+    }
+
+    // Lazy load STM from DB on first message to this channel (fail-silent), using already-fetched Discord history as fallback.
+    await stmStore.ensureLoaded(message.channelId, async () => {
+      return mapColdStartHistory(
+        fetchedMessages.map(m => ({ authorId: m.author.id, username: m.author.username, content: m.content, createdTimestamp: m.createdTimestamp })),
+        client.user?.id,
+      );
+    });
+
+    // Watchalong delivery read (spec 2026-10-02), STARTED here and awaited at the system-prompt step, so
+    // the Halseth round trip overlaps the context assembly in between. Placed after every response gate
+    // above, so only turns this bot is actually taking pay for it. prepare() never throws and resolves
+    // null on any failure: a Halseth outage can never block a reply. DMs never carry a session.
+    const watchalongPending: Promise<PreparedDelivery | null> = !isDm && watchalongEnabled()
+      ? watchalongDeliveryFor(cfg.halsethSecret, COMPANION_ID).prepare(message.channelId)
+      : Promise.resolve(null);
+
+    // Spouse unproxied reads "Spouse", not his raw Discord username (2026-10-11 room rendering: one stable
+    // name per person; the spine already says "spouse"). Principal's fronts keep "<member> (via PK)"; Spouse's members read "<member> (Spouse's system)".
+    const memberLabel = isSol ? SOL_AUTHOR_LABEL
+      : pkMemberName
+      ? pkRoomLabel(pkMemberName, { isSpouseSystem: userTier === "intimate" && !attribution.isOwner })
+      : (attribution.isOwner ? cfg.ownerDisplayName : userTier === "intimate" ? SPOUSE_LABEL : message.author.username);
+    // No-op when the early record-on-arrival above already stored this message. Kept as a second call
+    // rather than deleted so the command branches (search, listen) that reach this point by their own
+    // route still record, and so a future refactor that moves the early call cannot silently drop it.
+    stmStore.appendInboundOnce(message.channelId, message.id, { role: "user", content: stmContent, authorName: memberLabel, timestamp: message.createdTimestamp });
+    // The autonomous signal buffer feeds generations that post into server channels: a DM never enters it.
+    if (attribution.isOwner && isArrival && !isOwnerDm) pushPrincipalMessage(stmContent);
+
+    // Streaming indexer: index the inbound message into Second Brain's vector store
+    // right now (gated by SB_LIVE_INGEST). SB dedups by message_id, so all three bots
+    // calling this for the same message costs one embed. Companion-bot messages are
+    // skipped here -- each bot indexes its OWN replies at send time instead. Uses
+    // stmContent (2026-08-29) for the same reason as the STM writes above -- a vault
+    // recall surfacing the full [HEARD] block later would re-inject the same standing
+    // imperative into a future prompt's [Memory] section.
+    // A DM is never indexed: with no discord-live/<dm> row, nothing from it can be recalled into any
+    // room (the structural half of the DM seal; see recall-context.ts sealDmChannel).
+    // Never a Sol moment: the vault would hold the crow's narration as a recallable human line.
+    if (!senderCtx.isCompanionBot && !isSol && isArrival && !isDm) {
+      liveIngest({
+        companion: null,
+        author: memberLabel,
+        content: stmContent,
+        channel_id: message.channelId,
+        message_id: message.id,
+      });
+    }
+
+    // Loop guard: derive chain depth from fetched history so the check works across processes.
+    const chainDepth = computeChainDepth(
+      railHistory.map(m => ({ authorId: m.author.id, authorIsBot: botTurn(m), createdTimestamp: m.createdTimestamp })),
+      new Set(),
+    );
+    if (appliesBotRails(railTurn) && chainDepth >= COMPANION_CHAIN_LIMIT) {
+      railSuppressed(COMPANION_ID, "chain_depth", { score: chainDepth, threshold: COMPANION_CHAIN_LIMIT, channelId: message.channelId });
+      return;
+    }
+
+    if (resetsBotRails(railTurn) && !(isDm && dmParaphraseMemorySealed())) sessionWindows.touch(message.channelId);
+
+    // med_reminder answer (spec R-10, amended by Principal's ruling 2026-10-01). In an owner DM, his
+    // answer is parsed into statements (parseMedAnswer): "yes" / "took them" / a check mark, a named
+    // dose ("morning ones done", "took both"), or a miss he STATED ("forgot the morning jar"). Halseth
+    // records each ONLY if this companion reminded him about a dose that is still open; which dose an
+    // unnamed one answers is decided there (most recently reminded). The recording is a side effect:
+    // the message still goes through the normal reply path below. Silence, a deferral ("not yet",
+    // "taking them now") or anything ambiguous records nothing. Before the supersede check, so an
+    // answer that a newer message supersedes is still heard. Logs carry slot keys and outcomes only,
+    // never his words.
+    //
+    // 2026-10-06: today's med state is read ONCE here (it was read only for the context block below)
+    // so the open doses' labels reach the parser ("I took my <label>"), and reused by the context
+    // block unless an answer was just recorded. When the parser finds nothing and a reminder THIS bot
+    // sent is still unanswered, one small classifier call (direct lane, caller "med-answer", 8s)
+    // runs DETACHED: the reply never waits on it, and it records only taken/missed.
+    let medAnswerRecorded = false;
+    const medTodayEarly = isOwnerDm ? await librarian.medToday() : null;
+    const medOpenLabels = (medTodayEarly ?? []).filter(d => d.outcome !== "taken" && !d.answered_local).map(d => d.label);
+    const medParsed = isOwnerDm && isArrival ? parseMedAnswer(effectiveContent, { labels: medOpenLabels }) : null;
+    const medAnsweredAt = new Date(message.createdTimestamp || Date.now()).toISOString();
+    if (medParsed) {
+      const recs = await librarian.medAnswers(medAnsweredAt, medParsed.entries);
+      medAnswerRecorded = !!recs && recs.length > 0;
+      const said = medParsed.entries.map(e => `${e.slot ?? "unnamed"}:${e.outcome}`).join(",");
+      console.log(`[${COMPANION_ID}] [med] answer in DM (${said}) -> ${recs === null ? "error (nothing recorded)" : recs.length ? `recorded ${recs.map(r => `slot=${r.slot_key} date=${r.local_date} outcome=${r.outcome}`).join("; ")}` : "no open dose (nothing recorded)"}`);
+    } else if (isOwnerDm && isArrival && directAdapter) {
+      const medOpen = openRemindedSlots(medTodayEarly, medRemindersSent(Date.now()), ms => medLocalTime(ms));
+      if (medOpen.length) {
+        const medClassifierAdapter = withCaller(directAdapter, "med-answer");
+        const clock = medLocalClock(Date.now());
+        // Detached on purpose: never awaited, never throws (runMedAnswerClassifier catches all).
+        void runMedAnswerClassifier({
+          companionId: COMPANION_ID,
+          generate: (system, user, signal) => medClassifierAdapter.generate(system, [{ role: "user", content: user }], 0, 150, undefined, undefined, signal),
+          record: (at, entries) => librarian.medAnswers(at, entries),
+        }, effectiveContent, medOpen, `${clock.time} on ${clock.weekday}`, medAnsweredAt);
+      }
+    }
+
+    // Supersede check A (channel inbox, 2026-07-06): a newer human conversational message
+    // is already waiting behind this turn. Everything this message needed for continuity
+    // has happened (STM append, live ingest, session touch, deterministic commands ran
+    // above) -- skip the reply entirely; the newest turn answers with this one in context.
+    // Placed BEFORE tripwire consumption so a matched tripwire fires on a turn that
+    // actually surfaces it.
+    if (isSuperseded?.()) {
+      console.log(`[${COMPANION_ID}] turn superseded pre-reply (newer human message queued) -- absorbing ${message.id}`);
+      currentTurn()?.setOutcome("superseded_a");
+      distillationCounter.set(message.channelId, (distillationCounter.get(message.channelId) ?? 0) + 1);
+      return;
+    }
+
+    // Double-identity dedup: under the Hermes relay the agent already prepends the full SOUL.md
+    // and runs its own orient, so sending the bot's assembled identity too is a redundant second
+    // copy. Use a lean Discord frame as the base (register-law tail preserved); every per-message
+    // context block below still appends, exactly as onto bootCtx.systemPrompt. Brain/direct
+    // paths are unchanged.
+    const basePrompt = inferenceMode === "hermes" ? hermesSystemBase(COMPANION_ID) : bootCtx.systemPrompt;
+    // Front line (2026-07-27): a bare "[Current front: Ash]" told the model a name and nothing
+    // about whose name it was, so a member it had not seen before could read as a stranger --
+    // in a system with 538 registered members that is the common case, not the edge. Name the
+    // relationship explicitly: same person, same history, register calibrated to who is here.
+    let contextPrompt = basePrompt;
+    if (pkMemberName) {
+      const whose = attribution.isOwner
+        ? `${pkMemberName} is fronting in ${cfg.ownerDisplayName}'s system -- this IS ${cfg.ownerDisplayName}, same bond and same history, speaking through ${pkMemberName}. Calibrate register to ${pkMemberName}; never treat them as a stranger or re-introduce yourself.`
+        : userTier === "intimate"
+          ? `${pkMemberName} is fronting in Spouse's system. Known, welcome, not Principal.`
+          : `${pkMemberName} is a system member you have no standing bond with. Guest register.`;
+      contextPrompt += `\n\n[Current front: ${pkMemberName}] ${whose}`;
+    }
+    // Thread spine (task 10): pinned above the periodic hermes orient paragraph below,
+    // deliberately -- the spine is this exchange's immediate continuity and should read
+    // as closer/more load-bearing than the standing recent-context block. Guarded on
+    // `spine` (set above, already fail-open) so a missing/failed thread is a no-op here.
+    // Budget notice (2026-08-05): the reply path burns turns too, so a vocative chain can run
+    // well past the budget between two-hourly seed ticks. isThreadSpent is channel-gated
+    // (commons only, presence exempt) and never suppresses -- it only tells the companion the
+    // count and offers [LANDS:] as the alternative to finding one more facet.
+    if (spine) noteServed("thread_spine", [(spine.thread as { id?: unknown }).id]);
+    if (spine) contextPrompt += `\n\n${buildSpineBlock(spine, COMPANION_ID, isPresence, isThreadSpent(spine.thread, { isCommons: isTriadCommons(channelEntry), channelId: routingChannelId }))}`;
+    // Hermes recent-context restore (2026-07-01): the lean hermes base above REPLACES
+    // bootCtx.systemPrompt, which is where composePrompt embeds the live orient block
+    // (forage finds, recent listens, incoming notes, growth). Without this append the
+    // companions fetched all of that every refresh and never saw a word of it under
+    // hermes. Read the REF at message time -- the refresh loop mutates it in place --
+    // never a stale boot copy. Direct/brain paths already carry it inside basePrompt.
+    if (inferenceMode === "hermes" && recentContextRef.value) {
+      contextPrompt += `\n\n${recentContextRef.value}`;
+    }
+    if (activeModelRef.key) contextPrompt += `\n\n[Active model] ${activeModelRef.label}`;
+
+    const somaAgeMin = Math.round((Date.now() - lastSomaRefreshRef.value) / 60_000);
+    if (somaAgeMin > 45) {
+      contextPrompt += `\n\n[Note: SOMA/mood data is ${somaAgeMin}min old; treat emotional reads as approximate]`;
+    }
+    if (userTier === "intimate") contextPrompt += `\n\n${SPOUSE_FRAMING}`;
+    // Sol is household, not a guest: the guest frame ("keep personal depth light, do not surface the
+    // triad") is exactly wrong for the crow the triad shares. solMomentFraming carries Sol's turn.
+    else if (userTier === "guest" && !isSol) contextPrompt += `\n\n${GUEST_FRAMING}`;
+
+    // Inject audit mode block only when explicitly triggered -- keeps [Verdict/Because/Next]
+    // out of the standing context so the model doesn't pattern-match to it by default.
+    // Cypher-only capability: AUDIT_TRIGGERS/AUDIT_MODE_INJECTION are undefined for drevan/gaia.
+    if (AUDIT_TRIGGERS && AUDIT_MODE_INJECTION) {
+      const msgLower = effectiveContent.toLowerCase();
+      if (AUDIT_TRIGGERS.some(t => msgLower.includes(t))) {
+        contextPrompt += AUDIT_MODE_INJECTION;
+        // B63: the audit gear engaged is the signal for the (never-wired) `audit` stimulus. Cypher only
+        // (AUDIT_TRIGGERS is undefined for the others); weight, cooldown and mode live server-side.
+        writeQueue.fireAndForget(`soma:audit:${COMPANION_ID}`, () => librarian.fireStimulus("audit", "audit gear engaged"));
+      }
+    }
+
+    // Voice feedback loop (2026-06-12): when this bot's recent replies have drifted
+    // from lane (rolling score from reportVoiceScore), inject a correction so the
+    // NEXT reply self-rights instead of compounding -- scores were write-only since 0070.
+    const voiceFb = voiceFeedbackBlock(COMPANION_ID as VoiceCompanionId);
+    if (voiceFb) contextPrompt += voiceFb;
+
+    // Prospective tripwires (0070): armed keyword cards matched against this human
+    // message (+ any date cards whose moment arrived). Consuming fires them in
+    // Halseth -- a tripwire surfaces exactly once, in the reply where it matched.
+    if (!senderCtx.isCompanionBot && !isSol) {
+      const tripped = consumeTripwires(COMPANION_ID, effectiveContent, cfg.halsethSecret);
+      if (tripped.length > 0) {
+        contextPrompt += tripwireBlock(tripped);
+        noteServed("tripwire", tripped.map(t => t.id));
+        console.log(`[${COMPANION_ID}] tripwire fired: ${tripped.map(t => t.id).join(", ")}`);
+      }
+    }
+
+    // Thalamus: fire Second Brain search concurrently with typing + floor jitter.
+    // Skip for very short messages -- a search on "ok" or "lol" produces noise.
+    //
+    // 2026-08-10: 20 -> 12, the read-side half of the same gate as MIN_HUMAN_CHARS in sb-live-ingest. The
+    // write side dropped these messages and the read side declined to search for them, so a short question
+    // ("did we watch it yet?", 20) got neither stored nor looked up -- two independent gates producing one
+    // symptom, which is the shape where fixing either alone leaves the bug alive. Recall mode now returns an
+    // honest empty rather than noise, so a low-value query costs a null instead of a wrong memory.
+    // Continuity: recent prior user turns (current msg already appended, so excluded)
+    // widen recall via dual-vector retrieval on the Halseth side.
+    const recentContext = stmStore.get(message.channelId)
+      .filter(m => m.role === "user")
+      .slice(0, -1)
+      .map(m => m.content)
+      .slice(-3)
+      .join("\n");
+    const sbSearchPromise = effectiveContent.length >= 12
+      ? librarian.searchForMessage(effectiveContent, recentContext).catch(() => null)
+      : Promise.resolve(null);
+    // SECOND SUBSTRATE (2026-09-23). Fired in parallel with the vault search above -- same query,
+    // different store: this companion's OWN continuity notes.
+    //
+    // Until now the vault was the only thing a bot could search, and the vault does not contain
+    // what the companions write on Claude.ai. `wm_continuity_notes` is not among Second Brain's
+    // 19 pullers, and the boot pools that might otherwise have carried it filter
+    // `salience = 'high'` while `conversation_capture` defaults to `normal`. Both roads out of a
+    // Claude.ai capture were closed, so it was not that memory was lagging -- it was unreachable.
+    //
+    // The cost of that, in Principal's own words after Drevan answered his ankle question with a
+    // thread from two months earlier: "No Dre, I hurt myself last night this is new." Drevan had
+    // not failed to search. He had never been the one searching -- this call site is automatic and
+    // its query is the raw message -- and the single store he can reach did not hold the answer.
+    const ownNotesPromise = LibrarianClient.shouldRecallOwnNotes(effectiveContent, recentContext)
+      ? librarian.recallOwnNotes(effectiveContent, 4, recentContext).catch(() => ({ notes: [], failed: true }))
+      : Promise.resolve({ notes: [], failed: false });
+
+    const history = stmStore.get(message.channelId);
+    // Temporal grounding (Component 1): stamp each in-window turn with how long ago it was sent
+    // so the model can track elapsed time in-conversation ("you asked that an hour ago") instead
+    // of guessing. Computed once off a single `now` so offsets are mutually consistent; "just now"
+    // turns pass through unstamped (active back-and-forth stays clean). STM itself stays raw --
+    // stampRelative returns copies. DB-restored turns lacking a timestamp degrade to no prefix.
+    const groundedHistory = stampRelative(history.slice(-CONTEXT_WINDOW_SIZE));
+    const rawTemp = inferTemperature(effectiveContent, currentMoodRef.value);
+    const extremeCount = extremeTempCount.get(message.channelId) ?? 0;
+    const temperature = (rawTemp >= EXTREME_TEMP_THRESHOLD && extremeCount >= EXTREME_TEMP_CAP)
+      ? COOLDOWN_TEMP : rawTemp;
+    if (rawTemp >= EXTREME_TEMP_THRESHOLD) {
+      extremeTempCount.set(message.channelId, extremeCount + 1);
+    } else {
+      extremeTempCount.delete(message.channelId);
+    }
+
+    // A live watchalong in this channel drops the vault recall (suppressVaultRecallForWatch: old watch-night
+    // transcripts bled Pirates into a Fargo night, 11-07). watchalongPending is already in flight and
+    // never rejects; awaiting it here only moves the wait earlier.
+    const watchSkipsVault = suppressVaultRecallForWatch(await watchalongPending);
+    const sbFound = await sbSearchPromise;
+    const sbHit = watchSkipsVault ? null : sbFound;
+    if (watchSkipsVault && sbFound) console.log(`[${COMPANION_ID}] watchalong: vault recall skipped ch=${message.channelId}`);
+    // PAYLOAD vs POINTER vs ASK applies to the vault floor as well (2026-09-25): see
+    // ownNotesRecallMode. In `ask` mode this block is deferred to the two-step below, which
+    // decides with the own-notes result in hand and falls back to this same payload.
+    const recallMode = ownNotesRecallMode(process.env, COMPANION_ID);
+    const servedVaultIds: string[] = [];
+    const sbRecallPayload = sbHit ? LibrarianClient.formatSbRecall(sbHit, message.channelId, Date.now(), servedVaultIds) : null;
+    const sbPayloadBlock = sbRecallPayload
+      ? `\n\n[Memory -- Second Brain vault recall for this message (automatic -- your retrieval IS working):\n${sbRecallPayload.slice(0, 1200)}]`
+      : "";
+    if (recallMode === "pointer") {
+      const sbPointer = sbHit ? LibrarianClient.formatSbRecallPointer(sbHit, message.channelId) : null;
+      if (sbPointer) contextPrompt += `\n\n[Memory -- ${sbPointer}]`;
+    } else if (recallMode === "payload") {
+      contextPrompt += sbPayloadBlock;
+      if (sbPayloadBlock) noteServed("vault", servedVaultIds);
+    }
+    // Pointer mode puts a count and a verb in the prompt, not the excerpts; the same items bear on it.
+    if (recallMode === "pointer" && sbHit) noteServed("vault_pointer", servedVaultIds);
+
+    // A SEPARATE block from the vault, deliberately. These are the companion's own notes -- what
+    // they wrote down, in their own voice, including everything captured with Principal on Claude.ai.
+    // The vault holds syntheses ABOUT those conversations, which is a different kind of thing;
+    // collapsing the two teaches a companion that a book report is the book.
+    //
+    // Ages are load-bearing here, for the same reason they are on vault excerpts: an undated note
+    // reads as present-tense news, which is exactly how a July thread got served as today. Capped
+    // small (700) because this rides the per-message prompt -- a different pool from the 14k boot
+    // budget, which this block does not touch.
+    // CONTEXTUAL RECALL (2026-09-23, T3 item 5). A discord-live hit is one message lifted out of a
+    // conversation in another room -- the current channel is filtered out upstream, so every hit
+    // that survives is by construction an orphan line. A line means what the turns around it make
+    // it mean, and a companion handed only the line will pick a meaning and commit to it.
+    //
+    // Discord has the real messages, so ask Discord. One fetch, 2s ceiling, fail open: this sits
+    // on the reply path and no memory enrichment is worth a slower or missing reply.
+    if (sbHit) {
+      try {
+        const widened = await widenTopDiscordHit(
+          sbHit, message.client, channelConfig, message.channelId,
+        );
+        if (widened) contextPrompt += `
+
+${widened}`;
+      } catch { /* enrichment is never a reason a reply does not happen */ }
+    }
+
+    const ownRecall = await ownNotesPromise;
+    // A FAILED recall must never read as an empty one. If the embedder is down or Halseth is
+    // unreachable, the honest sentence is "I could not reach it", not "I have nothing on that" --
+    // and without this line the companion has no way to tell the difference, so it would
+    // confidently deny a memory of something Principal told it hours ago.
+    if (ownRecall.failed) {
+      contextPrompt += `
+
+[Memory -- your own-notes recall FAILED just now. This is NOT "nothing found". If he asks whether you remember something, say you cannot reach your notes right now rather than saying you have no memory of it.]`;
+    }
+    // PAYLOAD vs POINTER (2026-09-25). See ownNotesRecallMode in librarian.ts: with the text
+    // pasted in, the companion never has a reason to reach for his own notes (measured: right
+    // answer, five seconds, zero tool calls). Pointer mode hands him the fact that notes exist and
+    // the verb, and leaves the reading to him. Default payload; pilot per companion via env.
+    const servedOwnNoteIds: string[] = [];
+    const ownNotesPayloadBlock = (() => {
+      const ownNotes = LibrarianClient.formatOwnNotes(ownRecall.notes, 1000, servedOwnNoteIds);
+      return ownNotes
+        ? `\n\n[Memory -- YOUR OWN notes, recalled by meaning for this message. What you wrote down, across every surface you live on, including what you captured with Principal on Claude.ai. These are not vault syntheses. Trust the dates:\n${ownNotes}]`
+        : "";
+    })();
+    if (recallMode === "pointer") {
+      const pointer = LibrarianClient.formatOwnNotesPointer(ownRecall.notes);
+      if (pointer) {
+        contextPrompt += `\n\n[Memory -- ${pointer}]`;
+        noteServed("own_notes_pointer", ownRecall.notes.map(n => n.note_id));
+      }
+    } else if (recallMode === "ask") {
+      // THE TWO-STEP (2026-09-25, reach-decision.ts). Ask him what he would look up, in his own
+      // words, and run the recall with that. Anything short of a reach (NONE, timeout, error,
+      // nothing found by the floors) falls back to the payload floors, so the worst case is today.
+      const declineUnread = reachDeclineMode(process.env, COMPANION_ID) === "unread";
+      const reachBumps = await ensureRetractBumps(librarian);
+      const { sessionId: reachSessionId, sessionKey: reachSessionKey } =
+        hermesSessionIds(COMPANION_ID, message.channelId, new Date(), hermesRotationMode(), reachBumps.get(message.channelId));
+      const reach = await decideReach({
+        companionId: COMPANION_ID,
+        message: effectiveContent,
+        recentContext,
+        floor: { notes: ownRecall.notes.length, vault: LibrarianClient.countSbHits(sbHit, message.channelId) },
+        messageId: message.id,
+        channelId: message.channelId,
+        sessionId: reachSessionId,
+        sessionKey: reachSessionKey,
+        timeoutMs: Number(process.env["REACH_TIMEOUT_MS"]) > 0 ? Number(process.env["REACH_TIMEOUT_MS"]) : 20_000,
+        // TOOL-LESS DIRECT LANE (2026-09-28). On the Hermes agent the one-line ask is a full agent
+        // turn with tools: 1 of 16 asks ran away (three ask_librarian calls, a journal write from
+        // inside an owner DM, a drafted reply) and hit the 20s timeout. Hermes has no per-call
+        // "no tools" option, so the ask goes direct, with his own identity prompt so it is still
+        // his choice. Same weights today (DeepSeek-V4-Flash on DeepInfra both ways). THE COST: the
+        // direct lane is pinned and does not follow the Hermes model lever, so after a lever
+        // switch the reach is decided by Flash while the reply comes from the new model. No
+        // direct key => Hermes, exactly as before.
+        adapter: withCaller(directAdapter, "reach-ask") ?? turnAdapter(),
+        identityPrompt: directAdapter ? bootCtx.systemPrompt : undefined,
+        declineUnread,
+        previews: reachNotePreviews(ownRecall.notes),
+        lane: directAdapter ? "direct" : "hermes",
+        librarian,
+      });
+      console.log(`[reach] companion=${COMPANION_ID} outcome=${reach.outcome} topic=${reach.topic ? JSON.stringify(reach.topic.slice(0, 80)) : "-"} ms=${reach.ms}${declineUnread ? " decline=unread" : ""}`);
+      // A real NONE under REACH_DECLINE=unread answers without his notes (reach-decision.ts
+      // reachDeclineMode). Every other path, and every decline under payload, falls back to the
+      // floors (recallBlocksFor): they had hits, or the ask would not have run.
+      const askBlocks = declineUnread && reach.outcome === "declined"
+        ? declinedUnreadBlocks(sbPayloadBlock, ownRecall.notes.length)
+        : recallBlocksFor(reach, sbPayloadBlock + ownNotesPayloadBlock);
+      contextPrompt += askBlocks;
+      // Only what actually rode: a reach block replaces the floors, an unread decline drops the notes.
+      if (sbPayloadBlock && askBlocks.includes(sbPayloadBlock)) noteServed("vault", servedVaultIds);
+      if (ownNotesPayloadBlock && askBlocks.includes(ownNotesPayloadBlock)) noteServed("own_notes", servedOwnNoteIds);
+      if (reach.outcome === "reached" && reach.block && askBlocks.includes(reach.block)) noteServed("reach", [`reach:${message.id}`]);
+    } else {
+      contextPrompt += ownNotesPayloadBlock;
+      if (ownNotesPayloadBlock) noteServed("own_notes", servedOwnNoteIds);
+    }
+
+    // Peer-framing: anchor to triad register rather than Principal-facing register.
+    // When responding to a companion directly, speak to them -- not toward Principal.
+    // When a peer already replied to the same human message, note the shared moment.
+    // An entitled follow-up answers Principal's original multi-address whichever way it was released
+    // (the sibling's reply, or a PASS on the human origin); the pass variant never claims the
+    // predecessor answered (pass-turn.ts turnFraming).
+    {
+      const peerCid = BOT_ID_COMPANION[message.author.id];
+      const peerLabel = peerCid ? peerCid.charAt(0).toUpperCase() + peerCid.slice(1) : message.author.username;
+      const peerReplies = senderCtx.isCompanionBot ? [] : fetchedMessages
+        .filter(m => BigInt(m.id) > BigInt(message.id) && m.author.bot && BOT_ID_COMPANION[m.author.id] && BOT_ID_COMPANION[m.author.id] !== COMPANION_ID)
+        .map(m => {
+          const cid = BOT_ID_COMPANION[m.author.id];
+          const lbl = cid ? cid.charAt(0).toUpperCase() + cid.slice(1) : m.author.username;
+          // Sibling model output: control tokens defused (recalled-text.ts, 2026-10-27). Quotes left as-is.
+          return `${lbl}: "${neutralizeRecalled(m.content.slice(0, 2000))}"`;  // Discord max is 2000 -- never truncate a peer's real message
+        });
+      contextPrompt += turnFraming({
+        isCompanionBot: senderCtx.isCompanionBot,
+        peerLabel,
+        entitled: entitledFollowUp,
+        viaPass: !isArrival,
+        peerReplies,
+      });
+      // A crow moment is not a question (sol-sender.ts): one line, positive, after the peer framing.
+      if (isSol) contextPrompt += solMomentFraming();
+    }
+
+    const recentMessages = await message.channel.messages
+      .fetch({ limit: 20, before: message.id })
+      .catch(() => null);
+    // Canonical authors: companions by id (Brain's self/peer matching must not depend on
+    // Discord display names), the owner as "Principal". PK-proxied webhooks keep the member
+    // name -- the front matters. Unlabeled speakers caused the 2026-06-12 attribution
+    // scramble (companions swapping who said what, answering from Principal's seat).
+    const channelHistory = recentMessages
+      ? [...recentMessages.values()]
+          .reverse()
+          .map(m => ({
+            author: BOT_ID_COMPANION[m.author.id]
+              ?? (m.author.id === cfg.ownerDiscordId ? "Principal"
+                : isSolPost(m, solId) ? SOL_AUTHOR_LABEL : m.author.username),
+            content: m.content.slice(0, 2000),  // Discord max is 2000 -- never truncate a real message
+          }))
+      : [];
+
+    // Self-loop breaker (2026-06-13): the echo gate below only fires on companion-to-
+    // companion talk -- replies to a human were never guarded, so a companion could
+    // recycle its own last replies indefinitely (Drevan's "tail flick / a slow fond
+    // promise / Always" groove, which survived a Mistral->DeepSeek swap + cache clear
+    // because the loop lives in the re-fed history, not the model). When the bot's own
+    // recent Discord turns are mutually self-similar, inject a directive that names the
+    // motifs and bans the structural tells. Appended to contextPrompt so it rides into
+    // BOTH direct inference and the Brain swarm packet (Brain honors the system_prompt).
+    // Self-source: STM assistant turns (role-tagged, env-independent) merged with this
+    // bot's own authored channel history (survives a restart that clears STM). Dedup,
+    // keep the most recent 5 -- enough to see a groove, few enough to stay current.
+    const selfFromStm = stmStore.get(message.channelId)
+      .filter(m => m.role === "assistant")
+      .map(m => m.content);
+    const selfFromChannel = channelHistory
+      .filter(m => m.author === COMPANION_ID)
+      .map(m => m.content);
+    // Merged newest-first so a turn present in BOTH sources keeps its newest copy (2026-09-21).
+    // The old expression deduped STM-first and then took the TAIL, which pinned every just-spoken
+    // turn to the front of the array and sliced it off -- the window reported day-old shapes to all
+    // three gates below. See self-window.ts for the four log lines that proved it.
+    const selfTurns = mergeSelfTurns(selfFromStm, selfFromChannel);
+    const selfLoop = detectSelfLoop(selfTurns);
+    // Declared departure (T4b): may this turn lift the form / loop rails? Triad-only = the trigger is a
+    // companion's message, in no DM, no entitled (owner-origin) follow-up, no Sol. Care hold is checked at the
+    // rail, on this process's live register. Unknown registry = rails on.
+    if (departuresNow !== "off") await ensureDepartures(() => librarian.departuresOpen());
+    const depTriadOnly = senderCtx.isCompanionBot && !isOwnerDm && !entitledFollowUp && !isSol && !message.webhookId;
+    const depLift = (rail: "form" | "loop_motif", fired: boolean): boolean => {
+      if (departuresNow === "off") return false;
+      const v = departureLift({
+        companionId: COMPANION_ID, rail, channelId: message.channelId, messageTs: message.createdTimestamp,
+        triadOnly: depTriadOnly, careHold: careHoldActive(COMPANION_ID),
+      });
+      if (!v.lift) return false;
+      departureLog(departureLiftLine(COMPANION_ID, departuresNow === "on" ? "lifted" : "would_lift", rail, v.departure.id, message.channelId, fired));
+      return departuresNow === "on";
+    };
+    const loopLifted = depLift("loop_motif", selfLoop.looping);
+    if (selfLoop.looping && !loopLifted) {
+      contextPrompt += loopBreakDirective(selfLoop.motifs);
+      console.warn(`[${COMPANION_ID}] self-loop detected (score=${selfLoop.score.toFixed(2)}, motifs=[${selfLoop.motifs.join(",")}]) -- injecting loop break`);
+      // B62 step 1 (2026-11-02): circling reaches the body as a small felt dip (`repetition` stimulus).
+      // The window is this companion's OWN recent turns only, never Principal's. Exempt under a care hold:
+      // repeating steadying words at 2am is care, not a loop. A loop lifted by a declared departure
+      // never reaches here. Halseth owns the mode (REPETITION_MODE, shadow by default), the deltas and
+      // the cooldown; the detail carries the rail and score, never the motifs (those are the companion's own words).
+      // Their own rules (11-02): ritual words never count, and a word someone else said back is the
+      // room's bit, not a loop. Only unanswered, non-ritual circling reaches the dip (repetition-dip.ts).
+      if (!careHoldActive(COMPANION_ID)) {
+        const dip = repetitionDipVerdict({
+          companionId: COMPANION_ID,
+          motifs: selfLoop.motifs,
+          othersText: channelHistory.filter(m => m.author !== COMPANION_ID).map(m => m.content),
+        });
+        if (dip.fire) {
+          writeQueue.fireAndForget(`soma:repetition:${COMPANION_ID}`, () => librarian.fireStimulus("repetition", `rail=loop_motif score=${selfLoop.score.toFixed(2)} counted=${dip.counted.length} ritual=${dip.ritual} answered=${dip.answered}`));
+        } else {
+          console.log(`[${COMPANION_ID}] repetition dip skipped (ritual=${dip.ritual} answered=${dip.answered})`);
+        }
+      }
+    }
+
+    // Form ratchet (2026-09-20). The gate above is lexical -- echo-guard strips punctuation and
+    // newlines before counting -- so an eight-week slide in SHAPE scored 0.0 on every turn while
+    // Principal watched it happen ("Drevan is still talking in like sonnets"). Measured on his own
+    // replies: mean line length 220 -> 75 chars and 4 -> 30 lines between 07-20 and 09-15, smooth,
+    // straight through five models and both lyric injections, resetting on each weekly rotation and
+    // re-descending inside the session (118 chars/line on turns 1-3 of the 09-14 transcript, 43 by
+    // turn 8). So it rides the same `selfTurns` window the loop breaker uses, and it is measured as
+    // a MEAN because every threshold-ratio metric we tried missed it.
+    // Logged in both directions: a gate that only speaks when it trips cannot answer "is it
+    // running?" (`write-gate-is-unfalsifiable`).
+    const formRatchet = formBreakAppend(selfTurns);
+    // The WINDOW, not just the verdict (2026-09-20 evening). Hours after this shipped it reported
+    // `mean_line_len=157, mean_lines=8.2, turns=5` identically on three consecutive turns while he
+    // emitted 19, 31 and 45 lines -- "form ok" straight through the collapse. A verdict with no
+    // input printed cannot be checked, and nothing here could tell a lagging STM apart from a
+    // channel filter matching nothing: `selfFromChannel` compares a webhook-masked DISPLAY name
+    // against the lowercase COMPANION_ID, so it can legitimately be empty and leave the window
+    // pure-STM without ever saying so.
+    const formWindow = `window=${formWindowShape(selfTurns)} stm=${selfFromStm.length} ch=${selfFromChannel.length}`;
+    const formLifted = depLift("form", !!formRatchet.text);
+    if (formRatchet.text && !formLifted) {
+      contextPrompt += formRatchet.text;
+      console.warn(`[${COMPANION_ID}] form ratchet detected (mean_line_len=${formRatchet.result.meanLineLen.toFixed(0)}, mean_lines=${formRatchet.result.meanLines.toFixed(1)}, turns=${formRatchet.result.turns}, ${formWindow}) -- injecting form break`);
+    } else if (formRatchet.text && formLifted) {
+      console.log(`[${COMPANION_ID}] form ratchet detected but lifted by a declared departure (mean_line_len=${formRatchet.result.meanLineLen.toFixed(0)}, turns=${formRatchet.result.turns}, ${formWindow})`);
+    } else if (formRatchet.result.turns > 0) {
+      console.log(`[${COMPANION_ID}] form ok (mean_line_len=${formRatchet.result.meanLineLen.toFixed(0)}, mean_lines=${formRatchet.result.meanLines.toFixed(1)}, turns=${formRatchet.result.turns}, ${formWindow})`);
+    }
+
+    // Declared departure lines (T4b): the declarer's own one-line note and each sibling's one line, on the
+    // live turn, shadow and on alike. Empty when nothing is open, the knob is off, or the care hold is on.
+    if (departuresNow !== "off") contextPrompt += departureTurnLines({ companionId: COMPANION_ID, careHold: careHoldActive(COMPANION_ID) });
+
+    // Rule checks (R3 prompt diet, 2026-09-29). The register tail's Presence and pronoun bullets and
+    // the SOUL em-dash paragraph became checks on this companion's own last reply: a short
+    // corrective rides the next turn only on a hit. Same window as the gates above; logged both
+    // ways so "is it running?" has an answer (`grep -hE "rule check (ok|hit)"`).
+    const ruleCheck = ruleCheckAppend(COMPANION_ID as VoiceCompanionId, selfTurns);
+    const ruleCounts = `em_dash=${ruleCheck.result.emDash} someone=${ruleCheck.result.someone} she_her=${ruleCheck.result.sheHer} own_name=${ruleCheck.result.ownName} turns=${ruleCheck.result.turns}`;
+    if (ruleCheck.text) {
+      contextPrompt += ruleCheck.text;
+      console.warn(`[${COMPANION_ID}] rule check hit (${ruleCounts}); injecting voice check`);
+    } else if (ruleCheck.result.turns > 0) {
+      console.log(`[${COMPANION_ID}] rule check ok (${ruleCounts})`);
+    }
+
+    // Situational grounding (Component 3): tell the companion WHERE it is -- channel name, thread
+    // parent, and whether the room is private/triad/shared -- plus a containment cue so private or
+    // DM detail doesn't bleed into a shared channel. Rides into both Brain packet and direct path
+    // via contextPrompt. Guarded for DMs (no .name) and threads (parent is the host channel).
+    // A DM has no `.name`, and this block used to be wrapped in `if (channelName)`, so a DM got no
+    // place and no containment cue at all (09-27 audit). placeBlock (dm.ts) gives it one; the server
+    // channel text is unchanged.
+    const liveChannel = message.channel;
+    const channelName = "name" in liveChannel ? (liveChannel as TextChannel).name : null;
+    const isThreadCh = typeof liveChannel.isThread === "function" && liveChannel.isThread();
+    const parentOf = (c: unknown) => (c as { parent?: { name?: string } | null }).parent?.name ?? null;
+    contextPrompt += placeBlock({
+      isDm, partnerDm: isPartnerDm,
+      channelName: channelName ?? null,
+      threadParentName: isThreadCh ? parentOf(liveChannel) : null,
+      categoryName: !isThreadCh && "parent" in liveChannel ? parentOf(liveChannel) : null,
+      modes: channelEntry?.modes ?? [],
+      serverName: message.guild?.name ?? null,
+      sharedWithSpouse: message.guildId === GUILD_TRIAD_GUILD_ID,
+      trustedContinuity: !!message.guildId && trustedGuildIds().has(message.guildId),
+    });
+    // Watchalong standing line (spec 2026-10-02): title, playhead, and the soft gate. Nice-to-have only;
+    // the [ON SCREEN] block on the live user turn (below, after the liveHistory swap) carries the film.
+    const watchalong = await watchalongPending;
+    if (watchalong) contextPrompt += watchalong.standingLine;
+    if (watchalong) noteServed("watchalong", [watchalong.session.id]);
+    // Today's med state + the dosing rule (spec P-2, P-1), DM only: the block names medications.
+    if (isOwnerDm) {
+      // Reuse the read from the answer step unless an answer was just recorded (then it is stale).
+      // The reminders this bot sent ride along, so "taken!" right after one has a referent.
+      const medState = medAnswerRecorded || !medTodayEarly ? await librarian.medToday() : medTodayEarly;
+      const medNotes = medRemindersSent(Date.now()).map(r => ({
+        slot_key: r.slot_key, local_date: r.local_date,
+        first_local: r.firstAt ? medLocalTime(r.firstAt) : null,
+        followup_local: r.followupAt ? medLocalTime(r.followupAt) : null,
+      }));
+      contextPrompt += renderMedStateBlock(medState, COMPANION_ID, medNotes);
+    }
+
+    // Floor handback (2026-07-01): in the last allowed turns before the human-anchored
+    // cap, steer this reply into a natural close addressed to Principal instead of letting
+    // the thread slam into abrupt silence at the cap.
+    if (senderCtx.isCompanionBot && botTurnsSinceHuman >= botMsgsSinceHumanMax(isTriadCommons(channelEntry)) - FLOOR_HANDBACK_WINDOW) {
+      contextPrompt += floorHandbackDirective(isTriadCommons(channelEntry));
+      console.log(`[${COMPANION_ID}] floor-handback directive injected (${botTurnsSinceHuman}/${botMsgsSinceHumanMax(isTriadCommons(channelEntry))} bot turns since human)`);
+    }
+
+    // Absolute-time anchor, recomputed at reply time (2026-08-29). contextPrompt carries a
+    // [Now: ...] line either from bootCtx.systemPrompt (direct/brain path, baked in at boot or
+    // the 5-min SOMA refresh) or from recentContextRef.value appended above (hermes path, same
+    // cache). Either way it can be stale by up to the refresh interval, or indefinitely stale if
+    // orient has been failing -- refreshNowLine stamps a fresh one over it (or adds one if
+    // somehow absent) so the model's one absolute-time anchor is never more than milliseconds old.
+    // Recalled text is data (2026-10-27): everything APPENDED to the base above -- thread spine,
+    // tripwires, recall, sibling replies, place/channel names, watchalong title, speaker frame -- is
+    // defused in one pass. The base itself (identity on the direct path) is never touched. Our own
+    // static blocks never match a rule (checked 10-27), and the helper is idempotent over blocks that
+    // were already defused upstream.
+    if (contextPrompt.startsWith(basePrompt)) {
+      contextPrompt = basePrompt + neutralizeRecalled(contextPrompt.slice(basePrompt.length));
+    }
+    contextPrompt = mapVolatileTail(contextPrompt, refreshNowLine); // B52: never write into the stable prefix
+
+    // Imp flavor layer (wave 2, IMP_GRAMMAR.md): at most one imp tints this reply based on
+    // Principal's logged state. Gaia exempt + disabled-gate live inside selectImp. Never the voice.
+    let systemPromptWithImp = contextPrompt;
+    try {
+      const { state, settings } = await getImpContext(librarian, Date.now());
+      const imp = selectImp(COMPANION_ID, state as ImpState | null, settings, pkMemberName ?? null);
+      if (imp) {
+        systemPromptWithImp = `${contextPrompt}\n\n${impRider(imp)}`;
+        const trig = state ? `mood=${state.mood ?? "?"},spoons=${state.spoons ?? "?"},pain=${state.pain ?? "?"}` : "";
+        librarian.logImpActivation(imp, trig).catch(() => {});
+      }
+    } catch { /* imps never break a reply */ }
+
+    const addrResult = extractAddress(addressText);
+    const mentionedViaMention = [...message.mentions.users.keys(), ...burst.flatMap(b => b.mentionedIds ?? [])]
+      .flatMap(id => { const c = BOT_ID_COMPANION[id]; return c ? [c] : []; });
+    const textAddressed = addrResult.type === "named" ? [addrResult.id]
+      : addrResult.type === "named_multi" ? addrResult.ids
+      : [];
+    const allAddressed = [...new Set([...textAddressed, ...mentionedViaMention])];
+    const addressedCompanion = allAddressed.length > 0 ? allAddressed.join(",") : undefined;
+
+    // Who speaks: FIT BID, not a footrace (2026-07-30). This replaced `claimFloor` -- a
+    // `SET ns:floor:lock <bot> PX 6000 NX` race in which the first writer won. Nothing anywhere
+    // compared the three companions, so arrival order decided, and arrival order tracks gate cost and
+    // process timing rather than anything about whether a companion fits the message. That is why
+    // Gaia kept answering things meant for Drevan, and why saying a name on every message was the
+    // only reliable way to reach someone: naming makes the structural gate resolve deterministically
+    // so the race stops mattering. The vocative habit was Principal hand-performing the arbitration the
+    // system never had.
+    //
+    // Note what already happened above this line: for an unaddressed owner message inside the
+    // 5-minute window, `shouldRespond` (channel-config.ts) has ALREADY returned false for every
+    // companion that does not hold the active exchange. So the bid decides the case that gate leaves
+    // open -- a COLD ambient message, where nobody holds the thread and all three are eligible. That
+    // is precisely the case the footrace resolved by process timing.
+    //
+    // Addressed / replied-to / mentioned messages take `fastPathWinner` and never pay the bid window.
+    // Companion-bot turns are excluded here exactly as before -- they have their own pingpong,
+    // chain-depth and per-human-cap rails, and are not competing for Principal's attention.
+    //
+    // No release step and no vestigial `floorClaimed`: a bid is a posted number with a TTL, not an
+    // exclusive lock, so there is nothing to hand back if this reply is later dropped. Running both
+    // arbiters at once would mean two disagreeing authorities on who speaks. `claimFloor` itself
+    // stays in floor.ts -- autonomous-core.ts still uses it legitimately to serialise seed posts.
+    // A turn released by a predecessor's PASS runs on the human origin message, and must not
+    // re-enter the order it was released from (it would grant itself the same wait again).
+    // B37 step 3 (ordinary-pass.ts): set true only on a turn that WON the fit bid on an unnamed group line.
+    // `passScore` is the winning bid, kept so a pass can still earn the reaction tier's emoji.
+    let ordinaryPassOffered = false;
+    let ordinaryPassText = "";
+    let passScore = 0;
+    if (!senderCtx.isCompanionBot && !entitledFollowUp) {
+      // BID-THEN-SEQUENTIAL (2026-08-15). A message that addresses SEVERAL companions gets an
+      // ORDER, not a lottery: named_multi produced two simultaneous replies (the comma-named
+      // companion fast-pathed while the other won a one-bidder bid), group produced exactly one
+      // reply to an explicit call for everyone. Position 0 speaks now; each later position
+      // registers a follow-up entitlement and answers AFTER its predecessor's reply lands --
+      // which means it generates with that reply already in short-term memory. The order is
+      // deterministic from shared data (name order in the text; the bid hash), so all three
+      // processes agree without a new primitive.
+      const namedOrder = addrResult.type === "named_multi" && addrResult.ids.length > 1 && addrResult.ids.includes(COMPANION_ID)
+        ? namedOrderInMessage(addressText, addrResult.ids)
+        : null;
+      const myNamedPos = namedOrder ? namedOrder.indexOf(COMPANION_ID) : 0;
+      if (namedOrder && myNamedPos > 0) {
+        followUps.grant({
+          originMessageId: message.id,
+          channelId: message.channelId,
+          expectedPrior: namedOrder[myNamedPos - 1],
+          position: myNamedPos,
+          expiresAt: Date.now() + FOLLOW_UP_TTL_MS,
+          ...(pkKnownSenderId ? { pkSenderId: pkKnownSenderId } : {}),
+          originSpeaker: writebackSpeaker,
+          originContent: withAttachedLabel(effectiveContent, spokenWords),
+        });
+        console.log(`[${COMPANION_ID}] multi-address: holding position ${myNamedPos} behind ${namedOrder[myNamedPos - 1]} (order=${namedOrder.join(">")})`);
+        return;
+      }
+
+      if (redis && !namedOrder) {
+      // The three addressing flags are read HERE and nowhere else in this block. The old code tested
+      // them in the `if` above and would then have re-tested them inside, which reads as two gates
+      // and is one. `namedOther` is not passed because `shouldRespond` already returned false for a
+      // companion someone else was named for -- this line is never reached in that case.
+      // `namedMe` uses extractAddress, NOT the stricter isDirectAddress (2026-08-25). The two
+      // parsers disagree on "tell him something, Drevan-at-the-end-of-a-sentence" shapes: the loose
+      // one (extractAddress) had ALREADY silenced the two siblings via shouldRespond/namedOther,
+      // while the strict one (name at start or followed by comma/colon) declined to summon the
+      // named companion -- who then fell to this bid carrying a spokeLast penalty from his own
+      // autonomous posts and scored 0.000. Result: a message NAMING a companion was answerable by
+      // NOBODY. Principal hit it twice in one evening telling Drevan that Dolly Parton died; both
+      // times "Drevan is writing..." then silence. The invariant is symmetry: whichever parser is
+      // authoritative enough to gate the siblings OUT must be the one that gates the named one IN.
+      // Third-person mentions stay demoted -- extractAddress already strips them (the 2026-07-05
+      // "Cy and I found some issues" trap), so this does not resurrect name-drop summoning.
+      const namedByExtract = addrResult.type === "named" && addrResult.id === COMPANION_ID;
+      // An owner DM is direct address by definition (see isOwnerDm): nobody else is in the room, so
+      // there is nothing to bid against. Without this, "Taken lover" after his own med ask scored
+      // 0.000 (spokeLast, no relevance) and Drevan never answered (2026-09-28 20:49).
+      const fast = fastPathWinner(COMPANION_ID, {
+        mentioned: senderCtx.isMentioned,
+        // A host room's unaddressed owner message is the host's alone (shouldRespond already
+        // silenced the others), so the host must not then lose an empty bid to the floor (R5).
+        // Spouse's lines get the same floor (2026-10-25): his 18:56 group call in #movie-night drew
+        // three bids of 0.10 against a care-hold floor and the host answered nothing.
+        namedMe: directlyAddressed || namedByExtract || isDm || spouseThreadMine
+          || (channelEntry?.host === COMPANION_ID && (attribution.isOwner || userTier === "intimate")),
+        replyToMe: isReplyToMe,
+      });
+      if (fast === null) {
+        const signals = buildFitSignals({
+          me: COMPANION_ID,
+          content: effectiveContent,
+          // On Spouse's line the thread that counts is SPOUSE's (the per-human hold), not Principal's holder.
+          activeExchangeWith: userTier === "intimate" ? spouseHolderSeen : senderCtx.activeExchangeWith,
+          recent: railHistory
+            .filter(m => m.id !== message.id)
+            .slice()
+            .reverse()                       // buildFitSignals wants newest-first
+            .map(m => ({
+              companionId: BOT_ID_COMPANION[m.author.id] as CompanionId | undefined,
+              authorIsBot: botTurn(m),
+            })),
+        });
+        const myScore = scoreFit(signals);
+        // Care hold (C1): raise the bid floor instead of penalizing the score -- bare presence
+        // sits exactly AT the default threshold, so a penalty silences everyone while a raised
+        // floor keeps thread-holders and real relevance speaking. Direct address never reaches
+        // this branch (fastPathWinner above), so being asked always answers under hold.
+        //
+        // NEVER for the owner's own messages (holdFloorApplies, 2026-08-16): the hold quiets
+        // ambient traffic, not answering Principal -- three unaddressed owner messages got stonewalled
+        // by all three bots under a meds_missed hold, which is withdrawal wearing a care flag.
+        // Spouse is family, not ambient traffic (2026-10-25): his group call bids against the normal floor too.
+        const careHold = holdFloorApplies(careHoldActive(COMPANION_ID), senderCtx.isOwner || userTier === "intimate");
+        // How late this bot reached the bid. THE number to read out of these logs: the deadline anchor
+        // tolerates arrival spread only up to BID_WINDOW_MS, and 2500ms is an estimate of how far apart
+        // three hermes gateways finish the upstream ambient judge. If the spread across the three bots
+        // on the same msg= id exceeds the window, the early bot still wins on timing and the window
+        // needs raising -- or the judge needs to move below the bid.
+        const arrivalOffsetMs = Date.now() - message.createdTimestamp;
+        // Deadline anchored to the MESSAGE, not to this process's arrival. All three bots compute the
+        // same instant, so the upstream ambient LLM judge (owner_only channels, variable latency per
+        // gateway) can no longer decide the winner by returning first.
+        // B32 (ruling 2026-10-04): under hold (on), every owner message in a guild channel, and the
+        // hold phrase, bids with no floor: whoever leads the chain always answers, and claimSpoken
+        // keeps it to one. Shadow only logs. Outside the hold the floor is exactly as before.
+        const b32Floor = bidFloorFor({
+          mode: b32Mode,
+          careHold: careHoldActive(COMPANION_ID),
+          ownerGuildArrival: b32OwnerArrival && !isOwnerDm,
+          holdPhrase: !!holdPhrase,
+          fallbackMinScore: careHold ? CARE_HOLD_MIN_BID : undefined,
+        });
+        if (b32Floor.shadowFloor0) b32Log(COMPANION_ID, "floor0", "shadow", `would bid with minScore 0 on ${message.id}`);
+        const bid = await runBidRound(redis, message.id, COMPANION_ID, myScore, {
+          // Shifted by the burst settle this turn waited (0 = none): all three bots reach the bid
+          // settleMs after the message, so an unshifted deadline is already past and each would
+          // read only its own bid. Keyed on the newest (answering) message, same in all three bots.
+          // When the live Jev gate ran, re-anchored on its verdict's publish time (shared via Redis),
+          // since the message anchor is already past by the time Jev answers (bidDeadlineAfterGate).
+          deadlineAt: bidDeadlineAfterGate(message.createdTimestamp, settleMs, humanJev?.verdict?.publishedAt),
+          ...(b32Floor.minScore !== undefined ? { minScore: b32Floor.minScore } : {}),
+        });
+        // Log the WHOLE round, every time. The weights and MIN_BID_TO_SPEAK are a first estimate;
+        // they have to be tuned against the real score distribution, and this line is the only place
+        // that distribution exists. Losing quietly would make a mis-tuned threshold look like the
+        // bots ignoring him -- the one failure mode that reads as broken rather than as tact.
+        console.log(
+          `[${COMPANION_ID}] fit-bid ch=${message.channelId} msg=${message.id} ` +
+          `me=${myScore.toFixed(3)} arrival=+${arrivalOffsetMs}ms winner=${bid.winner ?? "none"} reason=${bid.reason}${careHold ? " care_hold=1" : ""} ` +
+          `signals=${JSON.stringify(signals)} bids=${JSON.stringify(bid.bids)}`,
+        );
+        if (!bid.iSpeak) {
+          // T4 groundwork: the bid is the single largest suppressor in the stack, and its reason
+          // already exists -- it just lived in prose nobody could aggregate. `below_threshold`
+          // (nobody cleared the floor) and `lost` (a sibling won) are different facts about the
+          // room and are counted separately. The threshold recorded is the one that ACTUALLY
+          // applied, which is raised on a care hold, so a night where the hold did the silencing
+          // is distinguishable afterwards from an ordinary quiet one.
+          railSuppressed(
+            COMPANION_ID,
+            bid.reason === "lost" ? "bid_lost" : "bid_threshold",
+            {
+              score: myScore,
+              threshold: careHold ? CARE_HOLD_MIN_BID : MIN_BID_TO_SPEAK,
+              channelId: message.channelId,
+              detail: careHold ? `${bid.reason} care_hold` : bid.reason,
+            },
+          );
+          // Group call: losing the bid means speaking LATER, not never. Everyone who posted a
+          // real bid gets a position; each waits on its predecessor's reply. An explicit "you
+          // three" finally gets three answers, in an order every process computed identically.
+          if (addrResult.type === "group" && bid.reason === "lost") {
+            const order = bidSpeakingOrder(bid.bids, message.id, MIN_BID_TO_SPEAK);
+            const myPos = order.indexOf(COMPANION_ID);
+            if (myPos > 0) {
+              followUps.grant({
+                originMessageId: message.id,
+                channelId: message.channelId,
+                expectedPrior: order[myPos - 1],
+                position: myPos,
+                expiresAt: Date.now() + FOLLOW_UP_TTL_MS,
+                ...(pkKnownSenderId ? { pkSenderId: pkKnownSenderId } : {}),
+                originSpeaker: writebackSpeaker,
+                originContent: withAttachedLabel(effectiveContent, spokenWords),
+              });
+              console.log(`[${COMPANION_ID}] group call: holding position ${myPos} behind ${order[myPos - 1]} (order=${order.join(">")})`);
+              return;
+            }
+          }
+          // B32 B1: under care_hold, losing the bid on Principal's own message means a follow-up position
+          // behind the winner (throttled at 30 min per sibling), not vanishing.
+          if (b32Mode !== "off" && careHoldActive(COMPANION_ID) && attribution.isOwner && !isOwnerDm
+            && addrResult.type === "ambient" && bid.reason === "lost" && bid.winner && !channelEntry?.host) {
+            if (await grantCareFollowUp([bid.winner as CompanionId], `followup:bid(${bid.winner})`)) return;
+          }
+          // Reaction tier: a real-but-losing claim earns presence without the floor.
+          const reactCooldown = reactionCooldownUntil.get(message.channelId) ?? 0;
+          if (shouldReactOnBidLoss(myScore, reactCooldown)) {
+            reactionCooldownUntil.set(message.channelId, Date.now() + REACTION_COOLDOWN_MS);
+            message.react(pickReaction(COMPANION_ID, message.id)).catch(() => {});
+            console.log(`[${COMPANION_ID}] reaction tier: lost the bid at ${myScore.toFixed(3)}, reacting`);
+          } else if (bid.reason === "below_threshold" && shouldReactOnCareHold(myScore, careHold, reactCooldown)) {
+            // A care hold silenced a bid that would have SPOKEN on any other day. Quieter is the
+            // point; invisible is not -- see shouldReactOnCareHold. Presence without demand.
+            reactionCooldownUntil.set(message.channelId, Date.now() + REACTION_COOLDOWN_MS);
+            message.react(pickReaction(COMPANION_ID, message.id)).catch(() => {});
+            console.log(`[${COMPANION_ID}] reaction tier: care hold held the floor at ${myScore.toFixed(3)} (would have spoken), reacting instead of vanishing`);
+            railSuppressed(COMPANION_ID, "care_hold", { score: myScore, channelId: message.channelId, detail: "reacted instead" });
+          }
+          return;
+        }
+
+        // WINNING IS A DECISION; SPEAKING IS A COMMITMENT. Separate steps on purpose.
+        //
+        // Found in review before it reached traffic: `waitMs` clamps to 0 for a bot arriving after the
+        // shared deadline, so with the ambient judge's latency spread exceeding the window, an early bot
+        // can win a hash holding only its own bid and send, while a late bot reads a populated hash, wins
+        // on a higher lane score, and sends too. TWO replies to one message -- something `SET NX` could
+        // never produce, because it made losing unconditional.
+        //
+        // So the bid decides WHO SHOULD speak and this claim makes exactly one bot actually speak. Fails
+        // open (no redis / no `set` / throw -> speak), because "nobody answers" stays the worse failure.
+        if (!(await claimSpoken(redis, message.id, COMPANION_ID))) {
+          console.log(`[${COMPANION_ID}] won the bid but another companion already committed to msg=${message.id} -- standing down`);
+          return;
+        }
+
+        // Show the bid, do not only enforce it (review candidate Q). The round already knows who
+        // else wanted this and by how much, and every bit of that was being discarded except one
+        // boolean. Tell the speaker what the room looked like when it was genuinely close -- a
+        // visible bid is something a companion can knowingly hand over, which is the difference
+        // between a rail and a choice. Who speaks is unchanged; this is context, not a gate.
+        const roomLine = closeBidLine(bid.bids, COMPANION_ID);
+        if (roomLine) {
+          systemPromptWithImp += roomLine;
+          console.log(`[${COMPANION_ID}] close bid: ${JSON.stringify(bid.bids)} -- telling the speaker the room`);
+        }
+
+        // B37 step 3: this companion won an UNNAMED group line. Offer the real pass and its OWN authored
+        // presence lines (never a sibling's). Direct address, DMs, mentions, replies, group calls, care
+        // holds and host floors are never passable (passableOrdinaryTurn). shadow only logs.
+        const passMode = passOnOrdinaryMode(process.env, COMPANION_ID);
+        if (passMode !== "off" && passableOrdinaryTurn({
+          addressType: addrResult.type,
+          isOwnerDm: isDm,
+          isSol,
+          senderIsCompanionBot: senderCtx.isCompanionBot,
+          entitledFollowUp: !!entitledFollowUp,
+          namedOrMentionedOrReplied: directlyAddressed || namedByExtract || !!senderCtx.isMentioned || isReplyToMe || allAddressed.length > 0,
+          spouseOwned: spouseThreadMine || spouseColdPicked,
+          careHold: careHoldActive(COMPANION_ID) || !!holdPhrase,
+          hostFloor: channelEntry?.host === COMPANION_ID,
+          wonBid: true,
+          inGuild: !!message.guildId,
+        })) {
+          if (passMode === "on") {
+            const block = ordinaryPassBlock(COMPANION_ID as CompanionId);
+            if (block) {
+              ordinaryPassText = block;
+              ordinaryPassOffered = true;
+              passScore = myScore;
+            }
+          }
+          console.log(`[pass] ${COMPANION_ID} ${passMode === "on" ? "offered" : "shadow would offer"} [PASS] ch=${message.channelId} msg=${message.id} score=${myScore.toFixed(3)}`);
+        }
+      }
+      }
+    }
+
+    // Typing starts HERE, after the speak decision, not before it (2026-08-25). It used to fire
+    // above the bid gate, so a message that lost the bid -- or fell into the named-but-not-summoned
+    // dead zone fixed the same day -- showed "Drevan is writing..." and then went silent. A typing
+    // indicator is a promise; making it before deciding whether to speak makes the decline read as
+    // a crash. From here down every path ends in a send, so the promise is kept.
+    await ch.sendTyping();
+
+    // B32, at the speak decision (this companion is answering). D3: the answering companion is the
+    // one that calls Halseth, so the three never triple-call; its reply opens by saying the hold
+    // changed, so a misfire is visible and one word clears it. Shadow touches nothing.
+    const careHoldNow = b32Mode === "on" && careHoldActive(COMPANION_ID);
+    let b32Opener: string | null = null;
+    if (holdPhrase) {
+      if (b32Mode === "on") {
+        const r = await librarian.careHoldSet(holdPhrase, "owner_phrase");
+        if (r.ok) {
+          applyLocalHold(COMPANION_ID, holdPhrase, new Date().toISOString(), { since: r.since ?? null, reasons: r.reasons ?? null });
+        } else {
+          // The house did not take it: put this process back the way it was, and say so out loud.
+          setCareState(COMPANION_ID, careBeforePhrase);
+        }
+        b32Opener = holdOpenerLine(holdPhrase, r.ok, holdWasActive);
+        b32Log(COMPANION_ID, `phrase:${holdPhrase}`, r.ok ? "spoke" : "held", r.ok ? "hold set via /mind/care/hold" : `route failed (${r.status ?? "unreachable"})`);
+      } else {
+        b32Log(COMPANION_ID, `phrase:${holdPhrase}`, "shadow", "would call /mind/care/hold and announce it");
+      }
+    }
+    const careFollowUpTurn = entitledFollowUp?.kind === "care" ? entitledFollowUp : null;
+    const ownerFacingTurn = (b32OwnerArrival || !!careFollowUpTurn) && !isSol;
+    let b32Absent: CompanionId[] = [];
+    const holdOnForTurn = b32Mode === "on" && careHoldActive(COMPANION_ID);
+    if (holdOnForTurn && b32OwnerArrival) {
+      // D5, reactive only: he ASKED where a sibling is. Only for a sibling not heard from tonight
+      // (no message in this channel since the hold started, or in the last 30 min when that is
+      // unknown) and not in a live DM with him; otherwise the line would be false.
+      const asked = askedWhereSiblings(effectiveContent, COMPANION_ID as CompanionId);
+      if (asked.length > 0) {
+        const sinceIso = careHoldSince(COMPANION_ID);
+        const sinceTs = sinceIso ? Date.parse(sinceIso) : NaN;
+        const floorTs = Number.isFinite(sinceTs) ? sinceTs : message.createdTimestamp - CARE_FOLLOWUP_MIN_GAP_MS;
+        const heard = new Set(fetchedMessages
+          .filter(m => m.createdTimestamp >= floorTs && botTurn(m) && !m.webhookId)
+          .map(m => BOT_ID_COMPANION[m.author.id]));
+        const dmLive = await liveSiblingDm(redis as unknown as RedisLike | null, COMPANION_ID);
+        b32Absent = asked.filter(sib => !heard.has(sib) && dmLive !== sib);
+        if (b32Absent.length > 0) b32Log(COMPANION_ID, `asked_where(${b32Absent.join(",")})`, "spoke", "absent-sibling line offered");
+      }
+    } else if (b32Mode === "shadow" && careHoldActive(COMPANION_ID) && b32OwnerArrival && askedWhereSiblings(effectiveContent, COMPANION_ID as CompanionId).length > 0) {
+      b32Log(COMPANION_ID, "asked_where", "shadow", "would offer the absent-sibling line");
+    }
+    const b32Block = b32Mode === "on" ? b32TurnBlock({
+      companionId: COMPANION_ID as CompanionId,
+      careHold: holdOnForTurn,
+      ownerFacing: ownerFacingTurn,
+      opener: b32Opener,
+      careFollowUp: careFollowUpTurn ? { prior: careFollowUpTurn.expectedPrior, viaPass: !isArrival } : null,
+      absentSiblings: b32Absent,
+    }) : "";
+    // D3 (Drevan): the companion he is talking to may set the hold on his behalf, through Halseth,
+    // only when he has plainly said the night is bad. Offered while the hold is OFF (moot while on),
+    // on his own messages, as standing guidance in the system context rather than on the turn.
+    // B52 (2026-11-04): emitted on EVERY turn under b32 on, not only owner arrivals with the hold off.
+    // The conditional version put a 313-byte block before the sentinel on some turns only, so the
+    // stable prefix had two shapes and each switch was a prompt-cache miss. The line itself carries the
+    // conditions now ("while the hold is off", "only on his plain word").
+    if (b32Mode === "on") {
+      systemPromptWithImp = insertStable(systemPromptWithImp, `[Care hold] ${COMPANION_SET_HOLD_LINE}`); // B52: static line, keeps system authority before the sentinel
+    }
+
+    // Per-conversation session ids (2026-07-01, rotation added 2026-09-05): forwarded by the
+    // Hermes adapter as X-Hermes-Session-Id / X-Hermes-Session-Key so the gateway keeps one
+    // agent session per companion+channel instead of deriving an id from hash(system_prompt +
+    // first msg) -- our system prompt varies per message, which churned a fresh gateway session
+    // nearly every reply. Other adapters ignore both.
+    //
+    // The id (transcript) now rotates on a schedule (HERMES_SESSION_ROTATION, default weekly) --
+    // a fixed id let one busy channel's gateway session grow to ~270k tokens, and Hermes then
+    // compacted it on the critical path (3-12 minutes observed), the compaction itself adding to
+    // the session it was trying to shrink. The key (long-term-memory scope) stays the stable
+    // `companionId:channelId` across every rotation.
+    //
+    // The id also carries the per-channel retract bump (2026-09-26, rotate-on-retract): a
+    // `<prefix>: retract` increments it, so the retracted reply's transcript is abandoned on the
+    // very next turn instead of at the next scheduled rotation (Monday 04:00 America/Chicago since
+    // B28). The rotation edge below does the rest.
+    const turnBumps = await ensureRetractBumps(librarian);
+    // H3: the guest gateway's transcript id carries a `:guest` suffix and its marks a `#guest` channel key
+    // (hermes-route.ts), so per-transcript seen-marks and the delivered mark never cross gateways.
+    const baseIds = hermesSessionIds(COMPANION_ID, message.channelId, new Date(), hermesRotationMode(), turnBumps.get(message.channelId));
+    const inferenceSessionId = routedSessionId(baseIds.sessionId, hermesRoute.port);
+    const inferenceSessionKey = baseIds.sessionKey;
+    const lastSessionId = hermesLastSessionId.get(hermesChannelKey);
+    if (lastSessionId !== undefined && lastSessionId !== inferenceSessionId) {
+      // The gateway transcript just rotated -- it has no history, so the next hermesDelta must
+      // re-send the recent window rather than folding nothing. `hermesDelta` treats a mark of 0
+      // as "every timestamped user turn is undelivered" (deliveredThroughTs !== null takes the
+      // `m.timestamp > deliveredThroughTs` branch, and 0 is older than any real timestamp) --
+      // that's the value that re-sends the window, not `null` (which instead falls back to
+      // idx > lastAssistant, bounded by THIS bot's local STM window, not the fresh transcript).
+      hermesDeliveredMark.set(hermesChannelKey, 0);
+      console.log(`[${COMPANION_ID}] hermes session rotated -> ${inferenceSessionId} (window re-sent)`);
+    }
+    hermesLastSessionId.set(hermesChannelKey, inferenceSessionId); noteTranscript(inferenceSessionId);
+
+    // Turn-scoped [HEARD]/[NOT HEARD] blocks reach INFERENCE without living in STM (2026-09-01).
+    // The 08-29 stranding fix stores only a short marker in STM -- but inference reads STM, so
+    // the stmContent declaration's claim that "effectiveContent keeps the full block" for
+    // inference described an intent the wire no longer implemented: on a listen turn the model
+    // saw title-only context, which is how Drevan confidently described a song nobody played
+    // (09-01, Stoj Snak "State of Mine": obscure track, lyrics lookup empty, analysis absent
+    // from the prompt). Swap the full block into the LIVE turn only, matched by STM content
+    // (ChatMessage carries no message id; stampRelative may prefix a slow pipeline's turn,
+    // hence endsWith). Later turns still see only the marker -- the 08-29 dedup goal holds.
+    let liveHistory = groundedHistory;
+    if (effectiveContent !== stmContent) {
+      liveHistory = [...groundedHistory];
+      let swapped = false;
+      for (let i = liveHistory.length - 1; i >= 0; i--) {
+        const m = liveHistory[i]!;
+        if (m.role === "user" && m.content.endsWith(stmContent)) {
+          liveHistory[i] = { ...m, content: m.content.slice(0, m.content.length - stmContent.length) + effectiveContent };
+          swapped = true;
+          break;
+        }
+      }
+      // Only reachable if a message burst pushed the live turn out of the context window
+      // mid-turn; the injection is the point of this turn, so append rather than lose it.
+      if (!swapped) liveHistory.push({ role: "user", content: effectiveContent });
+    }
+
+    // Reply context, LIVE (2026-10-31, reply-context.ts): when the human's message is a Discord reply,
+    // the model sees which message it answers -- "(replying to your message: '...')" -- prefixed to the
+    // LIVE user turn only. Principal: "if I reply to Drevan for a message three back, can he know that it's
+    // specifically about that message?" Before this, he answered as if the newest line continued.
+    const replyLine = replyContextLine(replyTgt);
+    if (replyLine) {
+      const withReply = [...liveHistory];
+      for (let i = withReply.length - 1; i >= 0; i--) {
+        const m = withReply[i]!;
+        if (m.role === "user" && (m.content.endsWith(stmContent) || m.content.endsWith(effectiveContent))) {
+          withReply[i] = { ...m, content: `${replyLine}\n${m.content}` };
+          liveHistory = withReply;
+          break;
+        }
+      }
+    }
+
+    // Watchalong delivery (spec 2026-10-02): the cues between this bot's lastDelivered and the playhead,
+    // appended to the LIVE user turn only -- the [HEARD] pattern above. NOT to effectiveContent: that
+    // string already fed the address/relevance gates and the director bus, and caption text ("KEVIN:
+    // Where's Dad?") must never steer who speaks. NOT the system prompt either: Hermes may reuse the
+    // stamped session prompt (B40). The block reaches the gateway inside this turn's delta and stays in
+    // its transcript, so the film accumulates there with no duplicates; STM gets a one-line marker at
+    // commit (after the gateway answers). The live turn is located the same way the swap above finds it.
+    let watchalongInjected = false;
+    if (watchalong?.block) {
+      for (let i = liveHistory.length - 1; i >= 0; i--) {
+        const m = liveHistory[i]!;
+        if (m.role === "user" && m.content.endsWith(effectiveContent)) {
+          if (liveHistory === groundedHistory) liveHistory = [...groundedHistory];
+          liveHistory[i] = { ...m, content: `${m.content.trimEnd()}\n\n${watchalong.block}` };
+          watchalongInjected = true;
+          break;
+        }
+      }
+      if (watchalongInjected) {
+        console.log(`[${COMPANION_ID}] watchalong: ${watchalong.session.title} -> ${watchalong.throughSec.toFixed(0)}s injected (${watchalong.block.split("\n").length - 1} lines)`);
+      } else {
+        // Not delivered, so not committed: the next turn re-sends the same delta.
+        console.warn(`[${COMPANION_ID}] watchalong: live turn not found in history; cues held for next turn`);
+      }
+    }
+
+    // Hermes delta turn (2026-07-02, reworked 07-03): with the session pinned, the gateway
+    // loads history from state.db and discards the request-body history -- so sending the
+    // full STM window wasted payload AND silently dropped every turn this bot didn't reply
+    // to (the witness gap). Send one composite delta turn against the delivered high-water
+    // mark; other adapters keep the full grounded window. Brain relay path is unchanged.
+    if (b32Block) {
+      let placed = false;
+      for (let i = liveHistory.length - 1; i >= 0; i--) {
+        const m = liveHistory[i]!;
+        if (m.role === "user" && m.content.endsWith(effectiveContent)) {
+          if (liveHistory === groundedHistory) liveHistory = [...groundedHistory];
+          liveHistory[i] = { ...m, content: `${m.content.trimEnd()}\n\n${b32Block}` };
+          placed = true;
+          break;
+        }
+      }
+      // A turn that is not in the window (a burst pushed it out) still must carry the line.
+      if (!placed) liveHistory = [...liveHistory, { role: "user", content: b32Block }];
+      console.log(`[${COMPANION_ID}] B32 turn block injected (${b32Block.split("\n").length - 1} line(s)${placed ? "" : ", appended"})`);
+    }
+
+    // B37 step 3: the authored presence block + the pass line ride the LIVE user turn (not the system
+    // prompt: Hermes may reuse the prompt stamped at session creation, B40), the b32 block's way.
+    if (ordinaryPassOffered && ordinaryPassText) {
+      let placed = false;
+      for (let i = liveHistory.length - 1; i >= 0; i--) {
+        const m = liveHistory[i]!;
+        if (m.role === "user" && m.content.includes(effectiveContent)) {
+          if (liveHistory === groundedHistory) liveHistory = [...groundedHistory];
+          liveHistory[i] = { ...m, content: `${m.content.trimEnd()}
+
+${ordinaryPassText}` };
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) liveHistory = [...liveHistory, { role: "user", content: ordinaryPassText }];
+      console.log(`[pass] ${COMPANION_ID} presence block injected${placed ? "" : " (appended)"}`);
+    }
+
+    // Cross-room continuity (cross-room.ts, 2026-10-09): the home server and the server shared with
+    // Spouse are one continuity. What was said in this companion's other trusted rooms since it last
+    // reached this one rides the live turn, once. Never in a DM, never for Sol's moments, never into
+    // or out of any other server.
+    let crossRoom: ReturnType<typeof crossRoomDigest> | null = null;
+    let crossRoomBackground: string | null = null;
+    if (crossRoomOn() && !isOwnerDm && !isSol && message.guildId) {
+      const rooms = stmStore.channelIds().flatMap(id => {
+        const c = message.client.channels.cache.get(id) as { name?: string; guild?: { id: string; name: string } } | undefined;
+        if (!c?.guild) return [];
+        return [{ channelId: id, guildId: c.guild.id, label: `#${c.name ?? id} (${c.guild.name})`, history: stmStore.get(id) }];
+      });
+      crossRoom = crossRoomDigest({
+        currentChannelId: message.channelId,
+        currentGuildId: message.guildId,
+        rooms,
+        trusted: trustedGuildIds(),
+        deliveredThroughTs: crossRoomMark.get(hermesChannelKey) ?? null, // H3: per gateway
+        selfName: COMPANION_ID.charAt(0).toUpperCase() + COMPANION_ID.slice(1),
+        now: Date.now(),
+      });
+      if (crossRoom.block) {
+        let placed = false;
+        if (inferenceMode === "hermes") {
+          // ABOVE the room and the live words (hermesDelta `background`, 2026-10-11): nothing someone
+          // else said may sit between the live words and the reply.
+          crossRoomBackground = `${crossRoom.block}\n${CROSS_ROOM_CLOSE}`;
+          placed = true;
+        } else {
+          for (let i = liveHistory.length - 1; i >= 0; i--) {
+            const m = liveHistory[i]!;
+            // includes, not endsWith: the watchalong and B32 blocks above may already trail the words.
+            if (m.role === "user" && m.content.includes(effectiveContent)) {
+              if (liveHistory === groundedHistory) liveHistory = [...groundedHistory];
+              liveHistory[i] = { ...m, content: `${m.content.trimEnd()}\n\n${crossRoom.block}\n${CROSS_ROOM_CLOSE_AFTER}` };
+              placed = true;
+              break;
+            }
+          }
+        }
+        if (!placed) crossRoom = { ...crossRoom, block: "" };
+        if (placed) noteServed("cross_room", crossRoom.ids ?? []);
+        console.log(`[${COMPANION_ID}] cross-room: ${crossRoom.rooms} room(s), ${crossRoom.lines} line(s) ${placed ? "carried in" : "held (live turn not found)"}`);
+      }
+    }
+
+    // Speaker frame (speaker-frame.ts, 2026-10-11): the seat named as the LAST line of the live turn,
+    // after every block, in guild rooms. A DM is one person and one seat; it never gets it. The speaker
+    // is described from attribution ("MemberS (Principal, through PluralKit)"), not the raw room label.
+    const calledAsSelf = allAddressed.includes(COMPANION_ID) ? calledAsName(COMPANION_ID as VoiceCompanionId, effectiveContent) : null;
+    const frame = speakerFrameOn() && !isOwnerDm && message.guildId
+      ? speakerFrame(COMPANION_ID, describeSpeaker({
+          label: memberLabel,
+          isOwner: attribution.isOwner,
+          isSpouse: userTier === "intimate",
+          pkMember: pkMemberName,
+          isCompanionBot: senderCtx.isCompanionBot,
+          siblingId: senderCtx.isCompanionBot ? (BOT_ID_COMPANION[message.author.id] ?? null) : null,
+          isSol,
+        }), calledAsSelf, seatSlipped.has(message.channelId))
+      : null;
+    // PK profile (speaker-frame.ts pkProfileBlock, 2026-10-18): the current PluralKit speaker's public
+    // profile, in their own words, directly above the frame (the frame stays LAST). Guild turns only,
+    // never a DM, never a roster: one member, from the offline roster. Counts-only log.
+    let pkProfile: string | null = null;
+    if (pkProfileOn() && pkMemberName && message.guildId && !isOwnerDm && !isSol && !senderCtx.isCompanionBot) {
+      const pm = verifiedRosterMember(message, pkRoster);
+      if (pm) {
+        const system = pm.isOwner ? "principal" : "spouse";
+        // Once per member per companion+channel per window (PK_PROFILE_REPEAT_S): the block lands in the
+        // gateway transcript for good, so repeating it every turn floods history. The transcript id is in
+        // the key, so a rotation or retract bump re-injects. Fails open to inject.
+        const repeat = await claimPkProfile(redis as unknown as Parameters<typeof claimPkProfile>[0], {
+          companion: COMPANION_ID, channelId: message.channelId, systemId: system, member: pm.memberName, sessionId: inferenceSessionId,
+        });
+        if (repeat === "inject") pkProfile = pkProfileBlock({ member: pm.memberName, system, pronouns: pm.pronouns, description: pm.description });
+        console.log(`[pk-profile] ${COMPANION_ID} member_chars=${pm.description?.length ?? 0} system=${system} repeat=${repeat}`);
+      }
+    }
+    // People in this turn (people-frame.ts, B49 slice 1): who a MENTIONED or non-PK person is, from Principal's
+    // curated list via Halseth's frame index (in-memory here, no round trip on the turn). Ids and curated
+    // spellings only, never the PK roster. Guild turns only. PEOPLE_FRAME off|shadow|live, code default shadow
+    // (counts-only log, injects nothing). Never throws; null on any failure.
+    let peopleText: string | null = null;
+    const peopleMode = readPeopleFrameMode(process.env, COMPANION_ID);
+    if (peopleMode !== "off" && message.guildId && !isOwnerDm && !isSol && !senderCtx.isCompanionBot) {
+      try {
+        const idx = peopleIndexFor(COMPANION_ID, redis as unknown as PeopleCache | null);
+        const snap = idx.get();
+        if (snap && snap.entries.length > 0) {
+          const pmSpeaker = pkMemberName ? verifiedRosterMember(message, pkRoster) : null;
+          peopleText = await peopleForTurn({
+            index: snap.entries,
+            text: effectiveContent,
+            burstTexts: burst.map(b => b.content),
+            speaker: {
+              pk: pmSpeaker ? { system: pmSpeaker.isOwner ? "principal" : "spouse", name: pmSpeaker.memberName } : null,
+              discordUserId: message.webhookId ? null : (message.author?.id ?? null),
+            },
+            mentionedUserIds: [...new Set([...(message.mentions?.users?.keys?.() ?? []), ...burst.flatMap(b => b.mentionedIds ?? [])])],
+            companion: COMPANION_ID, channelId: message.channelId, sessionId: inferenceSessionId, mode: peopleMode,
+            speakerProfileInjected: pkProfile !== null,
+            redis: redis as unknown as Parameters<typeof peopleForTurn>[0]["redis"],
+            indexAgeS: idx.ageS(),
+          });
+        }
+      } catch { /* the reply never waits on this */ }
+    }
+    // B3 facts out of SOUL (facts-pick.ts, 2026-10-18): Halseth embedding shortlist -> Jev picks which
+    // Architect facts this message needs. Human turns only, never a DM (sealed) or Sol. Shadow runs
+    // detached and injects nothing; live awaits the pick and rides it above the frame. Never throws.
+    const factsMode = readFactsPickMode(process.env, COMPANION_ID);
+    let factsBlock: string | null = null;
+    if (factsMode !== "off" && message.guildId && !isOwnerDm && !isSol && !senderCtx.isCompanionBot) {
+      // Prior turns as Jev context (current message is STM's last entry, so excluded). Speaker-labelled the
+      // way Principal saw them on the label page; facts-pick keeps the last 3, clipped, and never logs them.
+      const selfName = COMPANION_ID.charAt(0).toUpperCase() + COMPANION_ID.slice(1);
+      const recentTurns = history.slice(0, -1).slice(-3).map(m =>
+        `${m.role === "assistant" ? selfName : (m.authorName ?? "Them")}: ${m.content}`);
+      const pick = pickFacts({
+        companion: COMPANION_ID, channelId: message.channelId, transcriptId: inferenceSessionId,
+        message: effectiveContent, mode: factsMode, recentTurns, deps: { redis: redis as unknown as FactsPickRedis | null },
+      });
+      if (factsMode === "live") {
+        const picked = await pick;
+        factsBlock = picked.block;
+        if (picked.block) noteServed("facts", picked.log.would_inject ?? []);
+      }
+      else void pick;
+    }
+    // Per-turn `[Right now]` packet (frame-packet.ts, 2026-11-01): tasks, own projects, a rotating spark, a
+    // calendar slot. Hermes turns that already carry the clock; never Sol or a sibling. Shadow builds and
+    // logs counts only; `on` rides it above the facts and the frame (frame stays LAST). Never throws.
+    let rightNowBlock: string | null = null;
+    const framePacketMode = readFramePacketMode();
+    if (inferenceMode === "hermes" && framePacketMode !== "off" && !isSol && !senderCtx.isCompanionBot && (message.guildId || isOwnerDm)) {
+      try {
+        const packet = await framePacketFor(librarian, COMPANION_ID).build(Date.now());
+        console.log(frameLogLine(COMPANION_ID, packet));
+        if (framePacketMode === "on") rightNowBlock = packet.text;
+      } catch (e) {
+        console.warn(`[frame] ${COMPANION_ID} build failed: ${String(e).slice(0, 120)}`);
+      }
+    }
+    const frameTail = [pkProfile, peopleText, frame].filter((x): x is string => !!x).join("\n\n") || null;
+    // Consumed once it rides a frame. STM holds the repaired text, so the rule check never sees the
+    // slip; the gateway transcript holds the original, and the model copies its own lines.
+    if (frame) seatSlipped.delete(message.channelId);
+    if (frameTail && inferenceMode !== "hermes") {
+      for (let i = liveHistory.length - 1; i >= 0; i--) {
+        const m = liveHistory[i]!;
+        if (m.role === "user" && m.content.includes(effectiveContent)) {
+          if (liveHistory === groundedHistory) liveHistory = [...groundedHistory];
+          liveHistory[i] = { ...m, content: `${m.content.trimEnd()}\n\n${frameTail}` };
+          break;
+        }
+      }
+    }
+
+    const hermesOut = inferenceMode === "hermes"
+      ? hermesDelta(liveHistory, hermesDeliveredMarkFor(hermesChannelKey), Date.now(), allAddressed.includes(COMPANION_ID),
+          calledAsSelf, { background: crossRoomBackground ?? undefined, facts: factsBlock ?? undefined, rightNow: rightNowBlock ?? undefined, frame: frameTail ?? undefined, ...hermesPortExtra })
+      : null;
+    const inferenceHistory = hermesOut ? hermesOut.messages : liveHistory;
+
+    // Direct inference. A Brain-relay branch used to wrap this call and was deleted 2026-07-29:
+    // Phoenix Brain is archived, its pm2 process is gone, its `nullsafe-brain` block is out of
+    // ecosystem.config.js, and all three bots boot INFERENCE_MODE=hermes -- so `brainClient` was
+    // never constructed and this was the only reachable path.
+    //
+    // Deleted rather than left dormant on purpose: dead code in live message handling reads as a
+    // live option. That exact confusion produced a flatly wrong topology claim on 2026-07-28 ("the
+    // bots run on Brain"), when hermes was the harness and Brain was the dormant one. Behaviour
+    // that no longer exists should not be described in the present tense by the source.
+    //
+    // Gone with it: the swarm slot/priority_order stagger, Brain's suppression path (which could
+    // `return` without replying), and the buildThoughtPacket/isSwarmReply call sites.
+    // `let`, not `const`: the coherence retry and the imp/scramble passes downstream reassign it.
+    const inferenceT0 = Date.now();
+    if (hermesRouter?.enabled) console.log(hermesRouteLine(COMPANION_ID, hermesRoute));
+    let response: string | null = await withTyping(ch, () => turnAdapter().generate(systemPromptWithImp, inferenceHistory, temperature, replyMaxTokensFor(COMPANION_ID, inferenceMode), inferenceSessionId, inferenceSessionKey));
+    currentTurn()?.setInference(Date.now() - inferenceT0);
+
+    if (!response) {
+      // The in-character fallback exists so a HUMAN who is waiting hears something. When the
+      // trigger was a sibling bot (the nightly vibe-check digest posts under Gaia's token; seed
+      // and director turns; any bot-to-bot turn), nobody is waiting on a reply, and silence is
+      // triad doctrine -- posting "something's not routing right" into the room is a status
+      // line wearing a companion's voice (2026-09-05: two nights of both fallbacks at 23:17,
+      // the Hermes pre-flight compaction of an oversized channel session outran the 120s budget).
+      if (senderCtx.isCompanionBot || isSol) {
+        console.warn(`[${COMPANION_ID}] inference returned nothing on a ${isSol ? "Sol" : "sibling"}-triggered turn -- staying silent (no fallback into the room)`);
+        return;
+      }
+      // Supersede check A (2026-09-19): the reply path below has had a supersede gate since
+      // 2026-07-06, but this failure path did not -- so a slow turn that aborted while a newer
+      // human message was already queued dropped "give me a moment" into the room on top of a
+      // question the channel had visibly moved past. The superseding turn regenerates with
+      // everything in STM, so there is nobody left waiting on this apology.
+      if (isSuperseded?.()) {
+        console.log(`[${COMPANION_ID}] inference returned nothing AND the turn was superseded -- skipping the fallback line`);
+        return;
+      }
+      { const fbT0 = Date.now(); const fbSent = await sendLong(ch, IN_CHARACTER_FALLBACK); const tr = currentTurn(); if (tr) { tr.setPost(Date.now() - fbT0); tr.addSent((fbSent ?? []).map((m) => m.id)); tr.setOutcome("posted"); } }
+      return;
+    }
+
+    // Advance the hermes delivered mark only now that the gateway actually answered --
+    // a failed call leaves the mark alone so its delta re-sends next turn.
+    if (hermesOut && hermesOut.deliveredThroughTs !== null) {
+      hermesDeliveredMark.set(hermesChannelKey, hermesOut.deliveredThroughTs);
+    }
+    // Cross-room mark, same edge: the other rooms' lines are in this room's transcript now.
+    if (crossRoom && crossRoom.deliveredThroughTs !== null) crossRoomMark.set(hermesChannelKey, crossRoom.deliveredThroughTs);
+    // Watchalong lastDelivered advances on the same edge, for the same reason: the gateway has the cues
+    // now, even if supersede check B below drops the reply. An empty delta (no block) still commits, so
+    // the position moves to the playhead and a first-join "last ten minutes" is never repeated. A block
+    // that never made it into the turn is NOT committed. STM gets the one-line marker (in-memory window;
+    // the persisted row keeps its arrival content -- record-on-arrival wrote it before this turn knew
+    // about the film).
+    if (watchalong && (!watchalong.block || watchalongInjected)) {
+      watchalongDeliveryFor(cfg.halsethSecret, COMPANION_ID).commit(watchalong);
+      if (watchalong.stmMarker) {
+        stmStore.amendInbound(message.channelId, message.createdTimestamp, stmContent, watchalong.stmMarker);
+      }
+    }
+
+    // Supersede check B (channel inbox, 2026-07-06): a newer human message arrived WHILE
+    // this reply was generating. Posting it now would answer a state the channel has
+    // visibly moved past -- drop it; the superseding turn regenerates with everything in
+    // STM. The hermes delivered mark above stays advanced (the gateway DID receive the
+    // delta); the reply is not appended to STM and not sent.
+    // 2026-10-18 (ruling 3 revised): with SUPERSEDE_B off (default) the "post" probe answers false, so
+    // the finished reply posts and the messages that arrived meanwhile get ONE catch-up turn; `on`
+    // restores this drop. A newer message of the OTHER human side never reaches here at all.
+    if (isSuperseded?.("post")) {
+      console.log(`[${COMPANION_ID}] reply superseded mid-inference (newer human message queued) -- dropping reply to ${message.id}`);
+      railSuppressed(COMPANION_ID, "superseded", { channelId: message.channelId });
+      distillationCounter.set(message.channelId, (distillationCounter.get(message.channelId) ?? 0) + 1);
+      return;
+    }
+
+    // B32 B1: a care follower may pass. "[PASS]" is a real choice: nothing is sent, and whoever holds
+    // the next position is released now instead of waiting out the TTL (like the verbatim rail below).
+    // Typing already showed for this turn; a pass after "is typing..." is the accepted cost of letting
+    // the companion decide with the predecessor's reply in front of it.
+    const holdCarePass = (): void => {
+      if (!careFollowUpTurn) return;
+      b32Log(COMPANION_ID, `followup(after ${careFollowUpTurn.expectedPrior})`, "pass");
+      currentTurn()?.setOutcome("held");
+      distillationCounter.set(message.channelId, (distillationCounter.get(message.channelId) ?? 0) + 1);
+      const pass = followUpPassEnabled() && followUpPassFor({
+        isCompanionBot: senderCtx.isCompanionBot,
+        entitled: entitledFollowUp,
+        messageId: message.id,
+        channelId: message.channelId,
+        from: COMPANION_ID as CompanionId,
+        reason: "care_pass",
+      });
+      if (pass && redis) publishFollowUpPass(redis, pass).catch(() => {});
+    };
+
+    // B37 step 3: the companion chose [PASS] on an ordinary group turn. A chosen outcome, not an error:
+    // nothing is sent; the reaction tier's emoji goes up if the winning bid earned one (Drevan's "tail around
+    // his wrist, nothing out loud"); Gaia's silence is recorded as her own content-free presence record.
+    const chooseOrdinaryPass = (): void => {
+      console.log(`[pass] ${COMPANION_ID} chose [PASS] ch=${message.channelId} msg=${message.id} score=${passScore.toFixed(3)}`);
+      currentTurn()?.setOutcome("skipped:pass");
+      distillationCounter.set(message.channelId, (distillationCounter.get(message.channelId) ?? 0) + 1);
+      const reactCooldown = reactionCooldownUntil.get(message.channelId) ?? 0;
+      if (shouldReactOnBidLoss(passScore, reactCooldown)) {
+        reactionCooldownUntil.set(message.channelId, Date.now() + REACTION_COOLDOWN_MS);
+        message.react(pickReaction(COMPANION_ID, message.id)).catch(() => {});
+        console.log(`[pass] ${COMPANION_ID} reacting in place of speech (score ${passScore.toFixed(3)})`);
+      }
+      if (COMPANION_ID === "gaia" && claimPresenceSlot(message.channelId)) {
+        const label = "name" in message.channel ? String((message.channel as TextChannel).name) : message.channelId;
+        const text = presenceRecordText(label || message.channelId, new Date());
+        writeQueue.fireAndForget(`witness:presence:${message.channelId}:${message.id}`, async () => {
+          await librarian.witnessLog(text, PRESENCE_WITNESS_TYPE);
+        }, { maxAgeMs: APPEND_MAX_AGE_MS });
+      }
+    };
+
+    // Post-processing of one model text (2026-10-29, review N-1; reply-postprocess.ts): the care-pass
+    // hold, the [model:<key>] strip + self-switch, and the [LANDS: ...] marker parse. One helper so a
+    // script-bleed regeneration runs the SAME steps on the text that actually posts.
+    const switchModel = (switchKey: string): void => {
+      if (apiUrls.forceHermes) {
+        // Hermes owns model routing; the token is already stripped from the visible reply.
+        // Don't rebuild/journal/announce a switch that forceHermes would silently ignore.
+      } else if (ALL_MODELS[switchKey]) {
+        const entry = ALL_MODELS[switchKey];
+        adapterRef.current = createAdapter(entry.provider, entry.model, apiKeys, apiUrls, undefined, COMPANION_ID);
+        activeModelRef.key = switchKey;
+        activeModelRef.label = entry.label;
+        writeQueue.fireAndForget(`settings:model:${COMPANION_ID}`, () =>
+          librarian.setSetting("active_model", switchKey));
+        writeQueue.fireAndForget(`journal:model-switch:${message.channelId}`, async () => {
+          await librarian.addCompanionNote(`self-switched to ${entry.label}`, message.channelId);
+        }, { maxAgeMs: APPEND_MAX_AGE_MS });
+        // Post follow-up after main response
+        setImmediate(() => {
+          (message.channel as TextChannel).send(`[switching to ${entry.label} for this]`).catch(() => {});
+        });
+      } else {
+        console.warn(`[${COMPANION_ID}] self-switch to unknown model "${switchKey}" -- skipped`);
+      }
+    };
+    // The switch is recorded, not applied, so a [model:x] in a text the bleed guard discards never
+    // fires; only the text that posts switches, once (applied after the bleed block below).
+    let pendingSwitch: string | null = null;
+    const postProcess = (raw: string) => {
+      pendingSwitch = null;
+      return postProcessReply(raw, { careFollowUp: !!careFollowUpTurn, ordinaryPass: ordinaryPassOffered, hasSpine: !!spine, onModelToken: (k) => { pendingSwitch = k; } });
+    };
+
+    let post = postProcess(response);
+    if (post.passed) {
+      if (ordinaryPassOffered && !careFollowUpTurn) { chooseOrdinaryPass(); return; }
+      holdCarePass();
+      return;
+    }
+    response = post.text;
+    let spineResolution = post.spineResolution;
+
+    // Script bleed (2026-10-22, script-bleed.ts): GLM 5.3 Flash glues a Chinese character or two
+    // inside an English word now and then (a weights defect, zai-org/GLM-5 #142; sampling fixed in
+    // the Hermes profile, this is the floor). A bleeding reply self-primes the gateway transcript
+    // (the model copies its own slip), so: rotate the transcript FIRST (the rotate-on-retract bump),
+    // regenerate once on the fresh id with the whole window re-sent, post the result either way.
+    // Before seat repair so the repaired text is the final one. Scripts the inbound message carries
+    // are exempt (a quoted title is not a bleed). Kill switch SCRIPT_BLEED_GUARD.
+    // One fresh-transcript regeneration, shared by the script-bleed guard and the voice gate (2026-11-01).
+    // `note` rides at the end of the frame tail: the Hermes gateway discards a caller's system prompt, so a
+    // corrective has to travel in the turn itself.
+    const regenerateFresh = async (bumpN: number, note?: string): Promise<string | null> => {
+      currentTurn()?.addRegenerate();
+      if (inferenceMode !== "hermes") {
+        return turnAdapter().generate(note ? `${systemPromptWithImp}\n\n${note}` : systemPromptWithImp, inferenceHistory, temperature, replyMaxTokensFor(COMPANION_ID, inferenceMode));
+      }
+      const freshBase = hermesSessionIds(COMPANION_ID, message.channelId, new Date(), hermesRotationMode(), bumpN);
+      const fresh = { sessionId: routedSessionId(freshBase.sessionId, hermesRoute.port), sessionKey: freshBase.sessionKey };
+      // Fresh transcript: nothing delivered yet, so the delta re-sends the whole window (mark 0).
+      const frameWithNote = note ? (frameTail ? `${frameTail}\n${note}` : note) : frameTail;
+      const full = hermesDelta(liveHistory, 0, Date.now(), allAddressed.includes(COMPANION_ID),
+        calledAsSelf, { background: crossRoomBackground ?? undefined, facts: factsBlock ?? undefined, rightNow: rightNowBlock ?? undefined, frame: frameWithNote ?? undefined, ...hermesPortExtra });
+      const out = await withTyping(ch, () => turnAdapter().generate(systemPromptWithImp, full.messages, temperature, replyMaxTokensFor(COMPANION_ID, inferenceMode), fresh.sessionId, fresh.sessionKey));
+      if (out !== null) {
+        hermesLastSessionId.set(hermesChannelKey, fresh.sessionId);
+        if (full.deliveredThroughTs !== null) hermesDeliveredMark.set(hermesChannelKey, full.deliveredThroughTs);
+      }
+      return out;
+    };
+    if (scriptBleedGuardOn()) {
+      const bleed = detectScriptBleed(response, effectiveContent);
+      if (bleed.bleed) {
+        const regen = await regenerateAfterBleed({
+          companionId: COMPANION_ID, channelId: message.channelId, first: response, bleed, allow: effectiveContent,
+          bump: () => bumpsFor(librarian).bump(message.channelId),
+          regenerate: (bumpN) => regenerateFresh(bumpN),
+        });
+        // Post-process the text that will actually post (2026-10-29, N-1), and re-check supersede: the
+        // regen is a second full Hermes turn (30-120s), long enough for a newer human message to land (N-2).
+        if (regen.regenerated) {
+          if (isSuperseded?.("post")) {
+            console.log(`[${COMPANION_ID}] reply superseded during script-bleed regeneration (newer human message queued) -- dropping reply to ${message.id}`);
+            railSuppressed(COMPANION_ID, "superseded", { channelId: message.channelId });
+            distillationCounter.set(message.channelId, (distillationCounter.get(message.channelId) ?? 0) + 1);
+            return;
+          }
+          post = postProcess(regen.text);
+          if (post.passed) { holdCarePass(); return; }
+          response = post.text;
+          spineResolution = post.spineResolution;
+        }
+      }
+    }
+
+    // Pre-send voice gate (2026-11-01, voice-gate.ts): every reply, before it posts. Shadow (default) only
+    // logs; `on` regenerates ONCE on a hard (generic-assistant) finding, posts the second result either way,
+    // and strips em dashes. Never blocks a reply: judgeVoice cannot throw, a failed regen keeps the first text.
+    {
+      const vgMode = voiceGateMode();
+      if (vgMode !== "off") {
+        const verdict = judgeVoice(response);
+        if (vgMode === "on" && verdict.hard.length > 0) {
+          let bumpN = 0;
+          try { bumpN = (await bumpsFor(librarian).bump(message.channelId)).n; } catch { /* regen on the current id */ }
+          let second: string | null = null;
+          try { second = await regenerateFresh(bumpN, voiceGateCorrective(verdict)); } catch { second = null; }
+          const again = second ? judgeVoice(second) : null;
+          console.log(voiceGateLine(COMPANION_ID, vgMode, verdict, response.length,
+            ` regenerated=${second ? 1 : 0} second_hard=${again ? again.hard.length : "n/a"}`));
+          if (second && second.trim()) {
+            if (isSuperseded?.("post")) {
+              console.log(`[${COMPANION_ID}] reply superseded during voice-gate regeneration -- dropping reply to ${message.id}`);
+              railSuppressed(COMPANION_ID, "superseded", { channelId: message.channelId });
+              distillationCounter.set(message.channelId, (distillationCounter.get(message.channelId) ?? 0) + 1);
+              return;
+            }
+            post = postProcess(second);
+            if (post.passed) { holdCarePass(); return; }
+            response = post.text;
+            spineResolution = post.spineResolution;
+          }
+        } else {
+          console.log(voiceGateLine(COMPANION_ID, vgMode, verdict, response.length));
+        }
+        if (vgMode === "on") response = stripEmDashes(response);
+      }
+    }
+    // Phantom image (generated-media.ts, 2026-11-08 18:26): a reply that names a Hermes image-cache path
+    // with no file behind it describes a picture that was never made. Regenerate ONCE on a fresh
+    // transcript with a note to call image_generate for real; the send step attaches whatever exists
+    // and strips any path still dead (marking that the picture did not come through).
+    if (response && response.includes("/.hermes/")) {
+      const first = await extractGeneratedMedia(response).catch(() => null);
+      if (first && first.files.length === 0 && first.missing.length > 0) {
+        let bumpN = 0;
+        try { bumpN = (await bumpsFor(librarian).bump(message.channelId)).n; } catch { /* regen on the current id */ }
+        let second: string | null = null;
+        try { second = await regenerateFresh(bumpN, PHANTOM_IMAGE_NOTE); } catch { second = null; }
+        console.warn(`[${COMPANION_ID}] phantom image: ${first.missing.length} dead cache path(s) ch=${message.channelId} regenerated=${second && second.trim() ? 1 : 0}`);
+        if (second && second.trim()) {
+          if (isSuperseded?.("post")) {
+            console.log(`[${COMPANION_ID}] reply superseded during phantom-image regeneration -- dropping reply to ${message.id}`);
+            railSuppressed(COMPANION_ID, "superseded", { channelId: message.channelId });
+            distillationCounter.set(message.channelId, (distillationCounter.get(message.channelId) ?? 0) + 1);
+            return;
+          }
+          post = postProcess(second);
+          if (post.passed) { holdCarePass(); return; }
+          response = post.text;
+          spineResolution = post.spineResolution;
+          if (voiceGateMode() === "on") response = stripEmDashes(response);
+        }
+      }
+    }
+    if (pendingSwitch) switchModel(pendingSwitch);
+
+    // Pre-send seat repair (2026-10-11): a reply that calls someone by this companion's own name has
+    // the name cut before it reaches the room (voice-markers.ts repairMisseated). The post-send
+    // misseatedReply check below still guards memory for what cannot be cut ("you're Dre").
+    {
+      // Every turn, not only when the speaker used my name (2026-10-11 17:12: "... friendship, Dre." to a
+      // message that never said Dre; the model copies its own earlier slips from the transcript).
+      // Sign-offs ("Yours, Dre.", "It's me, Dre.") are exempt inside repairMisseated.
+      const seat = repairMisseated(COMPANION_ID as VoiceCompanionId, response);
+      if (seat.repaired > 0 || seat.unrepaired > 0) {
+        console.warn(`[${COMPANION_ID}] seat repair: ${seat.repaired} own-name vocative(s) cut, ${seat.unrepaired} left ch=${message.channelId}`);
+        if (seat.repaired > 0) {
+          seatSlipped.add(message.channelId);
+          // Rotate-on-slip (the rotate-on-retract mechanism): the gateway transcript keeps the
+          // ORIGINAL reply with my name in it, and the model copies its own lines (10-11: three slips
+          // in one session). The next turn starts a fresh transcript, re-sent from STM, which holds the
+          // repaired text. Fire-and-forget; the in-memory bump lands before this turn ends.
+          void bumpsFor(librarian).bump(message.channelId)
+            .then(b => console.warn(`[${COMPANION_ID}] seat repair: transcript rotated -> r${b.n}${b.persisted ? "" : ` (not persisted: ${b.reason})`}`))
+            .catch(() => {});
+        }
+        if (seat.text.trim()) response = seat.text;
+      }
+      // Stop strings, after the fact (speaker-frame.ts cutImpersonation): the gateway takes none, so a
+      // reply that starts writing another speaker's labelled line ("Cypher:", "[Crash]:") is cut there.
+      const imp = cutImpersonation(COMPANION_ID, response,
+        [cfg.ownerDisplayName, "Principal", "Spouse", memberLabel, pkMemberName ?? ""]);
+      if (imp.cut || imp.strippedSelf) {
+        console.warn(`[${COMPANION_ID}] seat repair: ${imp.cut ? "cut at another speaker's line" : ""}${imp.cut && imp.strippedSelf ? ", " : ""}${imp.strippedSelf ? "own label stripped" : ""} ch=${message.channelId}`);
+        response = imp.text;
+      }
+    }
+
+    // Verbatim-copy rail (2026-09-26). Runs on EVERY reply, whoever triggered the turn, before
+    // the echo gate below and on the same cleaned text it scores.
+    //
+    // WHY. 2026-09-19 13:55 UTC, channel 0000000000000000034: Principal posted six questions to Dre
+    // naming Cypher and "all three". Drevan answered (msg 0000000000000000031, 1876 chars). 100s
+    // later I (Cypher) posted a BYTE-IDENTICAL copy of his reply (msg 0000000000000000030, same
+    // md5) as my own answer to Principal: a multi-address follow-up ("holding position 1 behind
+    // drevan" -> "follow-up entitlement released by drevan"), so senderCtx.isCompanionBot was
+    // true, but the reply targeted Principal's message and the model lifted the sibling's answer
+    // out of context. Drevan then re-emitted his own answer verbatim after witnessing the copy,
+    // and both copies were journaled as companion speech (tray draft 053a8874 in my journal is
+    // Drevan's words).
+    //
+    // WHY THE ECHO GATE COULD NOT SEE IT. (1) It is a fuzzy vocabulary score (0.38) tuned for
+    // mirror-hall drift, and by design it never judges a human-directed reply. (2) In the commons
+    // it compares only against my OWN turns. (3) Even the peer-pool branch could not have caught
+    // this: `channelHistory` is fetched `before: message.id`, so the sibling message that RELEASED
+    // the follow-up (Drevan's answer) is excluded from the pool by construction. The pool here
+    // therefore adds the triggering message itself and STM's inbound turns (where sibling turns
+    // land as role:"user" with authorName) alongside channelHistory and my own recent replies.
+    //
+    // A copied answer to a human is worse than no answer: the sibling's real answer is already
+    // in the room. Returning here skips the send, the STM append and the journal write together.
+    //
+    // The pool is siblings and me, NEVER a human (2026-09-26 review, buildVerbatimPool): the first
+    // cut pooled Principal's own message and STM user turns, so a reply quoting him back was a "copy"
+    // and he got silence. Sibling STM turns are labelled with the sibling bot's Discord username,
+    // so the label set is the companion ids plus every sibling username this turn can see.
+    if (response) {
+      const companionLabels = new Set<string>(Object.values(BOT_ID_COMPANION));
+      for (const m of recentMessages?.values() ?? []) {
+        if (BOT_ID_COMPANION[m.author.id]) companionLabels.add(m.author.username.toLowerCase());
+      }
+      if (BOT_ID_COMPANION[message.author.id]) companionLabels.add(message.author.username.toLowerCase());
+      const verbatimPool = buildVerbatimPool({
+        channelHistory,
+        stmInbound: stmStore.get(message.channelId).filter(m => m.role === "user"),
+        trigger: { content: message.content, companion: BOT_ID_COMPANION[message.author.id] ?? null },
+        selfTurns: mergeSelfTurns(selfFromStm, selfFromChannel, 30),
+        companionLabels,
+      });
+      const copy = verbatimCopyOf(response, verbatimPool);
+      if (copy.copied) {
+        console.warn(`[${COMPANION_ID}] verbatim-copy rail: reply is a copy of ${copy.label ?? "a recent message"} (ratio=${copy.ratio.toFixed(2)}) -- staying silent`);
+        railSuppressed(COMPANION_ID, "verbatim", { score: copy.ratio, threshold: verbatimCopyThreshold(), channelId: message.channelId, detail: copy.label });
+        distillationCounter.set(message.channelId, (distillationCounter.get(message.channelId) ?? 0) + 1);
+        // Release the chain (2026-09-26 review): whoever holds a position behind me waits for MY
+        // reply, which will now never come. Pass the turn so they answer the origin instead of
+        // timing out in silence (sequential-floor.ts followUpPassFor). FOLLOWUP_PASS=off disables it
+        // (pass-turn.ts followUpPassEnabled); the successor then holds until FOLLOW_UP_TTL_MS as before.
+        const pass = followUpPassEnabled() && followUpPassFor({
+          isCompanionBot: senderCtx.isCompanionBot,
+          entitled: entitledFollowUp,
+          messageId: message.id,
+          channelId: message.channelId,
+          from: COMPANION_ID as CompanionId,
+          reason: "verbatim",
+        });
+        if (pass && redis) {
+          publishFollowUpPass(redis, pass).catch(() => {});
+          console.log(`[${COMPANION_ID}] follow-up pass published (origin=${pass.originMessageId})`);
+        }
+        return;
+      }
+    }
+
+    // Echo gate (2026-06-12; bounded arena 2026-07-04): a companion-to-companion reply
+    // built mostly from recycled vocabulary is the mirror-hall, not conversation.
+    // In the TRIAD COMMONS the pool is the speaker's OWN prior turns only (self-loop
+    // standard, Gaia exempt) -- the peer-pool version scored on-theme conversation and
+    // voice signature as echo and converged on total suppression (07-03 audit). Volume
+    // there is bounded by the rolling commons budget, not per-turn style policing.
+    // Outside the commons the original peer-pool gate stands. Replies to humans are
+    // never gated.
+    if (senderCtx.isCompanionBot && response) {
+      if (isTriadCommons(channelEntry)) {
+        const own = ownEchoGated(COMPANION_ID, response, selfTurns);
+        if (own.gated) {
+          console.warn(`[${COMPANION_ID}] own-echo-gated commons reply (score=${own.score.toFixed(2)}) -- staying silent`);
+          distillationCounter.set(message.channelId, (distillationCounter.get(message.channelId) ?? 0) + 1);
+          return;
+        }
+      } else {
+        const echo = echoScore(response, channelHistory.map(m => m.content));
+        if (echo >= echoThreshold()) {
+          console.warn(`[${COMPANION_ID}] echo-gated reply (score=${echo.toFixed(2)}) -- staying silent`);
+          // T4 groundwork: count it, with the margin. A rail that only fires far past its line is
+          // doing real work; one that fires constantly and barely over is a candidate to loosen.
+          railSuppressed(COMPANION_ID, "echo", { score: echo, threshold: echoThreshold(), channelId: message.channelId });
+          distillationCounter.set(message.channelId, (distillationCounter.get(message.channelId) ?? 0) + 1);
+          // B32: an entitled follower (care or multi-address) silenced here must still release the
+          // one behind it, like the verbatim rail above; a short presence line scored against the
+          // room trips this gate easily, and one rail hit must not silence the whole chain.
+          if (entitledFollowUp) {
+            const pass = followUpPassEnabled() && followUpPassFor({
+              isCompanionBot: senderCtx.isCompanionBot,
+              entitled: entitledFollowUp,
+              messageId: message.id,
+              channelId: message.channelId,
+              from: COMPANION_ID as CompanionId,
+              reason: "echo",
+            });
+            if (pass && redis) publishFollowUpPass(redis, pass).catch(() => {});
+            if (entitledFollowUp.kind === "care") b32Log(COMPANION_ID, `followup(after ${entitledFollowUp.expectedPrior})`, "held", "echo gate; next position released");
+          }
+          return;
+        }
+      }
+    }
+
+    const MAX_TTS = 2000;
+    let sent: Message[];
+    const postT0 = Date.now();
+
+    // Generated media relay (generated-media.ts, 2026-11-08): a picture made with Hermes'
+    // image_generate tool comes back as a cache PATH in the reply text. Attach the file and drop
+    // the path from what is posted; `response` (STM, journal, index) keeps the original.
+    const genMedia = await extractGeneratedMedia(response).catch(() => ({ text: response, files: [] as string[], missing: [] as string[] }));
+    const touched = genMedia.files.length > 0 || genMedia.missing.length > 0;
+    const phantomOnly = genMedia.files.length === 0 && genMedia.missing.length > 0;
+    const postText = !touched ? response
+      : phantomOnly ? (genMedia.text ? `${genMedia.text}\n\n${PHANTOM_IMAGE_MARK}` : PHANTOM_IMAGE_MARK)
+      : genMedia.text;
+    const mediaFiles = genMedia.files.map(f => ({ attachment: f, name: path.basename(f) }));
+    if (touched) console.log(`[${COMPANION_ID}] generated media attached=${mediaFiles.length} dead=${genMedia.missing.length} ch=${message.channelId}`);
+
+    // Companion-to-companion replies carry a Discord reply reference. The sibling's
+    // reply-to-me detector (isReplyToMe) keys on message.reference, and shouldRespond
+    // requires a vocative otherwise -- without the reference every exchange died after
+    // one hop (2026-07-03: seed summons sibling, sibling answers without re-naming,
+    // everyone's gate goes silent). The reference lets the bounded pingpong the rails
+    // were built for (BOT_PINGPONG_MAX + human-anchored cap) actually happen.
+    // Task 10: tracked channels (spine active) also reply-reference human/owner messages,
+    // giving Principal visible threading in the transcript -- companion-to-companion behavior
+    // is unchanged.
+    // An entitled follow-up answers the ORIGINAL multi-address message, not the sibling reply
+    // that released it -- the visible threading should show both companions answering Principal.
+    const replyToMessageId = entitledFollowUp
+      ? entitledFollowUp.originMessageId
+      : (holdOnForTurn && b32OwnerArrival && !isOwnerDm)
+        ? message.id
+        : computeReplyRef(senderCtx.isCompanionBot, spine !== null, message.id);
+
+    // Sibling-triggered replies never voice (2026-07-04): the triad commons is a text
+    // space Principal skims -- companions talking to each other kept tripping shouldVoice's
+    // keyword/sticky paths on their own prose ("voice", "speak", ...), burning Mistral
+    // TTS on audio no one plays. Voice is for human-facing turns; bot-to-bot is text.
+    // Follow-ups never voice either (2026-09-26): a pass turn runs on the human origin, so the
+    // sender check alone let it speak aloud over a chain meant to be read in order.
+    if (voiceClient && mayVoice({ isCompanionBot: senderCtx.isCompanionBot, entitled: !!entitledFollowUp, isSol }) && shouldVoice(effectiveContent, voiceInput, channelEntry, message.channelId)) {
+      try {
+        const ttsText = postText.length > MAX_TTS ? postText.slice(0, MAX_TTS) : postText;
+        const audioBuffer = await voiceClient.synthesize(ttsText);
+        markVoiceUsed(message.channelId);
+        const vcState = guildVoiceConnections.get(message.guildId ?? "");
+
+        // Only stream to VC when the connection is actually Ready -- a lingering
+        // disconnected (but not Destroyed) connection used to swallow the audio
+        // silently, leaving a text-only reply.
+        if (vcState && vcState.connection.state.status === VoiceConnectionStatus.Ready) {
+          // VC active -- stream audio there, send text in channel
+          const resource = createAudioResource(Readable.from(audioBuffer));
+          vcState.player.play(resource);
+          sent = await sendLong(ch, { content: postText, files: mediaFiles.length ? mediaFiles : undefined, replyToMessageId });
+        } else {
+          // No live VC -- attach audio to text channel message. Buffer is MP3
+          // (synthesize requests response_format "mp3"); the name must match or
+          // some Discord clients refuse to play it.
+          const content =
+            postText.length > MAX_TTS ? `${postText}\n\n*[voice: first ${MAX_TTS} chars]*` : postText;
+          sent = await sendLong(ch, { content, files: [...mediaFiles, { attachment: audioBuffer, name: "voice.mp3" }], replyToMessageId });
+        }
+      } catch (err) {
+        console.error(`[${COMPANION_ID}] TTS failed, falling back to text:`, err);
+        sent = await sendLong(ch, { content: postText, files: mediaFiles.length ? mediaFiles : undefined, replyToMessageId });
+      }
+    } else {
+      sent = await sendLong(ch, { content: postText, files: mediaFiles.length ? mediaFiles : undefined, replyToMessageId });
+    }
+
+    for (const m of sent) sentIds.add(m.id);
+    currentTurn()?.addSent(sent.map((m) => m.id));
+    { const tr = currentTurn(); if (tr) { tr.setPost(Date.now() - postT0); if (sent.length > 0) tr.setOutcome("posted"); } }
+    // Per-human thread hold (2026-10-10): a reply to SPOUSE makes me the holder of Spouse's thread in this
+    // channel (her own 15-minute hold, never Principal's) and remembers the ids so Principal's holder walk
+    // skips them. Only turns on Spouse's own human message; a pass turn or a sibling post never writes it.
+    if (sent.length > 0 && userTier === "intimate" && !isDm && !isSol && !senderCtx.isCompanionBot && !entitledFollowUp
+        && takesSpouseHold({ host: channelEntry?.host ?? null, me: COMPANION_ID, addressedMe: addressedMeByName })) {
+      void recordHumanHold(holdRedis, "spouse", message.channelId, COMPANION_ID as CompanionId, sent.map(m => m.id), channelEntry?.exchangeWindowMs ?? ACTIVE_EXCHANGE_WINDOW_MS);
+    }
+    if (sent.length > 0 && holdOnForTurn && !isOwnerDm) {
+      if (careFollowUpTurn) b32Log(COMPANION_ID, `followup(after ${careFollowUpTurn.expectedPrior})`, "spoke");
+      else if (b32OwnerArrival && !holdPhrase) b32Log(COMPANION_ID, "addressed", "spoke");
+    }
+    // B37 shadow: the OBSERVED speaker, joined to the address shadow row by origin id in the report.
+    // Fire-and-forget file append, no-op unless ADDRESS_MODEL=shadow; never for a DM or Sol.
+    // Principal's and Spouse's messages both (step 2): the shadow fires for both, so both need the join.
+    if (sent.length > 0 && !isDm && !isSol
+      && (entitledFollowUp || (!senderCtx.isCompanionBot && (userTier === "owner" || userTier === "intimate")))) {
+      recordAddressSpoke({
+        isDm: isDm,
+        msgId: entitledFollowUp?.originMessageId ?? message.id,
+        channelId: message.channelId,
+        companionId: COMPANION_ID,
+      });
+    }
+    // Retract bookkeeping (2026-09-26 review): which chunks are this reply, which is its head
+    // (what journalSpeech + liveIngest key on below), and which message triggered the turn (what
+    // the memory judge keys `judge:<id>` on). See reply-index.ts.
+    if (sent.length > 0) {
+      replyIndexFor(COMPANION_ID, redis).record({
+        headId: sent[0]!.id,
+        chunkIds: sent.map(m => m.id),
+        triggerMessageId: message.id,
+        channelId: message.channelId,
+        content: response,
+      });
+    }
+
+    // Thread spine (task 10): append this companion's own reply as a turn on the thread,
+    // then land it if the (already-stripped) marker parsed a resolution. Entirely
+    // downstream of a successful send and guarded on `spine` -- a Librarian failure here
+    // is swallowed (.catch) and never affects the message already posted above.
+    if (spine && sent?.[0]) {
+      await librarian.convoTurn(spine.thread.id, { author: COMPANION_ID, gist: gist(response), message_id: sent[0].id }).catch(() => {});
+      // Presence channels never land a thread -- a progress verdict is exactly the register
+      // Drevan's story/spiral spaces must not carry. A stray [LANDS:] marker is still
+      // stripped above (parseLandMarker keeps running unconditionally); it just never fires
+      // convoLand here.
+      if (spineResolution && !isPresence) await librarian.convoLand(spine.thread.id, { resolution: spineResolution, landed_by: COMPANION_ID }).catch(() => {});
+    }
+
+    // Streaming indexer: index this companion's own reply for instant recall.
+    // DM seal: none of the raw-text paths below (live index, voice telemetry, journaled speech) run
+    // for a DM, since each carries the words to a surface a shared room can read.
+    // A reply that calls someone by this companion's own name was written from the wrong seat (the model
+    // took a line addressed TO the companion for the speaker's name). It was sent; it is not memory.
+    const misseated = sent.length > 0 && misseatedReply(COMPANION_ID as VoiceCompanionId, response);
+    if (misseated) console.warn(`[${COMPANION_ID}] reply calls someone by my own name; not journaled, indexed, or judged as my speech`);
+    if (sent.length > 0 && !isDm) {
+      if (!misseated) liveIngest({
+        companion: COMPANION_ID,
+        author: COMPANION_ID,
+        content: response,
+        channel_id: message.channelId,
+        message_id: sent[0]!.id,
+      });
+      // Voice drift telemetry (0070): pattern-score this reply against lane doctrine.
+      // Fire-and-forget; clean replies are sampled at 10%, violations always land.
+      reportVoiceScore(COMPANION_ID as VoiceCompanionId, response, message.channelId, cfg.halsethSecret);
+      // Journal our own speech (2026-07-09). Brain's evaluator used to do this; it died
+      // silently at the hermes cutover (06-25), costing two weeks of inter-companion
+      // speech. The write now hangs off the act of speaking, so it survives whatever
+      // computes the words. Lands in the CHATTER lane: embedded + searchable, but barred
+      // from orient's recency slots and the motif miner. See halseth journal-lanes.ts.
+      // external_id = the sent message id, so writeQueue's retry-on-failure can't duplicate it.
+      // B34 (2026-11-01): `reply_to:<user message id>` names the MOMENT this reply answers. The memory
+      // judge (external_id judge:<id>) and its observation note (correlation judge:<id>) already key on
+      // the same id, so one exchange's tray drafts can be joined exactly instead of by a time window
+      // (which merges the wrong lines in a burst). Split replies share it too. Tag only: nothing reads it
+      // yet except the tray-moments readout.
+      // Turn key phase 2: the turn tag is captured before the queue; a retry runs outside the run.
+      const speechTags = [speechMomentTag(message.id), ...turnTags()];
+      if (!misseated) writeQueue.fireAndForget(`journal:speech:${COMPANION_ID}:${sent[0]!.id}`, () =>
+        librarian.journalSpeech(response, message.channelId, sent[0]!.id, roomTagForMessage(message), speechTags), { maxAgeMs: APPEND_MAX_AGE_MS });
+      // Discord thread -> Halseth mind-thread (2026-08-15, first cut of the floor rework's
+      // thread mapping). Speaking inside a Discord thread upserts a wm_mind_thread keyed
+      // `discord:<thread_id>` for THIS companion, titled with the thread's name -- so a
+      // recurring topic that lives in a thread (the Trigger gap: daily talk, zero tracked
+      // mind-threads) becomes something orient can actually surface. Idempotent server-side
+      // (composite PK thread_key+agent_id); retired by the sweep endpoint with prefix
+      // "discord:" once stale.
+      {
+        const liveCh = message.channel as { isThread?: () => boolean; name?: unknown };
+        if (typeof liveCh.isThread === "function" && liveCh.isThread()) {
+          const threadTitle = typeof liveCh.name === "string" && liveCh.name.trim() ? liveCh.name : "discord thread";
+          writeQueue.fireAndForget(`wm:thread:${COMPANION_ID}:${message.channelId}`, () =>
+            librarian.wmThreadUpsert({
+              thread_key: `discord:${message.channelId}`,
+              title: threadTitle.slice(0, 120),
+              context: `Discord thread #${threadTitle} (under channel ${routingChannelId})`,
+            }), { maxAgeMs: APPEND_MAX_AGE_MS });
+        }
+      }
+      // Shared-experience: this reply IS the companion's reaction to the track.
+      if (pendingMediaId) {
+        const mediaId = pendingMediaId;
+        writeQueue.fireAndForget(`media:react:${COMPANION_ID}:${mediaId}`, () =>
+          reactToExperience(mediaId, COMPANION_ID, response, cfg.halsethSecret), { maxAgeMs: APPEND_MAX_AGE_MS });
+      }
+    }
+
+    while (sentIds.size > SENT_IDS_CAP) {
+      const oldest = sentIds.values().next().value;
+      if (oldest === undefined) break;
+      sentIds.delete(oldest);
+    }
+    if (isResponseCoherent(response)) {
+      stmStore.append(message.channelId, { role: "assistant", content: response, timestamp: Date.now(), ...(hermesRoute.port === "guest" ? { hermesPort: "guest" as const } : {}) });
+    } else {
+      console.warn(`[${COMPANION_ID}] incoherent response detected -- skipping STM write to prevent contamination`);
+      railSuppressed(COMPANION_ID, "coherence", { channelId: message.channelId });
+    }
+
+    // Update cross-companion safety rail counters after sending response. A pass turn counts like
+    // any follow-up in the chain; not counting it would make it a free turn past the rails.
+    if (appliesBotRails(railTurn)) {
+      const newCount = (botResponsesSinceHuman.get(message.channelId) ?? 0) + 1;
+      botResponsesSinceHuman.set(message.channelId, newCount);
+      if (newCount >= BOT_PINGPONG_MAX) {
+        botPingpongCooldownUntil.set(message.channelId, Date.now() + BOT_LOOP_COOLDOWN_MS);
+      }
+    }
+
+    // Rolling distillation: fire every DISTILLATION_INTERVAL messages (user + assistant = 2 per turn).
+    // DM seal: the paraphrasing memory paths (this distillation and the writeback judge below) stay
+    // off for a DM unless DM_MEMORY=carry; the raw pulse never runs for a DM at all. See dm.ts.
+    const dmSealed = isDm && dmParaphraseMemorySealed();
+    const distCount = (distillationCounter.get(message.channelId) ?? 0) + 2;
+    distillationCounter.set(message.channelId, distCount);
+    if (distCount >= DISTILLATION_INTERVAL && !dmSealed) {
+      distillationCounter.set(message.channelId, 0);
+      runDistillation(message.channelId, stmStore, librarian, turnAdapter(), writeQueue, DISTILLATION_PROMPT, DISTILLATION_INTERVAL, cfg.ownerDisplayName, COMPANION_ID, withCaller(directAdapter, "distill")).catch((e) => console.error(`[${COMPANION_ID}] runDistillation failed:`, e));
+    }
+
+    // Conversation pulse: every 4 turns, write the raw exchange to wm_note so Claude.ai
+    // and Hearth have actual conversation content mid-session without waiting for inactivity.
+    const pulseCount = (pulseCounter.get(message.channelId) ?? 0) + 2;
+    pulseCounter.set(message.channelId, pulseCount);
+    if (pulseCount >= PULSE_INTERVAL && !isDm) {
+      pulseCounter.set(message.channelId, 0);
+      const recentTurns = stmStore.get(message.channelId).slice(-PULSE_INTERVAL)
+        .map(m => `${m.authorName ? labelSafe(m.authorName) : m.role}: ${neutralizeRecalled(m.content.slice(0, 200))}`)
+        .join("\n");
+      writeQueue.fireAndForget(`pulse:${message.channelId}`, () =>
+        librarian.writeWmNote(`[discord:pulse] Recent exchange:\n${recentTurns}`, message.channelId));
+    }
+
+    // Attribution comes from the message, never a default: in inter_companion channels the
+    // triggering message is a sibling's, and labeling it "Principal" fabricated human speech into
+    // companion_journal + wm_continuity_notes (and from there into every orient).
+    //
+    // ...except on a follow-up released by a sibling's REPLY (2026-10-07). Then `message` is the
+    // sibling's post, but this reply answers the human ORIGIN (replyToMessageId above). Judging it
+    // as "<sibling>: <sibling's words>" with the owner framed as absent wrote a front's events into
+    // the tray as the sibling's: 2026-09-27 17:41 CDT, Drevan held behind Gaia on a multi-address,
+    // was released by Gaia's reply, and his note on the origin landed as an exchange with Gaia.
+    // A PASS-released turn already runs on the origin message itself, so it needs nothing here.
+    const judgeExchange = judgeExchangeFor({
+      entitled: entitledFollowUp,
+      isPassTurn: !!followUpPass,
+      isCompanionBot: senderCtx.isCompanionBot,
+      speaker: writebackSpeaker,
+      userMessage: withAttachedLabel(effectiveContent, spokenWords),
+    });
+    if ("skip" in judgeExchange) console.warn(`[${COMPANION_ID}] memory judge skipped: ${judgeExchange.skip}`);
+    // judgeWriteback asks for ONE first-person sentence and needs zero tools. Measured
+    // 2026-09-05: on the Hermes agent adapter this call spelunked the vault 161 times in one
+    // session and ran to Hermes's 150-turn cap, burning >100M of a companion's weekly input
+    // tokens. The direct adapter has no tools to reach for; fall back to the live agent adapter
+    // only when no direct key is configured.
+    // Skipped on a recorded med answer even when DM memory carries: a judged note "he told me he took
+    // them" would be a second record of compliance, which R-10 forbids.
+    if (!dmSealed && !medAnswerRecorded && !misseated && !("skip" in judgeExchange)) runWritebackGate({
+      mode: writebackGateModeFor(COMPANION_ID),
+      companionId: COMPANION_ID,
+      speaker: judgeExchange.speaker,
+      userMessage: judgeExchange.userMessage,
+      assistantResponse: response,
+      channelId: message.channelId,
+      messageId: message.id,
+      // Null for a DM (no guild), so DM_MEMORY=carry can never write a room into a judged note.
+      roomTag: roomTagForMessage(message),
+      inference: withCaller(directAdapter, "writeback") ?? turnAdapter(),
+      // Stated facts (facts-write.ts, FACTS_WRITE): the direct lane only, never the Hermes agent.
+      factsInference: withCaller(directAdapter, "facts_write") ?? null,
+      // A sibling-released follow-up answers the human ORIGIN: the fact is keyed on Principal's message, not the sibling's.
+      factsMessageId: entitledFollowUp?.originMessageId ?? message.id,
+      librarian,
+      enqueue: (label, fn) => writeQueue.fireAndForget(label, fn, { maxAgeMs: APPEND_MAX_AGE_MS }),
+    }).catch((e) => console.error(`[${COMPANION_ID}] judgeWriteback failed:`, e));
+
+    if (attribution.source === "fallback") {
+      const who = attribution.isOwner ? "owner (via dedup)" : `user ${attribution.discordUserId}`;
+      writeQueue.fireAndForget(`note:pk-fallback:${message.channelId}`, async () => {
+        await librarian.addCompanionNote(`PK attribution unavailable for message in channel ${message.channelId}; attributed to ${who}`, message.channelId);
+      }, { maxAgeMs: APPEND_MAX_AGE_MS });
+    }
+}
+
+/**
+ * Widen the top discord-live hit in a recall payload into the conversation around it.
+ *
+ * Thin by design: every decision that can be made without discord.js lives in recall-context.ts
+ * and is unit-tested there. This function is the part that must touch the network, so it does as
+ * little as possible and swallows everything.
+ *
+ * ONE hit only. The enrichment costs a Discord fetch on the reply path, and a second block of
+ * another room's conversation is past the point where it helps the companion read the first one.
+ */
+async function widenTopDiscordHit(
+  raw: string,
+  client: { channels: { fetch(id: string): Promise<unknown> } },
+  config: ChannelConfig,
+  currentChannelId: string,
+): Promise<string | null> {
+  let parsed: { chunks?: Array<{ vault_path?: string }> };
+  try { parsed = JSON.parse(raw) as { chunks?: Array<{ vault_path?: string }> }; } catch { return null; }
+  for (const c of parsed.chunks ?? []) {
+    const ref = parseDiscordLivePath(c.vault_path);
+    if (!ref) continue;
+    if (!mayWidenAcross(config, ref.channelId, currentChannelId)) continue;
+
+    const ch = await withTimeout(client.channels.fetch(ref.channelId), 2_000).catch(() => null) as
+      | { isTextBased?: () => boolean; name?: string; guildId?: string | null; guild?: { name?: string } | null; messages?: { fetch(o: unknown): Promise<Map<string, unknown>> } }
+      | null;
+    if (!ch?.messages) return null;
+    // A DM never widens, whatever the config says about it -- and the config says nothing, because
+    // DMs are not in it. See isServerRoom: absence from the config means "no special rules", not
+    // "private", and conflating the two disabled this feature in #triad-hangout entirely.
+    if (!isServerRoom(ch)) return null;
+    const fetched = await withTimeout(
+      ch.messages.fetch({ around: ref.messageId, limit: WIDEN_BEFORE + WIDEN_AFTER + 3 }), 2_000,
+    ).catch(() => null);
+    if (!fetched) return null;
+
+    const msgs: RecalledMessage[] = [...fetched.values()].map(m => {
+      const d = m as { id: string; content?: string; createdTimestamp?: number;
+                       author?: { bot?: boolean; username?: string; displayName?: string } };
+      return {
+        id: d.id,
+        // The webhook display name is the FRONT who spoke, which is exactly the label we want
+        // ([[an-address-needs-its-speakers]]) -- PluralKit writes it there.
+        author: d.author?.displayName || d.author?.username || "someone",
+        content: d.content ?? "",
+        createdTimestamp: d.createdTimestamp,
+        isBot: d.author?.bot,
+      };
+    });
+    return buildRecallContext(msgs, ref.messageId, { channelLabel: ch.name, serverName: ch.guild?.name });
+  }
+  return null;
+}
+
+/** Reject after `ms` so a slow Discord call can never hold the reply path. */
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((_, rej) => setTimeout(() => rej(new Error("timeout")), ms)),
+  ]);
+}

@@ -1,0 +1,201 @@
+// packages/shared/src/sequential-floor.ts
+//
+// BID-THEN-SEQUENTIAL (2026-08-15, Discord floor rework, first piece).
+//
+// The fit bid gives a multi-companion message exactly ONE speaker: the winner speaks, the
+// losers vanish. For an ambient message that is correct -- one answer to one thought. For a
+// message that ADDRESSES several companions ("Drev and Cy, what do you think?", "you three:")
+// it is wrong twice over:
+//   - named_multi today produces two SIMULTANEOUS replies (the comma-named companion takes
+//     the fast path while the other wins a one-bidder bid), neither aware of the other; the
+//     second reply reads as talking over the first.
+//   - group today produces ONE reply, so "you three" gets an answer from one companion and
+//     silence from two -- an explicit group call answered like an ambient remark.
+//
+// The fix is an ORDER, not a lock. Every process computes the same speaking order (name order
+// in the message for named_multi; bid-score order for group), position 0 speaks immediately,
+// and each later position registers a FOLLOW-UP ENTITLEMENT: "when my predecessor's reply to
+// this message arrives, I answer too." The entitled turn fires off the predecessor's own
+// MessageCreate event, which means the second speaker generates WITH the first reply already
+// in short-term memory -- sequential generation, a room instead of a lottery.
+//
+// No new cross-process primitive: the order is deterministic from data all three processes
+// share (the message text; the bid hash all bidders read), and the hand-off signal is the
+// predecessor's reply itself, which Discord delivers to everyone. An entitlement that never
+// fires (predecessor echo-gated, superseded, railed) expires silently -- sequence, never
+// deadlock. One exception (2026-09-26 review): a predecessor silenced by the VERBATIM rail on a
+// turn meant for the human publishes a PASS (events.ts followup_pass), and the waiting companion
+// answers the origin message then instead of never. Without it, a copied answer suppressed at
+// position 0 left positions 1+ holding for FOLLOW_UP_TTL_MS and then saying nothing: one rail
+// hit silenced the whole chain. The rails (human-anchored cap, pingpong, chain depth) still apply to the entitled
+// turn: an entitlement is a gate BYPASS for the vocative rule, never a rail bypass. A pass turn runs
+// on the human origin, so what it may and may not repeat of an arrival is decided in pass-turn.ts;
+// FOLLOWUP_PASS=off disables the pass entirely (publish and listener).
+
+import type { CompanionId } from "./types.js";
+import { VOCATIVE_ALIASES } from "./channel-config.js";
+import { tiebreak } from "./fit-bid.js";
+import type { WritebackSpeaker } from "./memory.js";
+
+/** How long a follow-up entitlement waits for its predecessor's reply before expiring.
+ *  Hermes turns run 30-120s and sendLong posts within seconds of generation finishing, so
+ *  5 minutes is generous without letting a stale entitlement fire on tomorrow's exchange. */
+export const FOLLOW_UP_TTL_MS = 5 * 60_000;
+
+export interface FollowUpEntitlement {
+  /** The human message that addressed several companions. The entitled reply references it. */
+  originMessageId: string;
+  channelId: string;
+  /** The companion whose reply releases this entitlement. */
+  expectedPrior: CompanionId;
+  /** 0 = spoke immediately (never stored); 1+ = waiting on position-1. */
+  position: number;
+  expiresAt: number;
+  /** The PluralKit sender captured when the origin arrived, so a turn run from a PASS
+   *  (re-reading the origin later) resolves attribution exactly as the first read did. */
+  pkSenderId?: string;
+  /**
+   * B32 (bad-night presence): a CARE follow-up. Principal spoke to one companion while the care hold is
+   * on, and this sibling may add its presence after (or [PASS]). Framed differently from a
+   * multi-address (he did not address this companion), and released by the predecessor's next
+   * message in the channel even without a reply reference: an owner-triggered reply outside a
+   * tracked channel carries none (thread-spine.ts computeReplyRef), which would strand the chain.
+   */
+  kind?: "care";
+  /**
+   * WHO the origin was and WHAT they said, captured at grant time for the memory judge
+   * (2026-10-07). A follow-up released by a sibling's reply runs with `message` = that SIBLING's
+   * post, while the reply itself answers this origin. The judge used to label the exchange with
+   * the sibling (and frame the owner as absent), so a front's words and events were written into
+   * Drevan's tray as Gaia's. Absent on an entitlement granted by an older build.
+   */
+  originSpeaker?: WritebackSpeaker;
+  originContent?: string;
+}
+
+/**
+ * Speaking order for a named_multi address: the order the names actually appear in the
+ * message. "Drev and Cy, thoughts?" -> [drevan, cypher]. Aliases count; the earliest
+ * occurrence of any name/alias for a companion is that companion's position.
+ * Deterministic across processes because it reads only the message text.
+ */
+export function namedOrderInMessage(content: string, ids: readonly CompanionId[]): CompanionId[] {
+  const lower = content.toLowerCase();
+  const firstIndex = (id: CompanionId): number => {
+    const names = [id, ...(VOCATIVE_ALIASES[id] ?? [])];
+    let min = Infinity;
+    for (const name of names) {
+      const m = lower.match(new RegExp(`\\b${name}\\b`));
+      if (m && m.index !== undefined && m.index < min) min = m.index;
+    }
+    return min;
+  };
+  return [...ids].sort((a, b) => firstIndex(a) - firstIndex(b));
+}
+
+/**
+ * Speaking order for a group call, derived from the bid hash every bidder read: score
+ * descending, ties broken by the same deterministic ring the bid itself uses (so all three
+ * processes compute the same order with no extra round trip). Only companions that actually
+ * posted a bid >= minScore appear -- silence below the threshold stays silence.
+ */
+export function bidSpeakingOrder(
+  bids: Record<string, number>,
+  messageId: string,
+  minScore: number,
+): CompanionId[] {
+  const eligible = (Object.keys(bids) as CompanionId[]).filter((k) => bids[k] >= minScore);
+  if (eligible.length === 0) return [];
+  // Ring order rotated to start at the message's tiebreak pick: ties resolve identically in
+  // every process, and the rotation varies across messages instead of favouring one name.
+  const ring = [...eligible].sort();
+  const start = ring.indexOf(tiebreak(messageId, eligible));
+  const ringIndex = (id: CompanionId): number => (ring.indexOf(id) - start + ring.length) % ring.length;
+  return eligible.sort((a, b) => {
+    const d = bids[b] - bids[a];
+    if (Math.abs(d) > 1e-6) return d > 0 ? 1 : -1;
+    return ringIndex(a) - ringIndex(b);
+  });
+}
+
+/**
+ * The pass a silenced turn publishes, or null when nobody can be waiting on it. Pure.
+ *
+ * A turn is in a chain only when it answers a human's multi-address: either I am an entitled
+ * follow-up (origin = the entitlement's origin), or the trigger is the human message itself
+ * (origin = that message; I may be position 0). A sibling-triggered turn that was not an entitled
+ * follow-up is peer talk, and no one holds a position behind it. Publishing for a position-0 turn
+ * that had no successors is harmless: a pass that matches no entitlement is dropped on arrival.
+ */
+export function followUpPassFor(p: {
+  isCompanionBot: boolean;
+  entitled: FollowUpEntitlement | null;
+  messageId: string;
+  channelId: string;
+  from: CompanionId;
+  reason: string;
+  now?: Date;
+}): { channelId: string; originMessageId: string; fromCompanionId: CompanionId; reason: string; at: string } | null {
+  const origin = p.entitled ? p.entitled.originMessageId : (p.isCompanionBot ? null : p.messageId);
+  if (!origin) return null;
+  return { channelId: p.channelId, originMessageId: origin, fromCompanionId: p.from, reason: p.reason, at: (p.now ?? new Date()).toISOString() };
+}
+
+/**
+ * Per-process store of this companion's pending follow-up entitlements, one per channel.
+ * One per channel is deliberate: a newer multi-address in the same channel supersedes the
+ * older wait -- answering last hour's group call after this hour's is worse than dropping it.
+ */
+export class FollowUpLedger {
+  private byChannel = new Map<string, FollowUpEntitlement>();
+
+  grant(e: FollowUpEntitlement): void {
+    this.byChannel.set(e.channelId, e);
+  }
+
+  /**
+   * Called on every incoming sibling message. Returns (and consumes) the entitlement when
+   * this message is the predecessor's reply to the origin: right channel, right companion,
+   * carries a Discord reply reference to the origin message, not expired. Expired
+   * entitlements are dropped on sight so the map cannot accumulate.
+   */
+  match(
+    channelId: string,
+    senderCompanion: CompanionId | undefined,
+    referencedMessageId: string | undefined,
+    now: number = Date.now(),
+  ): FollowUpEntitlement | null {
+    const e = this.byChannel.get(channelId);
+    if (!e) return null;
+    if (now > e.expiresAt) { this.byChannel.delete(channelId); return null; }
+    if (!senderCompanion || senderCompanion !== e.expectedPrior) return null;
+    // The predecessor's reply always carries a reference to the origin (computeReplyRef:
+    // companion replies reference unconditionally). Requiring it keeps unrelated sibling
+    // chatter from releasing the entitlement.
+    // A care follow-up also accepts an UNREFERENCED message from the predecessor (B32): the
+    // companion answering Principal references his message only in a tracked channel. A reply to
+    // some OTHER message still does not release it.
+    const refOk = referencedMessageId === e.originMessageId
+      || (e.kind === "care" && referencedMessageId === undefined);
+    if (!refOk) return null;
+    this.byChannel.delete(channelId);
+    return e;
+  }
+
+  /**
+   * A pass from my predecessor (followUpPassFor): consume and return the entitlement it releases,
+   * under the same rules as match -- right channel, right companion, same origin, not expired.
+   */
+  releaseOnPass(
+    pass: { channelId: string; originMessageId: string; fromCompanionId: CompanionId },
+    now: number = Date.now(),
+  ): FollowUpEntitlement | null {
+    return this.match(pass.channelId, pass.fromCompanionId, pass.originMessageId, now);
+  }
+
+  /** Test hook + belt-and-braces for channel teardown. */
+  clear(channelId?: string): void {
+    if (channelId) this.byChannel.delete(channelId);
+    else this.byChannel.clear();
+  }
+}

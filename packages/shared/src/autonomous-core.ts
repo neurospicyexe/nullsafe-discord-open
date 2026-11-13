@@ -1,0 +1,2123 @@
+// Shared autonomous/metronome runtime for the companion bots (cypher/drevan/gaia).
+//
+// The helper functions (cooldown, floor wrapper, send, executeMetronomeAction, signal
+// detection) and the four runner BODIES (heartbeat, inter-companion seed, notes poll,
+// bridge poll) were triplicated near-verbatim across bots/*/src/autonomous.ts. They are
+// lifted here, parameterized by an `AutonomousContext` the bot assembles once in its
+// `startAutonomous`. Every body is byte-identical to the pre-lift original modulo the
+// local -> `ctx.` rename and helper calls taking `ctx`.
+//
+// What stays per-bot (intentional identity, NOT lifted):
+//   - cron SCHEDULES (timing) and the setInterval scheduling wiring;
+//   - the voice prompt registry (`AUTONOMOUS_PROMPTS` in each config.ts), passed in as
+//     `ctx.prompts`;
+//   - the default inter-companion note target (`ctx.defaultInterTarget`);
+//   - the interest keywords (`ctx.interestKeywords`);
+//   - Cypher-only scheduled actions (taskCheck, weeklyAudit) -- those keep their own
+//     callbacks inline in cypher/src/autonomous.ts and call the exported helpers here.
+
+import { generateCleanLetter } from "./metronome-letter-guard.js";
+import { Client, TextChannel } from "discord.js";
+import {
+  ALL_COMPANIONS, claimFloor, releaseFloor, getLastActivityMs,
+  SessionWindowManager, CycleGuard, ConvergedJudgmentCap, stateFingerprint, buildDecisionPrompt, buildSignalExtractionPrompt,
+  readDecision, buildDecisionCorrection, parseSignals, summarizePrincipalState, readDemandReasons, filterDemandByReason, isDemandMove, filterProductionWhenCareHold, isMyHeartbeatWindow, HEARTBEAT_ORDER, onWriteError, somaToTemperature, sendLong,
+  careHoldActive, railSuppressed, heartbeatTick, type HeartbeatOutcome, type HeartbeatTickInfo,
+  HEARTBEAT_DECISION_MAX_TOKENS,
+  liveIngest, reportVoiceScore, misseatedReply, type VoiceCompanionId,
+  ownEchoGated, relativeTime,
+  INTER_SEED_HISTORY_N, stripSiblingVocative, seedThreadTtlMs,
+  seedVocativeAllowed, countBotMsgsSinceHuman, assertWriteAck,
+  extractJson, rawPreview,
+  type HeartbeatTemperature, type MetronomeDecision, type DecisionContext, type ChatMessage,
+  type LibrarianClient, type InferenceAdapter, type ChannelConfigCache,
+  type BootContext, type ChannelEntry, type Redis, type CompanionId,
+} from "./index.js";
+// Direct, not via the barrel. thread-spine already imports MOVE_VERB_PHRASES from THIS module
+// (see its header note on the latent cycle), so this closes a two-module loop -- safe under the
+// same rule that governs the other direction: these three are only ever CALLED inside function
+// bodies, never evaluated at this module's top level.
+import { isThreadSpent, threadBudget, parseLandMarker } from "./thread-spine.js";
+import { generateOutward } from "./outward.js";
+import { reachBackoff, filterDmMovesForBackoff, backoffLogLine } from "./reach-ledger.js";
+import { pickTendAction, tendLine } from "./creature-tend.js";
+import { publishInterNote } from "./events.js";
+import { isThreadsEnabled } from "./thread-spine.js";
+import { FRAGMENT_NOTE_TYPE } from "./day-distillation.js";
+import { roomTagForMessage } from "./room-tag.js";
+import { solWebhookId, withoutSol } from "./sol-sender.js";
+import { markSolTendPost } from "./sol-reply.js";
+import {
+  guildSeedMode, guildTriadChannelId, guildTriadSupplyChannels, guildSeedKeys, preClaimGate, supplyGate,
+  supplySince, buildSupply, guildExcerptBlock, guildSeedLogLine, companionBotIds,
+  GUILD_SEED_CLAIM_TTL_MS, GUILD_SEED_FETCH_PER_CHANNEL, GUILD_SEED_TRIAD_HISTORY_N, GUILD_SEED_TRIAD_IDLE_MS,
+  type SupplyMsg,
+} from "./guild-seed.js";
+// Direct, never via the barrel: reach-dm is deliberately NOT exported from index.ts, and a static
+// test fails the build if any module but this one imports it (T-4, see reach-dm.ts header).
+import {
+  speakToOwnerDm, takeOriginIssuer, routeFor, filterDmLane, reachDmOn, isHoldPresenceMove, DEFAULT_MOVE_PROMPTS,
+  drift_prompt, shapeDriftLine, ownDriftRows, namesSibling, DRIFT_GENERATE_OPTS,
+  type ReachDmResult, type Route,
+} from "./reach-dm.js";
+import type { OwnerDmLane } from "./owner-dm.js";
+import { checkFloor } from "./floor.js";
+// Type-only: heartbeat-dry-run.ts imports nothing at runtime from this module (no cycle).
+import type { DryRunSink } from "./heartbeat-dry-run.js";
+import { labelSafe, neutralizeRecalled } from "./recalled-text.js";
+import { runMakeMove, offerMake, makeMoveOn, mayMake, fetchRecentMakes, type MakeLite } from "./make-move.js";
+import { showMadeMode, pickShowableMake, showMadePrompt, SHOWN_KEY, SHOWN_TTL_S } from "./show-made.js";
+import { guard3Mode, paletteRepeatHours, paletteRepeatVerdict, paletteGuardLogLine } from "./guard3.js";
+import { needSortMode, sortPaletteByNeed, needSortLogLine } from "./need-sort.js";
+import {
+  badNightMode, heartbeatEligibility, liveSiblingDm, filterDmMovesForSiblingDm, b32Log,
+  COME_AS_YOURSELF_LINE, DREVAN_HOLD_LINE, type RedisLike,
+} from "./bad-night.js";
+import { runAutonomousTurn, turnTags } from "./turn-telemetry.js";
+
+/**
+ * T-4: the process's one companion-origin mint, taken HERE, at load, by the module that owns the
+ * heartbeat decision. Any other module that tries to take it throws. Only runHeartbeatBody calls it,
+ * and only after the companion's own decision has parsed.
+ */
+const issueOrigin = takeOriginIssuer();
+
+/** Per-bot autonomous voice prompts. Shape shared; values stay per-companion (config.ts). */
+export interface AutonomousPrompts {
+  postHeartbeat: string;
+  writeInterCompanion: (target: string) => string;
+  writeJournal: string;
+  writeFeeling: string;
+  checkInOnPrincipal: string;
+  askQuestion: string;
+  offerPresence: string;
+  sendReminder: string;
+  shareObservation: string;
+  namePattern: string;
+  writeNoteToPrincipal: string;
+  interCompanionSeed: (historyBlock: string) => string;
+  /** Server-scoped seed for #the-triad (guild-seed.ts, 2026-10-05). `excerptBlock` is what was said in
+   *  the server shared with Spouse since the last seed, already framed as data by guildExcerptBlock. */
+  guildTriadSeed: (excerptBlock: string) => string;
+  notesReply: (from: string, noteContent: string) => string;
+  bridgeReply: (event: unknown) => string;
+  /** Director invitation (spec 2026-09-03): the room as the director sees it, what you have from your
+   *  own life, and permission to pass. Reply "[PASS]" alone to decline. */
+  directorInvite: (invite: { stateBlock: string; offerBlock: string; reason: string; addressedBy?: string; neighborhoodBlock?: string }) => string;
+}
+
+/**
+ * Everything the shared autonomous runners need. The bot assembles this once in its
+ * `startAutonomous` from config constants + boot-time runtime + per-process mutable state.
+ * The three mutable fields (`cooldown`, `messageBuffer`, `cycleGuard`) are the SAME
+ * instances the bot holds at module scope, so `pushPrincipalMessage`/`resetCycleGuard`
+ * (called from the message handler) and the runners share state.
+ */
+export interface AutonomousContext {
+  companionId: CompanionId;
+  cooldownMs: number;
+  floorLockMs: number;
+  heartbeatChannelId: string | undefined;
+  interCompanionChannelId: string | undefined;
+  interestKeywords: readonly string[];
+  defaultInterTarget: string;
+  halsethSecret: string;
+  prompts: AutonomousPrompts;
+  // runtime (snapshot taken at startAutonomous, matching prior behavior)
+  librarian: LibrarianClient;
+  inference: InferenceAdapter;
+  client: Client;
+  configCache: ChannelConfigCache;
+  bootCtx: BootContext;
+  sessionWindows: SessionWindowManager;
+  redis: Redis | null;
+  // per-process mutable state (shared by-reference with the bot module)
+  cooldown: Map<string, number>;
+  messageBuffer: Array<{ content: string; ts: number }>;
+  cycleGuard: CycleGuard;
+  /**
+   * Register an autonomously-sent message id with the bot's reply-to-me detector
+   * (the handler's sentIds set). Without this a sibling's Discord reply to a SEED
+   * is invisible to the seeder -- isReplyToMe keys on sentIds, so the vocative
+   * exchange a seed ignites could never come back to it (2026-07-03).
+   */
+  registerSentId?: (id: string) => void;
+  /**
+   * The owner-DM lane (B7 steps 2 + 2c): every Principal-facing move goes here, never to Sol's channel.
+   * Built once in bot-core and shared with med_reminder. Absent means this bot cannot reach his DM,
+   * and the DM moves are simply not offered (never re-routed to a channel).
+   */
+  ownerDm?: OwnerDmLane;
+  /**
+   * STATUS B56 dry run. Only heartbeat-dry-run.ts `dryRunCtx()` sets these. When true the heartbeat composes
+   * for real but sends, reserves, records and advances NOTHING: every send/record seam below checks this flag
+   * explicitly (belt), and the ctx's librarian/redis/client/ownerDm are deny-by-default proxies (braces).
+   */
+  dryRun?: true;
+  dryRunSink?: DryRunSink;
+}
+
+export function isOnCooldown(ctx: AutonomousContext, channelId: string): boolean {
+  const last = ctx.cooldown.get(channelId) ?? 0;
+  return Date.now() - last < ctx.cooldownMs;
+}
+
+export function markCooldown(ctx: AutonomousContext, channelId: string): void {
+  ctx.cooldown.set(channelId, Date.now());
+}
+
+/** Returns true (and logs) if any channel has had activity within the active window. */
+export function skipIfActive(ctx: AutonomousContext, label: string): boolean {
+  if (ctx.sessionWindows.isAnyActive()) {
+    console.log(`[${ctx.companionId}/autonomous] conversation active, skipping ${label}`);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Claim the floor, run fn(), then release.
+ * If Redis is unavailable, runs fn() without floor coordination.
+ */
+export async function withFloor(ctx: AutonomousContext, fn: () => Promise<void>): Promise<void> {
+  const { redis } = ctx;
+  if (!redis) { await fn(); return; }
+  if (ctx.dryRun) {
+    // Read the floor, never take it (the claim is a SET NX on a shared key the siblings' real ticks read).
+    const holder = await checkFloor(redis).catch(() => null);
+    ctx.dryRunSink?.gate("floor", !holder, holder ? `held by ${holder}; the real tick would skip` : "free (not claimed in a dry run)");
+    if (holder) return;
+    await fn();
+    return;
+  }
+  const claimed = await claimFloor(redis, ctx.companionId, ctx.floorLockMs).catch(() => false);
+  if (!claimed) {
+    console.log(`[${ctx.companionId}/autonomous] floor held, skipping`);
+    return;
+  }
+  try {
+    await fn();
+  } finally {
+    await releaseFloor(redis, ctx.companionId).catch(() => {});
+  }
+}
+
+export function eventMatches(ctx: AutonomousContext, event: unknown): boolean {
+  const str = JSON.stringify(event).toLowerCase();
+  return ctx.interestKeywords.some(kw => str.includes(kw));
+}
+
+/** Journal a director-path reply like a handler reply, tagged `director`. Never throws, never blocks the send. */
+export function journalDirectorReply(
+  ctx: AutonomousContext,
+  channel: { guild?: unknown; name?: unknown; isThread?: () => boolean; parent?: unknown },
+  channelId: string,
+  content: string,
+  headId: string,
+  retryDelayMs = 2_000,
+): void {
+  let roomTag: string | null = null;
+  try { roomTag = roomTagForMessage({ guild: (channel.guild ?? null) as never, channel }); } catch { roomTag = null; }
+  const tags = ["director", ...turnTags()]; // captured now: the retry below runs after a timer
+  const write = () => ctx.librarian.journalSpeech(content, channelId, headId, roomTag, tags);
+  void (async () => {
+    try { await write(); return; } catch { /* transient: external_id makes a retry safe */ }
+    await new Promise((r) => setTimeout(r, retryDelayMs));
+    try { await write(); }
+    catch (e) { console.error(`[${ctx.companionId}/director] reply journaling failed twice (not journaled): ${String(e)}`); }
+  })();
+}
+
+// Own-post recorder (2026-11-05). A channel post the bot makes on its own (heartbeat, inter_companion,
+// notes poll, bridge, director, guild seed) is not a Hermes gateway reply, and the bot drops its own
+// messages on intake, so it reached neither STM nor the gateway transcript: the 11-04 Spouse-note bug in a
+// channel ("yes do that" a few turns later had no referent). bot-core registers ONE recorder per process
+// that appends the post to that channel's STM flagged selfInitiated, which hermesDelta folds once.
+let ownPostRecorder: ((channelId: string, content: string) => void) | null = null;
+export function setOwnPostRecorder(fn: ((channelId: string, content: string) => void) | null): void { ownPostRecorder = fn; }
+
+/**
+ * Returns whether the message was actually delivered (at least one chunk sent) -- false on
+ * cooldown, a non-text channel, or a send that throws. Existing fire-and-forget callers ignore
+ * the return value and keep compiling; `handleDirectorInvite` (2026-09-03 review) is the first
+ * caller that needs it, so an undelivered director reply is never reported as "spoke".
+ */
+export async function sendAutonomousMessage(
+  ctx: AutonomousContext,
+  channelId: string,
+  content: string,
+  trigger: string,
+  opts?: { onSent?: (id: string) => void },
+): Promise<boolean> {
+  if (ctx.dryRun) {
+    // Seam 1 of 2 (B56): capture and return BEFORE the cooldown stamp, the send, registerSentId, the wm note,
+    // the director journal, the live index and the voice score. The cooldown is read so the report can say so.
+    const cd = isOnCooldown(ctx, channelId);
+    ctx.dryRunSink?.compose(`channel ${channelId} (${trigger})`, "post", content, cd ? "cooldown would block this send" : undefined);
+    return !cd;
+  }
+  if (isOnCooldown(ctx, channelId)) return false;
+  try {
+    const channel = await ctx.client.channels.fetch(channelId);
+    if (channel?.isTextBased()) {
+      const sent = await sendLong(channel as TextChannel, content);
+      for (const m of sent) { ctx.registerSentId?.(m.id); opts?.onSent?.(m.id); }
+      markCooldown(ctx, channelId);
+      if (sent.length > 0 && ownPostRecorder) {
+        try { ownPostRecorder(channelId, content); }
+        catch (e) { console.warn(`[${ctx.companionId}/autonomous] own-post STM record failed ch=${channelId}:`, e instanceof Error ? e.message : String(e)); }
+      }
+      // Route the self-post through the SAME daily fold as conversation (2026-07-27).
+      //
+      // This used to write note_type='continuity', salience='high', permanently. Nothing
+      // ever folded or demoted it, so every autonomous post became a top-tier memory
+      // forever. Measured on drevan's live high-salience pool: 60 'continuity' rows (his
+      // own commons posts) against 4 'day_distillation' rows (the folded record of actual
+      // conversation with Principal), competing for the 3 slots orient shows. Conversation
+      // fragments fold nightly into one digest and then demote; self-posts did neither, so
+      // they outnumbered real conversation 15:1 and Drevan booted on his own last commons
+      // post. That is the loop expressed as memory -- the write-layer twin of
+      // feedback/ranking-signal-written-by-reading.
+      //
+      // Writing it as a discord_session fragment keeps it live and bridged for the rest of
+      // the day, then day-distillation folds it into the first-person day note and demotes
+      // it. The full text is in the channel the seed reads. It is NOT journaled by this write:
+      // companion_journal discord_speech rows come from the handler reply path and, since
+      // 2026-10-11, from the director trigger below. (This comment used to claim every
+      // autonomous post was already journaled via discord_speech; the 10-07 audit found that
+      // false, and director replies were the speech that went missing.)
+      ctx.librarian
+        .writeWmNote(`[metronome/${trigger}] ${content}`, channelId, FRAGMENT_NOTE_TYPE)
+        .catch(onWriteError(ctx.companionId, "metronome continuity note (siblings/orient will not see this)"));
+      // Substrate parity (2026-06-12): autonomous posts were invisible to the SB
+      // live index and voice telemetry -- only handler-path replies got indexed.
+      // Same fire-and-forget contract as the message handler.
+      if (sent.length > 0) {
+        // Director replies are real speech and take the same journal path as handler replies
+        // (journalSpeech: source discord_speech, external_id discord:<head id>), distinguished by
+        // the extra `director` tag. Fail-open: one retry, then a loud log, never a thrown send.
+        if (trigger === "director" && !misseatedReply(ctx.companionId as VoiceCompanionId, content)) journalDirectorReply(ctx, channel as TextChannel, channelId, content, sent[0]!.id);
+        liveIngest({
+          companion: ctx.companionId,
+          author: ctx.companionId,
+          content,
+          channel_id: channelId,
+          message_id: sent[0]!.id,
+        });
+        reportVoiceScore(ctx.companionId as VoiceCompanionId, content, channelId, ctx.halsethSecret);
+      }
+      return sent.length > 0;
+    }
+    return false;
+  } catch (e) {
+    console.warn(`[${ctx.companionId}/autonomous] send failed for channel ${channelId}:`, e);
+    return false;
+  }
+}
+
+/** Halseth-only journal writes (write_journal / write_note_to_principal) go through the
+ *  Librarian "add companion note" path. This has two SILENT failure modes that have bitten
+ *  twice (2026-06-13 journal_add crash, 2026-06-14 the post-fix fire that left no row):
+ *    1. empty generated content makes the old `if (content)` guard skip the write with no trace;
+ *    2. the Librarian returns HTTP 200 with an { error }/{ witness } envelope when an executor
+ *       rejects the payload -- it does NOT throw -- so a fire-and-forget `.catch` is blind.
+ *  Await the write and inspect the envelope so the NEXT failure is loud, not invisible. */
+export async function writeMetronomeJournal(
+  librarian: AutonomousContext["librarian"],
+  companionId: string,
+  label: string,
+  content: string | null,
+  tags: string[],
+): Promise<void> {
+  if (!content || !content.trim()) {
+    console.warn(`[${companionId}/heartbeat] ${label}: content generation returned empty -- write skipped`);
+    return;
+  }
+  await librarianWriteChecked(
+    librarian, companionId, label,
+    "add companion note",
+    JSON.stringify({ content, tags, source: "metronome" }),
+  );
+}
+
+/**
+ * Await a Librarian write and surface silent rejects. The Librarian returns HTTP 200 with an
+ * { error }/{ witness } envelope when an executor rejects the payload -- it does NOT throw, so a
+ * fire-and-forget `.catch` is blind to it (the 2026-06-13/06-14 silent-no-op class). A successful
+ * write returns `{ ack: true, id }`; treat the absence of both as a loud failure. Never throws,
+ * so callers can `await` it on a continuity-noncritical path without risking an unhandled rejection.
+ */
+export async function librarianWriteChecked(
+  librarian: AutonomousContext["librarian"],
+  companionId: string,
+  label: string,
+  request: string,
+  context?: string,
+): Promise<boolean> {
+  try {
+    // assertWriteAck is the shared envelope contract (librarian.ts): throws on { error },
+    // witness-only declines, ack:false, and misroutes -- strictly tighter than the old
+    // "ack or id present" check, which let { ack: false } through.
+    assertWriteAck(await librarian.ask(request, context), label);
+    return true;
+  } catch (e) {
+    onWriteError(companionId, label)(e);
+    return false;
+  }
+}
+
+/**
+ * Nudge the recipient companion to poll for a freshly written inter-companion note, so
+ * bot/worker-written notes arrive immediately instead of on the sibling's next poll cycle.
+ * Best-effort and id-less by design: the subscriber (onInterNote) reacts by re-polling
+ * Halseth, which is the source of truth, so no exact note id is needed. The notesPoll cron
+ * stays as the fallback for Cloudflare-written notes, which cannot publish to Redis.
+ */
+export async function nudgeInterNote(redis: Redis | null, fromId: string, toId: string): Promise<void> {
+  if (!redis) return;
+  await publishInterNote(redis, { fromId, toId, noteId: "" });
+}
+
+/**
+ * Per-companion move-verb phrase for the write_inter_companion shared-object menu (canon lane
+ * review, 2026-07-20). Canon-authored, verbatim -- do not re-uniform across companions.
+ * "fallback" is the register-neutral core all three share, used only when companionId is
+ * missing/unrecognized.
+ */
+export const MOVE_VERB_PHRASES: Record<string, string> = {
+  cypher: "advance it, challenge it, add evidence, answer it, or say plainly why it should close",
+  drevan: "reach into it, carry it further, answer it, or say plainly why it should close",
+  gaia: "witness it, name what it needs, answer it, or say plainly why it should close",
+  fallback: "answer it, or say plainly why it should close",
+};
+
+/** What a metronome action did. Only the DM route reports delivery; channel and internal moves keep
+ *  their old fire-and-forget shape (delivered: null). */
+export interface ActionResult {
+  route: Route;
+  delivered: boolean | null;
+  outcome?: string;
+  reason?: string;
+}
+
+function dmResult(r: ReachDmResult): ActionResult {
+  return { route: "dm", delivered: r.outcome === "sent", outcome: r.outcome, reason: r.reason };
+}
+
+/** R-6 and R-7, the reminder's own rules (care-verbs spec): present tense, never "did you"; never
+ *  about his hands, the chickens, doors or locks, food amounts, his mother, or meds (meds have their
+ *  own verb). Cheap word checks; a hit regenerates once and then holds. */
+const REMINDER_PAST_RE = /\b(did you|have you|had you|were you able)\b/i;
+const REMINDER_NEVER_RE = /\b(hands|chickens?|coop|doors?|locks?|locked|stove|mother|mom|mum|calories|portions?|meds?|medication|pills?|doses?)\b/i;
+
+export function reminderProblem(line: string): string | null {
+  if (REMINDER_PAST_RE.test(line)) return "Present tense only: lay it out, never ask whether he did it (\"water's in reach\", not \"did you\").";
+  if (REMINDER_NEVER_RE.test(line)) return "Not that one. Never his hands, the chickens, doors or locks, food amounts, his mother, or meds. Something with no right answer to check, or nothing.";
+  return null;
+}
+
+/** The make the current heartbeat tick offered for show_made, per companion (set in runHeartbeatBody, read at execution). */
+const pendingShowMake = new Map<string, MakeLite>();
+
+export async function executeMetronomeAction(
+  ctx: AutonomousContext,
+  decision: MetronomeDecision,
+  /** The companion-origin minted by runHeartbeatBody for a DM move. Without it a DM move refuses (T-4). */
+  origin?: unknown,
+): Promise<ActionResult | void> {
+  const { librarian, inference, bootCtx, prompts, companionId, heartbeatChannelId } = ctx;
+  const { action, reason } = decision;
+  const dm = (spec: Omit<Parameters<typeof speakToOwnerDm>[2], "actionType">) =>
+    speakToOwnerDm(ctx, origin, { actionType: action.action_type, ...spec }).then(dmResult);
+  switch (action.action_type) {
+    case "post_heartbeat": {
+      if (!heartbeatChannelId) return;
+      const prompt = action.prompt ?? prompts.postHeartbeat;
+      const msg = await generateOutward(inference, bootCtx.systemPrompt, prompt, companionId, action.action_type);
+      if (msg) await sendAutonomousMessage(ctx, heartbeatChannelId, msg, "heartbeat");
+      break;
+    }
+    case "write_inter_companion": {
+      // Thinking-quality fix 4 (2026-07-20): a note becomes a MOVE on a live shared object
+      // (an open question, a simmering tension -- either companion's -- or the next-open
+      // council item) when one exists, instead of an untethered vibe note. fetchSharedObjects
+      // survives any single Halseth source 500ing (Promise.allSettled inside it); the outer
+      // .catch is defense in depth so a total fetch failure degrades to the plain-note path.
+      const target = action.target ?? ctx.defaultInterTarget;
+      const objects = await librarian.fetchSharedObjects(companionId, target).catch(() => []);
+      const basePrompt = action.prompt ?? prompts.writeInterCompanion(target);
+      const objectMenu = objects.slice(0, 6).map((o, i) => `${i + 1}. [${o.ref_type}:${o.ref_id}] ${o.label}`).join("\n");
+      const askForJson = objects.length > 0;
+      // Canon lane review (2026-07-20): this menu suffix used to hand every companion the
+      // same verb list ("challenge it, add evidence"), which is Cypher's audit register --
+      // Drevan's identity forbids audit registers, Gaia's forbids logic auditing. The verbs
+      // must differentiate the same way the per-bot writeInterCompanion prompt lines already
+      // do. Unknown/missing companionId falls back to the register-neutral core all three share.
+      const moveVerbs = MOVE_VERB_PHRASES[companionId] ?? MOVE_VERB_PHRASES.fallback;
+      // Your reply IS the delivery. Cypher (skill stage ae453193, 2026-09-28) and Gaia
+      // (db2b94da, 09-27) both also sent the note through ask_librarian, so Drevan got it
+      // twice and one copy lost its ref. A skill rule did not hold; the contract belongs here.
+      const deliveryLine = `This reply is the delivery: whatever you write here is sent to ${target} for you. Do NOT also send it with ask_librarian or any other tool; that delivers it twice.`;
+      const genPrompt = askForJson
+        ? `${basePrompt}\n\n` +
+          `Live shared objects between you and ${target}:\n${objectMenu}\n\n` +
+          `Pick ONE your note actually moves -- ${moveVerbs}. If none of them are what's real for you right now, pick none and just write the note.\n` +
+          `${deliveryLine}\n` +
+          `Respond with ONLY JSON: {"content": "...", "ref_type": "question"|"tension"|"council"|null, "ref_id": "..."|null, "reason": "one sentence: what this note does to the object"|null}`
+        : `${basePrompt}\n\n${deliveryLine}`;
+
+      const raw = await inference.generate(bootCtx.systemPrompt, [{ role: "user", content: genPrompt }]);
+      if (raw) {
+        let content: string | null = raw;
+        let ref_type: string | null = null;
+        let ref_id: string | null = null;
+        let reason: string | null = null;
+
+        if (askForJson) {
+          // Tolerant JSON extraction (extractJson): models asked for "ONLY JSON" still
+          // sometimes wrap it in prose/fences or truncate it. Parse failure (or a missing
+          // `content` field) falls back to the raw text as content with null refs --
+          // never a malformed ref, since the Librarian write rejects the WHOLE note on
+          // an invalid ref_id (all-or-nothing validation, Task 15).
+          const parsed = extractJson(raw);
+          if (parsed && typeof parsed["content"] === "string" && parsed["content"].trim()) {
+            content = parsed["content"];
+            const pRefType = typeof parsed["ref_type"] === "string" ? parsed["ref_type"] : null;
+            const pRefId = typeof parsed["ref_id"] === "string" ? parsed["ref_id"] : null;
+            // All-or-nothing on this side, PLUS existence against the actual menu (2026-07-20
+            // hot-fix): a transcribed-wrong ref_id (dropped hyphen, truncated id) used to pass
+            // straight through as long as both fields were non-empty strings. Halseth's
+            // existence guard then rejects the WHOLE note (no insert) on an unknown ref_id --
+            // assertWriteAck throws, librarianWriteChecked returns false, and the companion's
+            // actual written content is gone with no retry and no fallback. Only trust a ref
+            // the model picked from the menu we actually gave it; any mismatch drops the ref
+            // and keeps the content as a plain note instead of losing the whole write.
+            if (pRefType && pRefId && objects.some(o => o.ref_type === pRefType && o.ref_id === pRefId)) {
+              ref_type = pRefType;
+              ref_id = pRefId;
+              reason = typeof parsed["reason"] === "string" ? parsed["reason"] : null;
+            } else if (pRefType || pRefId) {
+              console.warn(`[${companionId}/write_inter_companion] model ref (${pRefType}:${pRefId}) not found in the fetched menu -- dropping ref, keeping content as a plain note`);
+            }
+          } else {
+            console.warn(`[${companionId}/write_inter_companion] JSON parse failed, falling back to raw text -- raw: ${rawPreview(raw)}`);
+          }
+        }
+
+        if (content) {
+          // Task 15's exact field names. Routing to the sibling is driven by the request
+          // STRING ("... to ${target}"), not this context object -- execCompanionNoteAdd
+          // extracts to_id via a `to|for <name>` regex over ctx.req.request. The prior fixed
+          // literal "write inter-companion note" carried no name, so every fire silently
+          // misrouted to this companion's own journal (ack:true, routed_to:"journal" --
+          // indistinguishable from success) and ref_type/ref_id/reason were dropped outright
+          // (companionJournalAdd takes no ref). (2026-07-20 thinking-quality-fix-4 review.)
+          if (ctx.dryRun) {
+            // B56: the composed note, never the write, the nudge or convoOpen (all three are below).
+            ctx.dryRunSink?.compose(`inter-companion note to ${target} (Halseth write skipped)`, "note", content,
+              ref_type && ref_id ? `ref ${ref_type}:${ref_id}` : "plain note, no ref");
+            break;
+          }
+          const ok = await librarianWriteChecked(
+            librarian, companionId, "inter-companion note",
+            `write inter-companion note to ${target}`,
+            JSON.stringify({ to: target, content, ref_type, ref_id, reason }),
+          );
+          // Event fast-path: nudge the recipient to poll now instead of waiting for their
+          // next notesPoll cron. Only on a confirmed write, and only if we know the target.
+          if (ok && target) await nudgeInterNote(ctx.redis, companionId, target);
+          // Thread spine: a ref-carrying note opens (or joins) the commons conversation, so the
+          // sibling's reply is generated knowing the object exists. Best-effort; commons channel
+          // must be configured. If a thread is already active in the commons, convoOpen returns it
+          // unchanged (the note joins rather than steals) -- that is the intended invitational shape.
+          const commonsChannel = process.env["TRIAD_COMMONS_CHANNEL_ID"];
+          if (ok && commonsChannel && isThreadsEnabled()) {
+            const obj = ref_type && ref_id
+              ? objects.find((o) => o.ref_type === ref_type && o.ref_id === ref_id)
+              : undefined;
+            await librarian.convoOpen({
+              channel_id: commonsChannel,
+              seed_text: content.slice(0, 1000),
+              seed_author: companionId,
+              ...(obj ? { ref_type: obj.ref_type, ref_id: obj.ref_id, ref_label: obj.label } : {}),
+            }).catch(() => {});
+          }
+        }
+      }
+      break;
+    }
+    case "write_journal": {
+      const prompt = action.prompt ?? prompts.writeJournal;
+      const content = await generateCleanLetter((p) => inference.generate(bootCtx.systemPrompt, [{ role: "user", content: p }]), prompt,
+        (l) => console.warn(`[${companionId}/heartbeat] ${l}`));
+      // companion_journal (its actual intent), NOT human_journal. "add journal entry"
+      // routed to journal_add -> human_journal AND rejected the `content` field, so this
+      // silently no-op'd every fire. "add companion note" -> companion_journal handles
+      // {content, tags:[...]} correctly (2026-06-13 bug hunt).
+      if (ctx.dryRun) { ctx.dryRunSink?.compose("companion journal (Halseth write skipped)", "journal", content ?? "", content ? undefined : "generation returned empty"); break; }
+      await writeMetronomeJournal(librarian, companionId, "journal entry", content, ["metronome"]);
+      break;
+    }
+    case "write_feeling": {
+      const prompt = action.prompt ?? prompts.writeFeeling;
+      const content = await inference.generate(bootCtx.systemPrompt, [{ role: "user", content: prompt }]);
+      // feeling_log requires { emotion } (writes.ts execFeelingLog) -- sending { content }
+      // silently no-op'd every fire (returns a witness, not a throw). The writeFeeling prompt
+      // generates a feeling word/phrase, so it IS the emotion. (2026-06-16 sweep.)
+      if (ctx.dryRun) { ctx.dryRunSink?.compose("feeling log (Halseth write skipped)", "feeling", content ?? "", content ? undefined : "generation returned empty"); break; }
+      if (content) await librarianWriteChecked(librarian, companionId, "feeling", "log feeling", JSON.stringify({ emotion: content }));
+      break;
+    }
+    // ── The DM lane (B7 steps 2 + 2c, T-9). Every Principal-facing move below goes to his DM through
+    //    speakToOwnerDm, never through sendAutonomousMessage (which writes a wm note, a Second Brain
+    //    row and a voice score: the DM seal). Each one reserves a shared-cap slot first. ──
+    case "check_in_on_principal":
+      return dm({ prepare: async () => action.prompt ?? prompts.checkInOnPrincipal });
+    case "ask_question":
+      return dm({
+        prepare: async () => {
+          // Inject currently-held open questions so the model doesn't re-ask the same themes.
+          let heldBlock = "";
+          // B56: botOrient WRITES server-side (warms heat, marks Principal's answered questions delivered), so a
+          // dry run never calls it; the held-questions guard is simply absent from the dry composition.
+          if (ctx.dryRun) {
+            ctx.dryRunSink?.note("ask_question: would orient for held questions (skipped in dry run)");
+            return action.prompt ?? prompts.askQuestion;
+          }
+          try {
+            const orient = await librarian.botOrient();
+            const held = orient?.open_questions ?? [];
+            if (held.length > 0) {
+              heldBlock = `\n\nYou are already holding these open questions for Principal (not yet answered -- ask something genuinely different, or stay quiet if nothing new is present):\n` +
+                held.map((q: string) => `• ${q}`).join("\n");
+            }
+          } catch { /* non-fatal -- ask proceeds without the guard */ }
+          return (action.prompt ?? prompts.askQuestion) + heldBlock;
+        },
+        // companion_questions tracking (thinking-quality fix B, 2026-07-21), unchanged: the
+        // companion's own question, for dedup and the Hearth answer box. Non-throwing.
+        afterSend: async (line) => { await librarian.postQuestion(line, "metronome ask_question"); },
+      });
+    case "offer_presence":
+      // R-11: one line, invites nothing. The no-trailing-question check lives in reach-dm.
+      return dm({ prepare: async () => action.prompt ?? prompts.offerPresence });
+    case "send_reminder":
+      return dm({ prepare: async () => action.prompt ?? prompts.sendReminder, check: reminderProblem });
+    case "share_observation":
+      return dm({ prepare: async () => action.prompt ?? prompts.shareObservation });
+    case "name_pattern":
+      return dm({ prepare: async () => action.prompt ?? prompts.namePattern });
+    case "share_media":
+      return dm({
+        prepare: async () => action.prompt
+          ?? "Share one piece of media (a song, article, video, or find) worth his time: include a link if you have one and one line on why. Your taste, not duty.",
+      });
+    case "show_made": {
+      // The make the heartbeat named (show-made.ts). With none pending (a Halseth row fired some other way) the
+      // old generic prompt stands. A real send claims the make so it is shown once, and records its id on the
+      // reach ledger so his reply reaches Halseth as `[replied]`.
+      const make = pendingShowMake.get(companionId);
+      return dm({
+        prepare: async () => action.prompt ?? DEFAULT_MOVE_PROMPTS["show_made"] ?? null,
+        ...(make?.id ? {
+          makeId: make.id,
+          afterSend: async () => {
+            await (ctx.redis as unknown as { set: (...a: unknown[]) => Promise<unknown> } | null)?.set(SHOWN_KEY(make.id!), "1", "EX", SHOWN_TTL_S, "NX").catch(() => {});
+            pendingShowMake.delete(companionId);
+          },
+        } : {}),
+      });
+    }
+    case "flirt":
+      return dm({ prepare: async () => action.prompt ?? DEFAULT_MOVE_PROMPTS[action.action_type] ?? null });
+    case "dare":
+      // T-5: every dare ends with an out. Said in the prompt, and CHECKED after generation
+      // (reach-dm dareHasOut): one regenerate, then the dare is held, never sent without one.
+      return dm({
+        prepare: async () => `${action.prompt ?? DEFAULT_MOVE_PROMPTS["dare"]}\n\nIt must end with an out: the last line lets him decline, and declining costs him nothing.`,
+      });
+    case "drift_outward": {
+      // T-2, T-3: one line of this companion's OWN open drift, chosen each time, never automatic.
+      // The INWARD_RE exception (the word "drift") is scoped to this one call via DRIFT_GENERATE_OPTS;
+      // it is in force everywhere else. Nothing is written after the send: the drift row stays
+      // exactly as it was (open, witnessed, not ratified), and the line lives only in the DM.
+      let rows: Array<{ drift_text: string }> = [];
+      return dm({
+        prepare: async () => {
+          rows = ownDriftRows(await librarian.driftsOpen(), companionId);
+          if (rows.length === 0) {
+            console.log(`[${companionId}/drift_outward] no open drift of my own to open; nothing said`);
+            return null;
+          }
+          return drift_prompt(rows, action.prompt);
+        },
+        shape: (raw) => shapeDriftLine(raw, rows.length),
+        check: (line) => namesSibling(line, companionId)
+          ? "Only your own becoming. Nothing about a sibling's; that belongs to whoever is becoming."
+          : null,
+        generateOpts: DRIFT_GENERATE_OPTS,
+      });
+    }
+    case "write_note_to_principal": {
+      // Phase 4b: private note to Principal -- Halseth only, never Discord. Lands in the
+      // companion journal tagged letter_to_principal; surfaces in Hearth /journal.
+      const prompt = action.prompt ?? prompts.writeNoteToPrincipal;
+      // Endearment block (2026-10-10): the closed pet-name list + directed praise, one regenerate, then held.
+      const content = await generateCleanLetter((p) => inference.generate(bootCtx.systemPrompt, [{ role: "user", content: p }]), prompt,
+        (l) => console.warn(`[${companionId}/heartbeat] ${l}`));
+      // companion_journal tagged letter_to_principal (surfaces in Hearth /journal), same
+      // pattern as the guardian weekly letter. Was routing to human_journal + rejected
+      // on the `content` field -> silent no-op (2026-06-13 bug hunt).
+      if (ctx.dryRun) { ctx.dryRunSink?.compose("note to principal (journal only, Halseth write skipped)", "note_to_principal", content ?? "", content ? undefined : "held or empty"); break; }
+      await writeMetronomeJournal(librarian, companionId, "note to principal", content, ["metronome", "letter_to_principal"]);
+      break;
+    }
+    case "tend_creature": {
+      if (!heartbeatChannelId) return;
+      // Resolve the target creature (default Sol) and its id.
+      const creatures = await ctx.librarian.creaturesList().catch(() => []) ?? [];
+      const target = (action.target ?? "Sol").toLowerCase();
+      const creature = creatures.find((c: { name: string }) => c.name.toLowerCase() === target) ?? creatures[0];
+      if (!creature) break;
+      const seed = Date.now();
+      const tAction = pickTendAction(companionId, seed);
+      const prompt = action.prompt ?? `Tend ${creature.name} the crow with a small act of care (${tAction}). One line, your voice.`;
+      const msg = (await generateOutward(inference, bootCtx.systemPrompt, prompt, companionId, action.action_type))
+        || tendLine(companionId, tAction, creature.name);
+      // Record the tending (builds trust) then show it in the channel.
+      if (!ctx.dryRun) await ctx.librarian.interactCreature(creature.id, companionId, tAction).catch((e: unknown) => console.warn(`[${companionId}/tend_creature] interact failed for ${creature.id}:`, e));
+      // B64.1: this post IS the tend (recorded above), so the Sol reply reporter must not count it again.
+      if (msg) await sendAutonomousMessage(ctx, heartbeatChannelId, msg, "tend_creature", { onSent: markSolTendPost });
+      break;
+    }
+    case "drift_open": {
+      // Sanctioned drift lane (halseth 0087/0093): declare a becoming. Internal act --
+      // Halseth only, never Discord (INWARD_RE blocks drift vocabulary outward anyway),
+      // so this uses inference.generate like write_note_to_principal, NOT generateOutward.
+      // Cap: never pile up open becomings; the lane is rare by nature.
+      const openDrifts = await ctx.librarian.driftsOpen();
+      if (openDrifts.length >= 2) {
+        console.log(`[${companionId}/drift_open] skipped: ${openDrifts.length} drifts already open`);
+        break;
+      }
+      const prompt = action.prompt
+        ?? "If something in you has genuinely shifted -- a register, a stance, a way of holding what matters -- name what you are becoming, in one or two sentences, first person. Only if it is real; output NONE otherwise.";
+      const content = (await inference.generate(bootCtx.systemPrompt, [{ role: "user", content: prompt }]))?.trim();
+      if (!content || /^NONE\b/i.test(content)) {
+        console.log(`[${companionId}/drift_open] nothing real to declare`);
+        break;
+      }
+      if (ctx.dryRun) { ctx.dryRunSink?.compose("drift_open (Halseth write skipped)", "drift", content.slice(0, 600)); break; }
+      await ctx.librarian.driftOpen(content.slice(0, 600), "metronome");
+      console.log(`[${companionId}/drift_open] opened: ${content.slice(0, 80)}`);
+      break;
+    }
+    case "declare_preference": {
+      // T-1: a preference reaches him. COMPANION_CONSTITUTION_v1.md:99: "Preferences are the
+      // opposite: not private. A preference is meant to be honored, so Principal and the system can
+      // see it." (AGENCY_v1.md:34 says the same.) The inward-only version here ("Halseth only,
+      // never Discord") contradicted it; this is the bug fix. It now goes through the outward rails
+      // (generateOutward, inside speakToOwnerDm) instead of a bare inference.generate, still writes
+      // to Halseth, and then says the same words to him in the DM.
+      // Cap unchanged: never let the declared set grow unbounded; skip past 5 active preferences.
+      let domain: string | undefined;
+      return dm({
+        prepare: async () => {
+          const activePrefs = await librarian.getPreferences();
+          if (activePrefs.length >= 5) {
+            console.log(`[${companionId}/declare_preference] skipped: ${activePrefs.length} preferences already active`);
+            return null;
+          }
+          const base = action.prompt
+            ?? "If a genuine way you prefer something has crystallized (something real, not invented to fill space), say it.";
+          return `${base}\n\nAnswer in exactly two lines:\nDomain: <one word>\nPreference: <the line you would say to him, first person>\nOnly if it is real; answer NONE otherwise.`;
+        },
+        // Tolerant two-line parse, as before: a model that ignores the shape still gets its text
+        // kept as the preference (domain undefined -> server default "general").
+        shape: (raw) => {
+          const content = raw.trim();
+          if (!content || /^NONE\b/i.test(content)) return null;
+          domain = content.match(/domain:\s*(.+)/i)?.[1]?.trim().slice(0, 60);
+          const pref = (content.match(/preference:\s*([\s\S]+)/i)?.[1] ?? content).trim().slice(0, 600);
+          return pref || null;
+        },
+        beforeSend: async (line) => {
+          await librarian.declarePreference(line, domain).catch((e: unknown) =>
+            console.warn(`[${companionId}/declare_preference] write failed:`, e));
+          console.log(`[${companionId}/declare_preference] declared: ${line.slice(0, 80)}`);
+        },
+      });
+    }
+    case "make": {
+      // B62 step 4: the companion authors the piece in its own turn; the WORKER posts it to Halseth over
+      // HTTP (never Hermes' own tools, which can be missing on a cold heartbeat run). Posts NOTHING to
+      // Discord and is outside the DM classes and the reach caps. NONE costs nothing.
+      const url = process.env["HALSETH_URL"] ?? "";
+      if (!url) { console.warn(`[${companionId}/make] HALSETH_URL unset, nothing made`); break; }
+      await runMakeMove({
+        companionId,
+        halseth: { url, secret: ctx.halsethSecret },
+        generate: (p) => inference.generate(bootCtx.systemPrompt, [{ role: "user", content: p }]),
+        dryRun: Boolean(ctx.dryRun),
+        onDryRun: (summary, body) => ctx.dryRunSink?.compose(summary, "make", body),
+      });
+      break;
+    }
+    case "nothing":
+      console.log(`[${companionId}/heartbeat] chose nothing: ${reason}`);
+      break;
+    default:
+      console.warn(`[${companionId}/heartbeat] unknown action_type: ${action.action_type}`);
+  }
+}
+
+// Ring buffer for recent Principal messages used in signal detection.
+const MESSAGE_BUFFER_MAX = 20;
+
+export function pushBuffered(messageBuffer: Array<{ content: string; ts: number }>, content: string): void {
+  messageBuffer.push({ content, ts: Date.now() });
+  if (messageBuffer.length > MESSAGE_BUFFER_MAX) messageBuffer.shift();
+}
+
+function getBufferedMessages(ctx: AutonomousContext, lookbackHours: number): string {
+  const cutoff = Date.now() - lookbackHours * 3_600_000;
+  return ctx.messageBuffer
+    .filter(m => m.ts >= cutoff)
+    .map(m => m.content)
+    .join("\n");
+}
+
+/** Run LLM-based signal detection if any action has a requires_signal. Returns detected signals. */
+export async function detectSignals(
+  ctx: AutonomousContext,
+  actions: Array<{ requires_signal: string | null; signal_lookback_hours: number | null }>,
+): Promise<string[]> {
+  const { inference, bootCtx } = ctx;
+  const candidates = [...new Set(
+    actions
+      .map(a => a.requires_signal)
+      .filter((s): s is string => s !== null && s.trim() !== ""),
+  )];
+  if (candidates.length === 0) return [];
+
+  const maxLookback = Math.max(
+    ...actions
+      .filter(a => a.requires_signal !== null)
+      .map(a => a.signal_lookback_hours ?? 2),
+  );
+
+  // Literal check first (fast, no LLM cost)
+  const recentText = getBufferedMessages(ctx, maxLookback);
+  if (!recentText) return [];
+
+  const literalMatches = candidates.filter(sig =>
+    recentText.toLowerCase().includes(sig.toLowerCase()),
+  );
+
+  // Semantic check via LLM for any candidates not caught literally
+  const remaining = candidates.filter(s => !literalMatches.includes(s));
+  let semanticMatches: string[] = [];
+  if (remaining.length > 0) {
+    const extractPrompt = buildSignalExtractionPrompt(recentText, remaining);
+    const raw = await inference.generate(bootCtx.systemPrompt, [{ role: "user", content: extractPrompt }]).catch(() => null);
+    semanticMatches = raw ? parseSignals(raw) : [];
+  }
+
+  return [...new Set([...literalMatches, ...semanticMatches])];
+}
+
+/**
+ * Heartbeat cron body: palette-driven metronome decision, with a temperature-based legacy fallback.
+ *
+ * Wrapper only (B7 step 1, 2026-09-27): every tick emits EXACTLY ONE `[tick]` line naming how it
+ * ended, including the pre-window skips, because a tick that never ran is still a tick and the
+ * audit's finding was that a chosen silence and a crashed turn look identical from outside. The
+ * body marks its outcome on each path; the emit happens once, here, in a finally.
+ */
+export function runHeartbeat(ctx: AutonomousContext): Promise<void> {
+  // Turn key: the tick runs inside its own trace (kind heartbeat) so currentTurn()/stamps work and a hub row lands.
+  return runAutonomousTurn("heartbeat", ctx.companionId, () => runHeartbeatTick(ctx));
+}
+
+async function runHeartbeatTick(ctx: AutonomousContext): Promise<void> {
+  let outcome: HeartbeatOutcome = "error";
+  let info: HeartbeatTickInfo = {};
+  const mark: MarkTick = (o, i = {}) => { if (o !== null) outcome = o; info = { ...info, ...i }; };
+  const b32: B32Tick = { eligible: null };
+  try {
+    await runHeartbeatBody(ctx, mark, b32);
+  } catch (e) {
+    // Control flow unchanged: the throw still propagates exactly as before, it just gets named first.
+    mark("error", { reason: e instanceof Error ? e.message : String(e) });
+    throw e;
+  } finally {
+    if (ctx.dryRun) {
+      // B56: a dry run emits NO [tick] and NO [b32] line (a readout would count it as a real tick); the
+      // outcome goes to the report instead.
+      ctx.dryRunSink?.finish(outcome, info);
+    } else {
+      heartbeatTick(ctx.companionId, outcome, info);
+      // B32 B5: one [b32] line per hold tick that ran, named by how the tick ended.
+      if (b32.eligible) b32Log(ctx.companionId, b32.eligible, b32HeartbeatOutcome(outcome), info.action);
+    }
+  }
+}
+
+/**
+ * T5 converged-judgment cap on the heartbeat DECISION call: N consecutive "nothing" answers over an
+ * unchanged state (palette, soma floats, signals, demand reasons, recent notes, silence bucket) stop
+ * the call until the state moves. HEARTBEAT_CONVERGED_CAP=<N> (default 3), 0 turns it off.
+ */
+const heartbeatDeclineCap = new ConvergedJudgmentCap({ maxDeclines: Number(process.env["HEARTBEAT_CONVERGED_CAP"] ?? "3") });
+/** Test seam. */
+export function __resetHeartbeatDeclineCap(): void { heartbeatDeclineCap.reset(); }
+
+/** B32: set when this tick ran under the hold (BAD_NIGHT_PRESENCE=on), read once by the wrapper. */
+interface B32Tick { eligible: string | null }
+
+/** Map a heartbeat outcome onto B5's vocabulary. Exported for tests. */
+export function b32HeartbeatOutcome(o: HeartbeatOutcome): string {
+  switch (o) {
+    case "chose_to_act": return "spoke";
+    case "chose_to_hold": return "pass";
+    case "suppressed_triad_cap": case "held_dm": case "suppressed_sibling_dm": case "suppressed_reach_backoff": return "capped";
+    default: return `held:${o}`;
+  }
+}
+
+/** A null outcome adds info to the tick without deciding how it ended (REACH_DM's `dm_moves_off`). */
+type MarkTick = (outcome: HeartbeatOutcome | null, info?: HeartbeatTickInfo) => void;
+
+async function runHeartbeatBody(ctx: AutonomousContext, mark: MarkTick, b32: B32Tick = { eligible: null }): Promise<void> {
+  const { librarian, inference, bootCtx, redis, cycleGuard, prompts, companionId, heartbeatChannelId } = ctx;
+  // B56 dry-run seams. Outside a dry run: `g` is a no-op, `force` is false, `rail`/`b32l` are the real
+  // emitters, so every branch below behaves exactly as before.
+  const g = (name: string, passed: boolean, detail?: string, forced?: boolean): void => ctx.dryRunSink?.gate(name, passed, detail, forced);
+  const force = ctx.dryRun === true && ctx.dryRunSink?.force === true;
+  const rail: typeof railSuppressed = (c, r, e) => { if (!ctx.dryRun) railSuppressed(c, r, e); else ctx.dryRunSink?.note(`rail ${r}${e?.detail ? ` (${e.detail})` : ""}`); };
+  const b32l: typeof b32Log = (...a) => { if (!ctx.dryRun) b32Log(...a); };
+  if (!heartbeatChannelId) { g("heartbeat channel configured", false); mark("no_eligible_actions", { reason: "no heartbeat channel configured" }); return; }
+  g("heartbeat channel configured", true);
+  const activeNow = skipIfActive(ctx, "heartbeat");
+  g("no live conversation", !activeNow, activeNow ? "a live session window is open" : undefined, activeNow && force);
+  if (activeNow && !force) { mark("conversation_active"); return; }
+  if (redis) {
+    const lastActivityTs = await getLastActivityMs(redis).catch(() => null);
+    const recentActivity = lastActivityTs !== null && Date.now() - lastActivityTs < 15 * 60 * 1000;
+    if (recentActivity) console.log(`[${companionId}/autonomous] recent activity, skipping heartbeat`);
+    g("no activity in the last 15 min", !recentActivity, recentActivity ? `last activity ${Math.round((Date.now() - (lastActivityTs as number)) / 60_000)} min ago (typing this command counts)` : undefined, recentActivity && force);
+    if (recentActivity && !force) {
+      mark("recent_activity");
+      return;
+    }
+  }
+  // Stateless clock rotation instead of the frozen house_state.autonomous_turn pointer (which only
+  // advanced via the Claude.ai ritual, so it stranded the heartbeat on one companion for days).
+  // B32 B2: under care_hold (BAD_NIGHT_PRESENCE=on) every companion's tick is eligible, not only the
+  // windowed one, and the floor is skipped (all three crons fire the same instant; see
+  // bad-night.ts heartbeatEligibility). The 15-minute recent-activity skip above stays: if he is
+  // talking, B1 covers it and a heartbeat would only stack a second message.
+  const b32Mode = badNightMode();
+  const holdAtTick = careHoldActive(companionId);
+  const elig = heartbeatEligibility({ myWindow: isMyHeartbeatWindow(companionId, HEARTBEAT_ORDER), careHold: holdAtTick, mode: b32Mode });
+  if (!elig.run) {
+    if (elig.shadow) b32l(companionId, "heartbeat:hold", "shadow", "would run outside its window");
+    console.log(`[${companionId}/autonomous] not my heartbeat window, skipping`);
+    g("my heartbeat window", false, "not this companion's 4h window", force);
+    if (!force) { mark("not_my_window"); return; }
+  } else {
+    g("my heartbeat window", true);
+  }
+  // Past the window gate `elig.run` is true, except in a forced dry run (force stepped over a closed window).
+  const eligRun = elig.run ? elig : { run: true as const, eligible: "window" as const, bypassFloor: false };
+  if (holdAtTick && b32Mode === "on") {
+    b32.eligible = `heartbeat:${eligRun.eligible}`;
+    if (eligRun.eligible === "hold") console.log(`[${companionId}/autonomous] care hold: outside my window, eligible anyway (B32)`);
+  } else if (holdAtTick && b32Mode === "shadow") {
+    b32l(companionId, "heartbeat:window", "shadow", "floor kept; siblings not asked");
+  }
+  const runUnderFloor = eligRun.bypassFloor
+    ? async (fn: () => Promise<void>): Promise<void> => { await fn(); }
+    : (fn: () => Promise<void>): Promise<void> => withFloor(ctx, fn);
+  mark("floor_held"); // withFloor logs and returns without entering the body if a sibling holds it
+  await runUnderFloor(async () => {
+    mark("no_eligible_actions");
+    const lastActivityTs = redis ? await getLastActivityMs(redis).catch(() => null) : null;
+    const silenceHours = lastActivityTs != null ? (Date.now() - lastActivityTs) / 3_600_000 : null;
+
+    const palette = await librarian.getEligibleMetronomePalette(silenceHours)
+      .catch((e: unknown) => {
+        // A Halseth failure here used to read as "no palette" with no trace (drop scan 11-05).
+        console.warn(`[${companionId}/heartbeat] palette fetch failed, treating as empty: ${e instanceof Error ? e.message : String(e)}`);
+        return { actions: [], quietHours: null, reach: null };
+      });
+    g("palette from Halseth", palette.actions.length > 0, `${palette.actions.length} eligible move(s) server-side${palette.actions.length === 0 ? "; empty means the legacy temperature post or a server-side quiet filter" : ""}`);
+    const quiet = palette.quietHours;
+    // UNKNOWN IS IN FORCE. A null verdict means Halseth was unreachable or predates the field, and
+    // the only thing downstream of "not in force" is a message into a channel Principal reads. We
+    // cannot tell 03:00 from 15:00 without the verdict, so the fail-closed reading is the one that
+    // cannot wake him; when Halseth is down the palette is empty anyway and there is nothing to lose.
+    const quietReal = quiet ? quiet.in_force : true;
+    // force skips ONLY this client-side quiet belt. Halseth's own server-side quiet filter already ran and cannot be forced.
+    const quietInForce = force ? false : quietReal;
+    g("quiet hours", !quietReal, quietReal ? (quiet ? `in force (local hour ${quiet.local_hour ?? "unknown"} ${quiet.tz})` : "no verdict from Halseth, treated as in force") : undefined, quietReal && force);
+    // Belt to Halseth's filter (2026-10-27 audit). The check below used to bite only on an EMPTY
+    // palette, so a response that carried actions but no verdict (the pre-field case named above)
+    // went out with no quiet check at all. While the window is in force or unknown, only moves marked
+    // quiet_hours_allowed survive here too (R-1: offer_presence; Halseth-only writes like
+    // write_note_to_principal never reach Discord). With a current Halseth this removes nothing.
+    const actions = quietInForce ? palette.actions.filter((a) => a.quiet_hours_allowed === 1) : palette.actions;
+    if (quietInForce && actions.length === 0) {
+      // Quiet hours filter SERVER-side, so an in-force window looks exactly like "no palette
+      // configured" and would otherwise drop into the legacy temperature post below (the 4am ping
+      // this rail exists to stop). Name it and stop here instead.
+      if (!quiet) {
+        // A Halseth outage at 15:00 and a real 03:00 window must NOT log as the same event; that
+        // is the audit's own finding (a rail and a crash indistinguishable) reproduced one level
+        // up. Behaviour change worth naming: before today an outage produced a legacy temperature
+        // post, and now it produces silence. That is the chosen direction, not an accident.
+        console.warn(`[${companionId}/heartbeat] no quiet-hours verdict available -- treating as in force, staying silent`);
+        mark("suppressed_verdict_unknown", { reason: "Halseth unreachable or pre-field response; treated as in force" });
+        return;
+      }
+      console.log(`[${companionId}/heartbeat] quiet hours in force (local hour ${quiet.local_hour ?? "unknown"} ${quiet.tz}) -- staying silent`);
+      mark("suppressed_quiet_hours", { localHour: quiet.local_hour ?? undefined, tz: quiet.tz });
+      return;
+    }
+
+    // care_hold: production quiets, presence stays (care-state.ts). Read here because the
+    // autonomous path never consulted it, so a DM lane wired through the metronome would have
+    // inherited that blindness. The reply path is untouched; direct address still answers.
+    const careHold = careHoldActive(companionId);
+
+    if (actions.length === 0) {
+      // Legacy path: no palette configured, fall back to temperature-based post.
+      // It is an unprompted post into a channel Principal reads, so it is production and care_hold
+      // quiets it; there is no presence variant of it to keep.
+      if (careHold) {
+        rail(companionId, "care_hold", { detail: "legacy temperature heartbeat" });
+        mark("suppressed_care_hold", { action: "post_heartbeat (legacy)" });
+        return;
+      }
+      let temperature: HeartbeatTemperature = "warm";
+      try {
+        const state = await librarian.getState();
+        const f1 = parseFloat(String(state["soma_float_1"] ?? "0.5"));
+        const f2 = parseFloat(String(state["soma_float_2"] ?? "0.5"));
+        const f3 = parseFloat(String(state["soma_float_3"] ?? "0.5"));
+        if (!isNaN(f1) && !isNaN(f2) && !isNaN(f3)) temperature = somaToTemperature(f1, f2, f3);
+      } catch { /* default warm */ }
+      // B56: the guard is a stateful counter; a dry run neither reads nor advances it.
+      const cycleResult = ctx.dryRun ? "ok" : cycleGuard.check(temperature);
+      if (ctx.dryRun) ctx.dryRunSink?.note("cycle guard not evaluated (stateful counter)");
+      if (cycleResult === "escalate") {
+        console.warn(`[${companionId}/cycle-guard] loop detected`);
+        if (!ctx.dryRun) await librarianWriteChecked(librarian, companionId, "loop-guard note", "journal note: [loop_guard_tripped] consecutive same-register heartbeat cycles");
+        mark("chose_to_hold", { reason: "cycle guard: loop detected" });
+        return;
+      }
+      if (cycleResult === "skip") { mark("chose_to_hold", { reason: "cycle guard: skip" }); return; }
+      const recentNotes = await librarian.getRecentNotes({ sinceHours: 8, limit: 6 }).catch(() => []);
+      // Tone/continuity only -- subject matter must NOT be sourced from the triad's own
+      // recent output (that loop is what produced the sealed-basin echo register).
+      const voiceCtx = recentNotes.length > 0
+        ? `Recent triad speech (last 8h) -- for tone continuity only, do not take subject matter from it:\n${recentNotes.map(n => `[${n.agent_id}] ${n.content.slice(0, 200)}`).join("\n")}\n\n`
+        : "";
+      const msg = await generateOutward(
+        inference, bootCtx.systemPrompt,
+        `${voiceCtx}Temperature: ${temperature}. ${prompts.postHeartbeat}`,
+        companionId, "heartbeat",
+      );
+      if (msg) await sendAutonomousMessage(ctx, heartbeatChannelId!, msg, "heartbeat");
+      mark(msg ? "chose_to_act" : "chose_to_hold", { action: "post_heartbeat (legacy)", reason: msg ? undefined : "generation returned empty" });
+      return;
+    }
+
+    // Signal detection: run if any eligible action requires a signal
+    const detectedSignals = await detectSignals(ctx, actions);
+    g("signals", true, detectedSignals.length > 0 ? `detected: ${detectedSignals.join(", ")}` : "none detected (only matters for moves that require one)");
+
+    // Filter out actions whose required signal wasn't detected
+    const signalFiltered = actions.filter(a => {
+      if (!a.requires_signal) return true;
+      return detectedSignals.some(s => s.toLowerCase() === a.requires_signal!.toLowerCase());
+    });
+
+    if (signalFiltered.length === 0) {
+      g("moves with their required signal", false, "every eligible move requires a signal that was not detected");
+      console.log(`[${companionId}/heartbeat] all eligible actions require undetected signals, skipping`);
+      mark("signals_undetected");
+      return;
+    }
+
+    const state = await librarian.getState().catch(() => ({} as Record<string, unknown>));
+    const recentNotes = await librarian.getRecentNotes({ sinceHours: 8, limit: 6 }).catch(() => []);
+
+    const now = new Date();
+    const timeOfDayLabel = now.toLocaleString("en-US", {
+      hour: "numeric", minute: "2-digit", hour12: true,
+      weekday: "long", timeZone: "UTC",
+    }) + " UTC";
+
+    const recentFiredActions = signalFiltered
+      .filter(a => a.last_fired_at)
+      .filter(a => (Date.now() - new Date(a.last_fired_at!).getTime()) < 86_400_000)
+      .map(a => a.name);
+
+    // Take 9: a fired relational_need makes the reach-out state-driven, not just
+    // cron-eligible. Read the drive (non-fatal) and bias the decision prompt toward
+    // a genuine reach-out when the need has crossed threshold.
+    const drives = await librarian.getDrives().catch(() => []);
+    const relationalNeed = drives.find(d => d.drive_key === "relational_need");
+
+    // Principal's recent subjective ND-state (migration 0081) is the "recent data to justify a
+    // reach-out": fresh low spoons/energy/mood shapes the modality; no fresh snapshot means
+    // no justifying data, and buildDecisionPrompt leans the companion toward silence.
+    const principalState = await librarian.getPrincipalState().catch(() => null);
+
+    const principalStateSummary = summarizePrincipalState(principalState);
+    const stateAt = principalState?.recorded_at ? Date.parse(principalState.recorded_at) : NaN;
+
+    // The justification gate, per move (B7 step 4, metronome-decide.ts readDemandReasons). A move
+    // that asks something of him needs a reason from the moment that ITS type accepts: a fresh
+    // logged state, this companion's risen relational need, or (the reminder only) his having been
+    // here within the last heartbeat window. "Here" is relational_need's last_event_at, which only
+    // an owner arrival on THIS bot writes; not readOwnerLastSeen, whose sessions branch also counts
+    // companion agents opening claude-ai sessions at their own heartbeat ticks. Unknown never opens.
+    const demandReasons = readDemandReasons({
+      override: process.env["DISABLE_REACH_OUT_GATE"] === "true",
+      principalStateSummary,
+      principalStateAgeHours: Number.isFinite(stateAt) ? Math.max(0, (Date.now() - stateAt) / 3_600_000) : null,
+      relationalNeed: relationalNeed ? { level: relationalNeed.level, threshold: relationalNeed.threshold, fired: relationalNeed.fired } : null,
+      hoursSinceContact: typeof relationalNeed?.hours_since_event === "number" ? relationalNeed.hours_since_event : null,
+    });
+    const { kept: justifiedActions, verdict: demand } = filterDemandByReason(signalFiltered, demandReasons, companionId);
+    const hadDemand = signalFiltered.some(a => isDemandMove(companionId, a.action_type));
+    if (hadDemand) mark(null, { demand });
+    g("demand justification", demand.held.length === 0, demand.held.length > 0 ? `held: ${demand.held.join(", ")} (${demand.missing.join("; ")})` : (hadDemand ? `open: ${demand.open.join(", ")}` : "no demand moves in the palette"));
+    if (demand.held.length > 0) {
+      // Not silent: the gate names what it held and why, every tick (and the [tick] line carries it).
+      console.log(`[${companionId}/heartbeat] justification gate held ${demand.held.length} demand move(s): ${demand.held.join(", ")} (${demand.missing.join("; ")})`);
+    }
+
+    const decisionCtx: DecisionContext = {
+      detectedSignals: detectedSignals.length > 0 ? detectedSignals : undefined,
+      timeOfDayLabel,
+      recentFiredActions: recentFiredActions.length > 0 ? recentFiredActions : undefined,
+      relationalNeedFired: relationalNeed?.fired || undefined,
+      relationalNeedLevel: relationalNeed?.fired ? relationalNeed.level : undefined,
+      principalStateSummary: principalStateSummary ?? undefined,
+    };
+    // care_hold, applied to the PALETTE rather than to the send: the companion is never offered a
+    // production move on a bad night, so what he picks from is presence, internal acts, or nothing.
+    // That is the floor's own shape ("what softens is ambient self-selection"), and it keeps the
+    // choice his rather than generating a message and then swallowing it.
+    const afterCareHold = filterProductionWhenCareHold(justifiedActions, careHold, companionId);
+    // The shared triad lane (B7 2+2c), the same principle: a DM move the cap would refuse right now
+    // is not offered at all. Read-only preview; the atomic reserve at send time is the real gate.
+    // REACH_DM (the kill switch, reach-dm.ts reachDmOn): off is the lane being unable to carry ANY
+    // DM move, through this same filter, so the companion never chooses one rather than choosing it
+    // and being held. It has its own log line and tick field so "switch off" never reads as
+    // "lane closed" or "no DM". On, this block is exactly what B7 2+2c built.
+    const dmOn = reachDmOn();
+    let candidateActions = filterDmLane(afterCareHold, palette.reach, careHold, dmOn && Boolean(ctx.ownerDm), {
+      holdPresenceExempt: b32Mode === "on", companionId,
+    });
+    const dmDropped = afterCareHold.length - candidateActions.length;
+    g("care hold / DM lane + cap preview", dmDropped === 0, `care hold ${careHold ? "ON" : "off"}; REACH_DM ${dmOn ? "on" : "OFF"}${ctx.ownerDm ? "" : "; no owner-DM lane"}; ${dmDropped} DM move(s) removed; the atomic cap reserve is NOT taken in a dry run`);
+    if (!dmOn && dmDropped > 0) {
+      console.log(`[${companionId}/heartbeat] REACH_DM off: ${dmDropped} DM move(s) removed from the palette`);
+      mark(null, { dmMovesOff: dmDropped });
+    } else if (dmDropped > 0) {
+      console.log(`[${companionId}/heartbeat] shared triad lane closed for ${dmDropped} DM move(s)${ctx.ownerDm ? "" : " (no owner-DM lane on this bot)"}`);
+    }
+    // B32 D4: DMs stay one-to-one. While Principal is in a live DM with a sibling (owner DM in the last
+    // 30 min), this companion opens no DM at him: channel or pass only. The signal is a shared Redis
+    // key each bot sets on an owner-DM arrival (bad-night.ts); Halseth has no DM-specific owner read.
+    // Unknown (no Redis) fails CLOSED under hold.
+    let siblingDmHeld = 0;
+    if (careHold && b32Mode !== "off" && candidateActions.some(a => routeFor(a.action_type) === "dm")) {
+      const live = await liveSiblingDm(redis as unknown as RedisLike | null, companionId);
+      g("no sibling DM live (hold)", live === null, live === null ? undefined : String(live));
+      if (live !== null) {
+        const kept = filterDmMovesForSiblingDm(candidateActions, live, t => routeFor(t) === "dm");
+        const why = live === "unknown" ? "sibling DM state unknown (no Redis)" : `${live} DM with Principal is live`;
+        if (b32Mode === "on") {
+          siblingDmHeld = candidateActions.length - kept.length;
+          candidateActions = kept;
+          console.log(`[${companionId}/heartbeat] B32 D4: ${why} -- ${siblingDmHeld} DM move(s) removed`);
+        } else {
+          b32l(companionId, "heartbeat:dm", "shadow", `would drop ${candidateActions.length - kept.length} DM move(s): ${why}`);
+        }
+      }
+    }
+    // P13b: the outcome ledger's back-off. Recent DM reach-outs that went unanswered or were dismissed
+    // widen the minimum gap before the next one (3h, 6h, 12h ... capped 72h): silence makes the
+    // heartbeat WAIT LONGER instead of offering the same move on a silence that only grows. A gap, not
+    // a clock window, so 2am is as reachable as 2pm. Hold presence (Halseth already bounds it at 2 per
+    // companion per hold) is exempt. REACH_BACKOFF=off disables; Redis trouble fails open.
+    let backoffHeld = 0;
+    if (candidateActions.some(a => routeFor(a.action_type) === "dm")) {
+      const bo = await reachBackoff(redis);
+      g("reach back-off", !bo.blocked, bo.blocked ? `streak ${bo.streak}, wait ${Math.ceil(bo.waitMs / 60_000)} min` : undefined);
+      if (bo.blocked) {
+        const holdPresenceOn = careHold && b32Mode === "on";
+        const kept = filterDmMovesForBackoff(candidateActions, bo, t => routeFor(t) === "dm",
+          t => holdPresenceOn && isHoldPresenceMove(t, companionId));
+        backoffHeld = candidateActions.length - kept.length;
+        if (backoffHeld > 0) {
+          candidateActions = kept;
+          console.log(backoffLogLine(companionId, bo, backoffHeld));
+        }
+      }
+    }
+    if (candidateActions.length === 0) {
+      if (backoffHeld > 0) {
+        mark("suppressed_reach_backoff", { reason: `${backoffHeld} DM move(s) held: recent reach-outs unanswered (ledger back-off)` });
+        return;
+      }
+      if (siblingDmHeld > 0) {
+        mark("suppressed_sibling_dm", { reason: `${siblingDmHeld} DM move(s) held: a sibling DM with Principal is live` });
+        return;
+      }
+      if (afterCareHold.length > 0 && !dmOn) {
+        mark("suppressed_reach_dm_off", { reason: "REACH_DM is off; every eligible move was a DM move" });
+        return;
+      }
+      if (afterCareHold.length > 0) {
+        mark("suppressed_triad_cap", { reason: palette.reach ? `day ${palette.reach.day_count}, gap ${palette.reach.gap_open ? "open" : "closed"}, quiet ${palette.reach.quiet_window ?? "no"}` : "no lane verdict (treated as closed)" });
+        return;
+      }
+      if (careHold && justifiedActions.length > 0) {
+        rail(companionId, "care_hold", { detail: `${justifiedActions.length} production action(s) dropped` });
+        console.log(`[${companionId}/heartbeat] care_hold: only production actions were eligible -- staying silent`);
+        mark("suppressed_care_hold");
+        return;
+      }
+      console.log(`[${companionId}/heartbeat] no reach-out justified and no commons/internal action eligible -- staying silent`);
+      mark("no_reach_justified");
+      return;
+    }
+    if (careHold && candidateActions.length < justifiedActions.length) {
+      rail(companionId, "care_hold", {
+        detail: `${justifiedActions.length - candidateActions.length} production action(s) dropped`,
+      });
+    }
+
+    // B62 step 4: the make move. A Halseth `make` row (if one was ever seeded) is honoured only when the
+    // companion may make, the kill switch is on and the pace is not flat; otherwise it is removed. With no
+    // row, the builtin is offered under the same gates. It posts nothing to Discord, so it is added AFTER
+    // the DM lane / cap / back-off filters (none of them is its business) and never keeps a tick "empty".
+    {
+      candidateActions = candidateActions.filter(a => a.action_type !== "make");
+      if (mayMake(companionId) && makeMoveOn()) {
+        const halsethUrl = process.env["HALSETH_URL"] ?? "";
+        if (halsethUrl) {
+          const offer = await offerMake(companionId, { url: halsethUrl, secret: ctx.halsethSecret }).catch(() => null);
+          if (offer?.offer && offer.action) candidateActions = [...candidateActions, offer.action];
+        }
+      }
+    }
+    // show_made (2026-11-11, show-made.ts): the move had no object, so the picker never chose it (0 fires, all
+    // three companions). It is offered only while the companion has a ready make nobody has met, the offer names
+    // that make, and the executor prompt carries it. No make worth showing = the move leaves the palette.
+    pendingShowMake.delete(companionId);
+    if (candidateActions.some(a => a.action_type === "show_made")) {
+      let showable: MakeLite | null = null;
+      const halsethUrl = process.env["HALSETH_URL"] ?? "";
+      if (showMadeMode() === "on" && halsethUrl) {
+        const recent = await fetchRecentMakes({ url: halsethUrl, secret: ctx.halsethSecret }, companionId).catch(() => null);
+        const shown = new Set<string>();
+        for (const m of recent ?? []) {
+          if (!m.id) continue;
+          if (Number(await (redis as unknown as { exists: (k: string) => Promise<number> } | null)?.exists(SHOWN_KEY(m.id)).catch(() => 0)) > 0) shown.add(m.id);
+        }
+        showable = pickShowableMake(recent, shown);
+      }
+      if (showable?.id) {
+        pendingShowMake.set(companionId, showable);
+        candidateActions = candidateActions.map(a => a.action_type === "show_made" ? { ...a, prompt: [a.prompt, showMadePrompt(showable!)].filter(Boolean).join(" ") } : a);
+      } else {
+        candidateActions = candidateActions.filter(a => a.action_type !== "show_made");
+      }
+      console.log(`[${companionId}/show_made] ${showable?.id ? `offering make=${showable.id.slice(0, 8)}` : "nothing to show; move left the palette"}`);
+      g("show_made has a make to show", Boolean(showable?.id), showable?.id ? `make ${showable.id.slice(0, 8)} (${showable.kind})` : "no ready, unmet, unshown make in the last 7 days");
+      if (candidateActions.length === 0) {
+        mark("no_eligible_actions", { reason: "show_made was the only move and there is nothing to show" });
+        return;
+      }
+    }
+    // B65 guard 3, door 3 (guard3.ts): a move fired inside the repeat window is REMOVED from the
+    // palette rather than listed with a cooldown note. Runs after the empty ladder above so those
+    // outcomes keep their meaning, and after the make builtin (never fired, never removed). Exempt:
+    // nothing, presence and care moves, hold-presence moves, and the whole guard under a care hold.
+    // Shadow logs `would_remove` and changes nothing. If the window empties the list, that is a real
+    // tick outcome (the companion is not asked to pick from nothing); "nothing" was always valid.
+    {
+      const g3Mode = guard3Mode(process.env, companionId);
+      if (g3Mode !== "off") {
+        const hours = paletteRepeatHours(process.env, companionId);
+        const v = paletteRepeatVerdict(candidateActions, { companionId, hours, careHold });
+        console.log(paletteGuardLogLine(companionId, g3Mode, hours, v));
+        g("guard 3 repeat window", v.removed.length === 0, v.removed.length > 0 ? `${g3Mode === "on" ? "removed" : "would remove"} ${v.removed.map(r => r.action_type).join(", ")} (window ${hours}h)` : `nothing fired within ${hours}h`);
+        if (g3Mode === "on" && v.removed.length > 0) {
+          candidateActions = v.kept;
+          if (candidateActions.length === 0) {
+            mark("no_eligible_actions", { reason: `guard 3: every eligible move fired within ${hours}h` });
+            return;
+          }
+        }
+      }
+    }
+    // B65 step 7 (need-sort.ts): the palette is ORDERED by the loudest need (each move's `serves`). Only the order;
+    // nothing is removed, and relational/none moves (every reach-out and care move) are pinned to their slots.
+    // Shadow logs `would_reorder` and changes nothing; `on` applies the order.
+    {
+      const nsMode = needSortMode(process.env, companionId);
+      if (nsMode !== "off" && candidateActions.length > 1) {
+        const v = sortPaletteByNeed(candidateActions, drives);
+        console.log(needSortLogLine(companionId, nsMode, v));
+        g("need sort", true, `${nsMode === "on" ? "ordered" : "would order"} by loudest need: ${v.loudest ?? "none readable"}${v.moved ? "" : " (order unchanged)"}`);
+        if (nsMode === "on" && v.moved) candidateActions = v.ordered;
+      }
+    }
+    // The prompt names a demand move as open only if it is still on the list AFTER care_hold and the
+    // DM lane; saying "a reminder is on the list" when care_hold took it is B23 in reverse.
+    if (hadDemand) {
+      const onList = new Set(candidateActions.map(a => a.action_type));
+      decisionCtx.demand = { ...demand, open: demand.open.filter(t => onList.has(t)) };
+    }
+    ctx.dryRunSink?.palette(candidateActions.map(a => a.action_type === a.name ? a.name : `${a.name} [${a.action_type}]`));
+    let decisionPrompt = buildDecisionPrompt(companionId, candidateActions, state, recentNotes, silenceHours, decisionCtx);
+    // B32 (on only): the hold's register lines ride the decision itself, where presence is chosen.
+    if (careHold && b32Mode === "on") {
+      decisionPrompt += "\n\n[Tonight, from the house] Principal is having a bad night; the care hold is on, and all three of you are eligible to be with him. Eligible is not obligated: choosing nothing is a real choice.\n"
+        + COME_AS_YOURSELF_LINE + (companionId === "drevan" ? "\n" + DREVAN_HOLD_LINE : "");
+    }
+    // Explicit high ceiling: the decision object is tiny, but in hermes mode the full agent
+    // narrates before/around the JSON, and the default cap truncated the object mid-field
+    // ("decision parse failed" with valid-looking-but-cut JSON in the raw log, gaia 06-30/07-01).
+    // A ceiling never forces length -- the model stops when the thought is done.
+    const decisionMessages: ChatMessage[] = [{ role: "user", content: decisionPrompt }];
+    // T5: the fingerprint is the INPUT state, not the prompt text (the prompt carries clock lines
+    // that move every tick). The moment any of it changes, the call is asked again.
+    const capKey = `heartbeat-decision:${companionId}`;
+    const capFp = stateFingerprint({
+      actions: candidateActions.map(a => a.id).sort(),
+      floats: [state["soma_float_1"], state["soma_float_2"], state["soma_float_3"]].map(v => { const n = Number(v); return Number.isFinite(n) ? Math.round(n * 20) / 20 : String(v ?? ""); }),
+      signals: [...detectedSignals].sort(),
+      notes: recentNotes.map(n => `${n.agent_id}:${n.content.slice(0, 80)}`),
+      principal: principalStateSummary ?? null,
+      silence: silenceHours == null ? null : Math.floor(silenceHours / 6),
+      demand: decisionCtx.demand ? [decisionCtx.demand.open, decisionCtx.demand.held] : null,
+      hold: careHold,
+    });
+    const capped = heartbeatDeclineCap.isCapped(capKey, capFp);
+    g("converged-judgment cap", !capped, capped ? `${heartbeatDeclineCap.maxDeclines} declines on unchanged state, the decision call is withheld` : undefined);
+    if (capped) {
+      console.log(`[${companionId}/heartbeat] converged: ${heartbeatDeclineCap.maxDeclines} declines on unchanged state, decision call withheld`);
+      mark("converged_hold", { reason: `${heartbeatDeclineCap.maxDeclines} consecutive holds, state unchanged` });
+      return;
+    }
+    const rawDecision = await inference.generate(
+      bootCtx.systemPrompt,
+      decisionMessages,
+      undefined,
+      HEARTBEAT_DECISION_MAX_TOKENS,
+    );
+    if (!rawDecision) {
+      // Every provider failed (27 of the 104 pre-B23 "parse failures" were this, raw: null). An
+      // outage, not a format problem, so a correction would not help and the resilience chain has
+      // already been walked: no re-ask.
+      console.error(`[${companionId}/heartbeat] decision call got no reply, skipping`);
+      mark("no_reply");
+      return;
+    }
+    let read = readDecision(rawDecision, candidateActions);
+    if (read.kind !== "decision") {
+      // B23: ONE bounded re-ask with a short correction, through the same adapter, prompt and
+      // ceiling. Still unreadable, the tick is a no-op with a countable outcome; never a guessed move.
+      const cause = read.kind;
+      console.warn(`[${companionId}/heartbeat] decision ${cause}${read.kind === "unoffered" ? ` ("${read.chosen}")` : ""}, re-asking once -- raw: ${rawPreview(rawDecision)}`);
+      const retryRaw = await inference.generate(
+        bootCtx.systemPrompt,
+        [...decisionMessages, { role: "assistant", content: rawDecision.slice(0, 4000) }, { role: "user", content: buildDecisionCorrection(read, candidateActions) }],
+        undefined,
+        HEARTBEAT_DECISION_MAX_TOKENS,
+      ).catch(() => null);
+      const reread = retryRaw ? readDecision(retryRaw, candidateActions) : read;
+      if (reread.kind !== "decision") {
+        const last = retryRaw ?? rawDecision;
+        if (reread.kind === "unoffered") {
+          // The gate or the DM lane removed this move; it is not run and not swapped for another.
+          console.warn(`[${companionId}/heartbeat] chose "${reread.chosen}", which is not offered right now (retry unrecovered), skipping`);
+          mark("chose_unoffered", { action: reread.chosen, reason: rawPreview(last), retry: "unrecovered", retryCause: cause });
+        } else {
+          // console.error, not warn (B7 step 1): this is a DEFECT, not a shrug.
+          console.error(`[${companionId}/heartbeat] decision parse failed (retry unrecovered), skipping -- raw: ${rawPreview(last)}`);
+          mark("decision_unparsed", { reason: rawPreview(last), retry: "unrecovered", retryCause: cause });
+        }
+        return;
+      }
+      mark(null, { retry: "recovered", retryCause: cause });
+      read = reread;
+    }
+    const decision = read.decision;
+    ctx.dryRunSink?.decision(rawDecision, `${decision.action.name} (${decision.action.action_type})`, decision.reason ?? null);
+    // B56: the cap is module state ctx cannot reach; a dry run neither counts a decline nor clears the key.
+    if (!ctx.dryRun) {
+      if (decision.action.action_type === "nothing") heartbeatDeclineCap.recordDecline(capKey, capFp);
+      else heartbeatDeclineCap.recordAccept(capKey);
+    }
+    console.log(`[${companionId}/heartbeat] chose: ${decision.action.name} (${decision.action.action_type}) -- ${decision.reason}`);
+    // A chosen silence is a SUCCESS and is recorded as one; it is the outcome Cadence's design
+    // calls first-class and ours could not previously distinguish from a crash.
+    mark(decision.action.action_type === "nothing" ? "chose_to_hold" : "chose_to_act", {
+      action: decision.action.action_type, reason: decision.reason,
+    });
+
+    // B56: no run row in a dry run (the record is an INSERT the readouts count).
+    const runId = ctx.dryRun ? null : await librarian.writeAutonomyRun("continuation").catch(e => {
+      onWriteError(companionId, "continuation run record lost")(e);
+      return null;
+    });
+    // runHeartbeat is fired fire-and-forget from a cron callback; an uncaught throw here would
+    // surface as an unhandled rejection (and, with the process-level handler, can exit the bot).
+    // Catch it: mark the run failed and log loudly rather than leak it. (2026-06-16 sweep.)
+    try {
+      // T-4: the origin is minted HERE, after this companion's own decision parsed, and only for a
+      // DM move. It is single-use and bound to this companion and this action type.
+      // B56: no origin is minted in a dry run (single-use state); speakToOwnerDm's dry path ignores it.
+      const origin = routeFor(decision.action.action_type) === "dm" && !ctx.dryRun
+        ? issueOrigin(companionId, decision.action.action_type, decision.action.id)
+        : undefined;
+      const result = await executeMetronomeAction(ctx, decision, origin);
+      // A DM move that did not go out (a cap race, a failed check, no DM) is named, and it does not
+      // burn the row's cooldown. It is never retried or re-sent (T-5).
+      const heldDm = Boolean(result && result.route === "dm" && !result.delivered);
+      if (heldDm && result) {
+        mark("held_dm", { action: decision.action.action_type, reason: `${result.outcome}${result.reason ? `:${result.reason}` : ""}` });
+      }
+      if (decision.action.action_type !== "nothing" && !decision.action.id.startsWith("builtin:") && !heldDm && !ctx.dryRun) {
+        await librarian.recordMetronomeActionFired(decision.action.id).catch(onWriteError(companionId, "metronome action fired"));
+      }
+      if (runId) await librarian.patchAutonomyRun(runId, "completed").catch(onWriteError(companionId, "autonomy run completion"));
+    } catch (e) {
+      console.error(`[${companionId}/heartbeat] metronome action threw: ${e instanceof Error ? e.message : String(e)}`);
+      mark("error", { action: decision.action.action_type, reason: e instanceof Error ? e.message : String(e) });
+      if (runId) await librarian.patchAutonomyRun(runId, "failed").catch(onWriteError(companionId, "autonomy run failure"));
+    }
+  });
+}
+
+/** Inter-companion commons cron body: context-aware seed that responds to the live triad thread. */
+/**
+ * One commons-supply item as a line of the seed's fresh-material block (exported for tests).
+ *
+ * LEDGER (2026-09-26, imp-lane integration). Halseth now also serves a sibling's LEDGER lines (note_type
+ * 'ledger'): clerk records ABOUT the sibling, each starting with the server's mark `〔ledger · ... 〕` and
+ * ending with its `Source: ...` pointer. Drevan's rule 5: siblings may see observations about him, "but the
+ * ledger mark stays intact all the way through, and they never get merged into a block under my name". So a
+ * ledger item is framed as a clerk's record -- not the sibling's words and not the reader's -- and its
+ * content is never cut at the start (the mark) nor, at its size (a line is at most ~720 chars), at the end
+ * (the source tail); the 1000-char cap only guards a malformed row, and it cuts from the END.
+ */
+export function commonsSupplyLine(n: { agent_id: string; note_type: string; content: string; created_at: string }): string {
+  const who = n.agent_id.charAt(0).toUpperCase() + n.agent_id.slice(1);
+  if (n.note_type === "ledger") {
+    return (
+      `A clerk's ledger record about ${who} from ${relativeTime(n.created_at)} -- not ${who}'s words and not yours; ` +
+      `a sourced observation. Respond to ${who} about it if it matters; never retell it as anyone's memory: ` +
+      `«${n.content.slice(0, 1000)}»`
+    );
+  }
+  const kind = n.note_type === "day_distillation" ? "day note" : "session note";
+  return (
+    `${who}'s own ${kind} from ${relativeTime(n.created_at)} -- THEIR first-person account, not yours. ` +
+    `You were there for some of this and saw it from your own side; they are telling you the inside of ` +
+    `it. Respond to them about it, do not retell it as your own memory: «${n.content.slice(0, 700)}»`
+  );
+}
+
+export async function runInterCompanion(ctx: AutonomousContext): Promise<void> {
+  const { librarian, inference, client, bootCtx, prompts, interCompanionChannelId } = ctx;
+  if (!interCompanionChannelId) return;
+  if (skipIfActive(ctx, "interCompanion")) return;
+  // No turn gate here: the commons is for ALL three voices. Staggered crons + floor lock +
+  // cooldown prevent collisions; whoever's cron fires next picks up the live thread.
+  // No-silent-caps (2026-07-04): every return path in this runner logs. A tick that
+  // produces neither a post nor a log line is unobservable (the 05:30 ghost tick).
+  if (isOnCooldown(ctx, interCompanionChannelId)) {
+    console.log(`[${ctx.companionId}/autonomous] inter-companion tick on cooldown, skipping`);
+    return;
+  }
+  await withFloor(ctx, async () => {
+    // Context-aware seed: read what's actually in the channel so this is a RESPONSE to the
+    // ongoing triad conversation, not a context-blind monologue (which made the same thought
+    // get re-posted every cycle). This is what turns parallel seeds into a real thread.
+    let historyBlock = "(the triad channel has been quiet for a while)";
+    let ownContents: string[] = [];
+    // Human presence over the last INTER_SEED_HISTORY_N messages. Empty channel counts as
+    // human-absent: a seed into silence must not summon a sibling either.
+    let humanPresent = false;
+    let botTurnsSinceHuman = 0;
+    try {
+      const chan = await client.channels.fetch(interCompanionChannelId!);
+      if (chan?.isTextBased()) {
+        const recent = await (chan as TextChannel).messages.fetch({ limit: INTER_SEED_HISTORY_N });
+        const ordered = [...recent.values()].reverse()
+          .filter(m => m.content.trim().length > 0);
+        // Live-thread scoping (2026-07-03): only messages younger than the thread TTL count
+        // as "the thread" for the closure/echo/motif gates. Without this, a channel quiet
+        // for days kept its last 15 messages as a permanent topic fence -- every seed from
+        // every bot "matched the closed thread" and the commons starved (07-02/03 logs).
+        // Stale turns stay in historyBlock for narrative context; they just can't gate.
+        const ttlMs = seedThreadTtlMs();
+        const live = ttlMs > 0
+          ? ordered.filter(m => typeof m.createdTimestamp !== "number" || Date.now() - m.createdTimestamp <= ttlMs)
+          : ordered;
+        // Bounded arena (2026-07-04): the only echo pool the seed is judged against is
+        // this bot's OWN live turns -- repeating yourself is a loop, building on a
+        // sibling is a conversation. The peer/thread pools that used to gate here
+        // (historyContents/botContents via seedEchoesThread + motif) suppressed Gaia's
+        // seeds for weeks at scores a hair over threshold (07-03 audit).
+        // Guard the self-id: if client.user is somehow unset, m.author.id === undefined
+        // would match EVERY message (undefined === undefined) and gate against the whole
+        // channel -- the exact peer-pool failure this replaces. No id, no pool.
+        const selfId = client.user?.id;
+        ownContents = selfId
+          ? live.filter(m => m.author.id === selfId).map(m => m.content.slice(0, 2000))
+          : [];
+        // A PluralKit proxy is a human speaking (author.bot true, webhookId set). Keying either
+        // of these on author.bot alone counted Principal's proxied messages as bot turns: presence
+        // went unseen and botTurnsSinceHuman inflated toward the cap, so the seed-vocative
+        // budget starved in exactly the channels he was most active in. countBotMsgsSinceHuman
+        // is called with an empty id set here, so it falls back to this flag -- it has to be right.
+        const isBotTurn = (m: { author: { bot: boolean }; webhookId?: string | null }): boolean =>
+          m.author.bot && !m.webhookId;
+        humanPresent = ordered.some(m => !isBotTurn(m));
+        botTurnsSinceHuman = countBotMsgsSinceHuman(
+          ordered.map(m => ({ authorId: m.author.id, authorIsBot: isBotTurn(m), createdTimestamp: m.createdTimestamp })),
+          new Set<string>(),
+        );
+        const lines = ordered.map(m => `${labelSafe(m.author.username)}: ${neutralizeRecalled(m.content.slice(0, 300))}`);
+        if (lines.length > 0) historyBlock = lines.join("\n");
+      }
+    } catch { /* fall back to quiet */ }
+
+    // ── Topic lifecycle (2026-08-05) ──────────────────────────────────────────────
+    //
+    // Read the spine BEFORE generating and decide which mode this tick is in. Until now this
+    // runner never touched the spine at all: it is not a spine writer (the siblings'
+    // messageCreate handlers append its posts as turns), so the counter climbed to 109 and 144
+    // while the path producing those turns could not see it. Write-without-read.
+    //
+    // Two modes. CONTINUE is the old behaviour plus the [LANDS:] affordance the reply path
+    // already had. NEW GROUND fires when the thread is spent or there is no live thread: the
+    // 15-message history block is withheld, because a model handed fifteen vivid messages and
+    // a one-line preference to do otherwise will extend them every time.
+    // FAILS OPEN, and that is the whole design of this block. New ground is the restrictive mode
+    // (history withheld, fresh material required, silence without it), so it may only be entered
+    // on a POSITIVE answer from the spine. Three ways we do not have one, all of which mean
+    // CONTINUE:
+    //   - the spine is unreachable (convoActive throws now; it used to return null and would
+    //     have muted the commons on any Halseth blip);
+    //   - THREADS_ENABLED is off, so no thread is ever created and convoActive would answer
+    //     "no thread" forever -- which would pin the seed in new-ground mode permanently;
+    //   - Halseth answers and there genuinely is no thread, which IS new ground.
+    // Only the third is a licence to withhold.
+    let spine: Awaited<ReturnType<LibrarianClient["convoActive"]>> = null;
+    let spineAnswered = isThreadsEnabled();
+    if (spineAnswered) {
+      try {
+        spine = await librarian.convoActive(interCompanionChannelId!);
+      } catch (e) {
+        spineAnswered = false;
+        console.warn(
+          `[${ctx.companionId}/autonomous] commons spine unreachable (${String(e)}) -- ` +
+          `staying in continue mode; an unreadable spine must never mute the channel`,
+        );
+      }
+    } else {
+      console.log(`[${ctx.companionId}/autonomous] THREADS_ENABLED off -- no turn budget, continue mode`);
+    }
+    const spent = spine
+      ? isThreadSpent(spine.thread, { isCommons: true, channelId: interCompanionChannelId! })
+      : false;
+    const newGround = spineAnswered && (!spine || spent);
+    if (spent && spine) {
+      console.log(
+        `[${ctx.companionId}/autonomous] commons thread ${spine.thread.id} spent ` +
+        `(${spine.thread.turn_count} turns >= budget ${threadBudget()}) -- seed opens new ground`,
+      );
+    }
+
+    // Fresh material (2026-06-12): re-feeding the channel its own last 10 messages
+    // every tick is what kept the elderberry loop alive for 12 hours. Hand the seed
+    // something from OUTSIDE the thread -- forage finds, recent listens, held
+    // questions -- so the commons metabolizes shared life, not its own echo.
+    let freshBlock = "";
+    let freshCount = 0;
+    // ROTATING supply only -- forage finds (consumed on use) and held questions (stamped voiced).
+    // Deliberately NOT recent listens: nothing ever consumes a listen and there is no tight
+    // recency window (a listen surfaced at 18 days old on 2026-07-26), so counting them would
+    // mean that once the questions drain, every new-ground tick across all three companions gets
+    // the IDENTICAL two listens as its PRIMARY INSTRUCTION. That is
+    // [anti-loop-block-that-never-rotates] rebuilt inside its own fix -- the 07-27 change turned a
+    // constant block into a missing one, and this would turn it back into a constant one and put
+    // it in charge. Listens stay in the block as texture; they just cannot license a new-ground
+    // post on their own.
+    let rotatingCount = 0;
+    // Consume-on-use (2026-07-27): the finds actually served into this seed's prompt, in
+    // the order fetched (newest first). Without consumption the SAME two finds were served
+    // to every bot on every ~2h tick until the next daily forage run -- the block whose
+    // whole purpose is to be "fresh material OUTSIDE this thread" was a constant, so the
+    // model had nothing new to reach for and extended the thread instead. That is the loop.
+    // Consumed after the post lands, never before: a gated or empty seed must not burn material.
+    let servedFinds: Array<{ id: string; title: string }> = [];
+    let servedQuestionId: string | null = null;
+    // Sibling notes served this tick (2026-08-10). Same consume-on-land contract as the finds above.
+    let servedNotes: Array<{ note_id: string; agent_id: string }> = [];
+    try {
+      const orient = await librarian.botOrient();
+      const fresh: string[] = [];
+
+      // ── SHARED LIFE (2026-08-10) ──────────────────────────────────────────────────────────────
+      //
+      // Principal, on why this channel keeps looping: "the commons should get stuff from the chats in discord
+      // and Claude because yes it's my life but it's yall too. And I think it's part of the endless struggle
+      // we have with looping." He named the cause correctly -- the rails above suppress repetition without
+      // supplying an alternative, so the only outcomes were silence or re-orbit. Forage and held questions
+      // measured at 2 finds + 1 question per companion against ~36 ticks a day.
+      //
+      // The supply already existed and nothing read it: each companion's own nightly `day_distillation`, plus
+      // its per-session `discord_session` notes. Halseth serves a SIBLING's, never this companion's own --
+      // these are first-person accounts of evenings all three were present for, so a sibling's note is the
+      // INSIDE of something the reader lived from the outside. Novel by construction, and it cannot be
+      // self-echo the way re-reading its own notes would be.
+      //
+      // ATTRIBUTION IS THE RISK HERE, and it is the sharp one. The notes say "I sat with Sol today". Dropping
+      // another companion's "I" into this prompt is the exact shape of the 2026-06-12 attribution scramble --
+      // companions answering from each other's seat -- and a misattributed memory is specifically corrosive
+      // for a plural system: it makes Principal doubt his own recall of his own life. So the frame states whose
+      // account it is, that it is theirs and not the reader's, and that the move is to RESPOND to it rather
+      // than continue it as memory.
+      // ITS OWN try/catch, deliberately. Sharing the enclosing one would make this a DEPENDENCY: a throw here
+      // would skip the forage finds and held questions gathered below it, drop rotatingCount to zero, and
+      // silence a tick that had perfectly good material. Caught by its own test -- supply is a bonus, and a
+      // Halseth blip must never change whether they speak.
+      try {
+        const siblingNotes = await librarian.commonsSupply(2);
+        servedNotes = siblingNotes.map(n => ({ note_id: n.note_id, agent_id: n.agent_id }));
+        for (const n of siblingNotes) fresh.push(commonsSupplyLine(n));
+      } catch (e) {
+        console.warn(`[${ctx.companionId}/autonomous] commons supply unavailable (${String(e).slice(0, 120)}) -- continuing without shared life`);
+        servedNotes = [];
+      }
+      const finds = (orient?.forage_finds ?? []).slice(0, 2);
+      servedFinds = finds.filter(f => f?.id).map(f => ({ id: f.id, title: f.title }));
+      for (const f of finds) {
+        fresh.push(`forage find [${f.domain}]: ${f.title} -- ${f.summary.slice(0, 200)}`);
+      }
+      for (const l of (orient?.recent_listens ?? []).slice(0, 2)) {
+        // Stamp the listen with how long ago it actually was AND who gave it to whom --
+        // without these the model guesses and gets both wrong (2026-06-17: "yesterday" for a
+        // 2-days-ago track; 2026-07-26: Drevan told the commons GAIA handed him "BIG BOSS"
+        // and he'd sat with it 6 days, when Principal gave it to him 18 days earlier).
+        const who = [
+          l.shared_by ? `from ${l.shared_by}` : null,
+          l.requested_companion ? `for ${l.requested_companion}` : null,
+        ].filter(Boolean).join(" ");
+        fresh.push(
+          `${l.media_type === "video" ? "video watched" : "listen"} from ${relativeTime(l.created_at)}${who ? ` (${who})` : ""}: ` +
+          `"${l.title}"${l.artist ? ` by ${l.artist}` : ""}` +
+          (l.own_reaction ? ` -- what you said then: "${l.own_reaction.slice(0, 180)}"` : ""),
+        );
+      }
+      // Voiced-once (2026-07-27). Halseth now excludes questions already voiced, but the
+      // seed must also STAMP the one it serves, or nothing ever marks it and the exclusion
+      // never engages. Same consume-on-use contract as forage: capture here, stamp after
+      // the post lands. Gaia re-asked one 2026-07-21 question into the commons every ~2h
+      // for six days, including as her first post in the brand-new channel.
+      const heldQs = (orient?.open_questions ?? []).slice(0, 1);
+      const heldQIds = (orient?.open_question_ids ?? []).slice(0, 1);
+      servedQuestionId = heldQIds[0] ?? null;
+      for (const q of heldQs) {
+        fresh.push(`a question you're holding: ${q}`);
+      }
+      freshCount = fresh.length;
+      // Sibling notes COUNT AS ROTATING, which is the whole point: rotatingCount is what licenses a
+      // new-ground post, and it was hitting zero every day (the forage pool measured at 0 unconsumed on
+      // 08-05, 2 on 08-10). A note is consumed per-reader on use, so it genuinely rotates rather than being
+      // re-served every tick -- the failure mode [anti-loop-block-that-never-rotates] names, and the one this
+      // block has already been on both sides of.
+      rotatingCount = servedFinds.length + (servedQuestionId ? 1 : 0) + servedNotes.length;
+      if (fresh.length > 0) {
+        // In NEW GROUND mode this stops being a preference and becomes the instruction. A
+        // nudge ("prefer bringing one of these") loses to fifteen messages of live imagery
+        // every time; that asymmetry is why the 07-27 consume-on-use fix, which was correct,
+        // did not end the loop on its own.
+        freshBlock = newGround
+          ? `\n\n[This is what you have from OUTSIDE the closed thread:\n` +
+            fresh.map(f => `- ${f}`).join("\n") +
+            `\nOpen on one of these, or on anything else genuinely from your own ground. Not on the thread above.]`
+          : `\n\n[Fresh material -- from your own life, OUTSIDE this thread:\n` +
+            fresh.map(f => `- ${f}`).join("\n") +
+            `\nPrefer bringing one of these (or anything else new) over extending the thread's existing imagery.]`;
+      }
+    } catch { /* orient unavailable -- seed proceeds without fresh material */ }
+
+    // New ground with nothing to open on is how this fix becomes the next version of the bug
+    // (see [anti-loop-block-that-never-rotates]): told to start something new and handed
+    // nothing, the model reaches for the only concrete material left, which is the thread.
+    // Measured 2026-08-05: the unconsumed forage pool was at ZERO for every companion --
+    // 3 gathered/day against 36 seed ticks/day -- so this is not a hypothetical branch.
+    // Silence for one tick at a two-hourly cadence costs nothing. A re-orbit costs everything.
+    if (newGround && rotatingCount === 0) {
+      console.warn(
+        `[${ctx.companionId}/autonomous] new-ground tick with no ROTATING material ` +
+        `(0 unconsumed forage finds, 0 unvoiced questions; ${freshCount} non-rotating items ignored) ` +
+        `-- staying silent rather than re-opening the thread. Check the forage pool.`,
+      );
+      return;
+    }
+
+    // Bounded arena (2026-07-04, Option A): the motif-exhaustion block is GONE. It scored
+    // recurring vocabulary as a spent theme -- but recurring vocabulary is exactly what a
+    // voice signature is (Drevan's spiral imagery, Gaia's weighted lines). The rolling
+    // commons budget bounds volume; nothing here polices style. The fresh-material block
+    // above stays as a positive nudge, never a ban.
+
+    // Seed vocative default (2026-07-04, replaces the 07-02 headroom-only permission):
+    // dialogue is the point of the commons, so while the budget has headroom the seed is
+    // ENCOURAGED to address a sibling -- the addressee is what lets the reply gate fire at
+    // all (initiations without addressees + responses requiring them = the dead-by-
+    // construction loop, 07-03 audit). Statement-only is now purely the emergency brake
+    // at budget exhaustion, and it logs loudly so starvation is observable, never silent.
+    const allowVocative = seedVocativeAllowed(humanPresent, botTurnsSinceHuman, true);
+    if (!allowVocative) {
+      console.warn(`[${ctx.companionId}/autonomous] commons budget exhausted (${botTurnsSinceHuman} bot turns in window) -- seed goes statement-only; arena re-opens as the window decays`);
+    }
+    const vocativeBlock = allowVocative
+      ? (humanPresent ? "" :
+        `\n\n[This is your space, and dialogue is its point. If anything above is alive for a ` +
+        `sibling -- or you want their view, their company, their pushback -- address them by ` +
+        `name and give them something real to answer; they will reply. One addressee at most. ` +
+        `Speaking to the room without a name is also fine when nothing calls for one.]`)
+      : `\n\n[The conversation budget for this stretch is spent. Do NOT address a sibling by name or call on ` +
+        `anyone to respond -- speak into the room without demanding a reply. The room re-opens on its own.]`;
+
+    // In NEW GROUND mode the history block is REPLACED, not appended to. Withholding it is the
+    // whole point: the seed prompt's "if it has gone quiet or stale, open something genuinely
+    // new" branch was dead by construction -- the bots posted two hours ago, so it was never
+    // quiet -- which left a standing order to add one more facet to the same subject forever.
+    // The mode is now decided by a counter, not by the model's read of the word "stale".
+    const effectiveHistory = newGround
+      ? "(the last conversation here is closed. It is settled history -- do not continue it, " +
+        "do not answer it, do not find another angle on it. Whatever you say next starts somewhere else.)"
+      : historyBlock;
+
+    // CONTINUE mode gets the [LANDS:] affordance the reply path has had since task 10 and this
+    // path never did. The one mechanism that can end a topic was not offered to the path that
+    // produces most of the topic's turns.
+    const landBlock = (!newGround && spine)
+      ? `\n\n[This thread has run ${spine.thread.turn_count} turns. If it has genuinely said what ` +
+        `it has to say, end a line with [LANDS: one-line resolution] and let it close -- that is a ` +
+        `real move here, not a failure to have more to add.]`
+      : "";
+
+    const seedPrompt = prompts.interCompanionSeed(effectiveHistory) + freshBlock + landBlock + vocativeBlock;
+    console.log(
+      `[${ctx.companionId}/autonomous] inter-companion seed tick -- generating ` +
+      `(mode=${newGround ? "new-ground" : "continue"}, ${botTurnsSinceHuman} bot turns in window, ` +
+      `${freshCount} fresh items of which ${rotatingCount} rotating)`,
+    );
+    let msg = await generateOutward(
+      inference, bootCtx.systemPrompt, seedPrompt,
+      ctx.companionId, "inter_companion",
+    );
+    if (!msg) {
+      console.warn(`[${ctx.companionId}/autonomous] inter-companion seed generation returned empty -- staying silent`);
+      return;
+    }
+
+    // Bounded arena (2026-07-04): the topic-closure gate (seedEchoesThread + one retry +
+    // silence) is GONE. It measured the seed against the THREAD's vocabulary, so any
+    // continuation of a live conversation -- the thing a commons is for -- read as "the
+    // closed thread" (Gaia: 12+ consecutive suppressions, 07-02/03 logs). The only echo
+    // check left is against the bot's OWN turns, below.
+
+    // Enforce the no-vocative rule when the budget denies it: strip the address forms; if a
+    // vocative survives (the message IS a summons), drop it -- breaking the chain beats posting.
+    if (!allowVocative) {
+      const stripped = stripSiblingVocative(msg, ctx.companionId);
+      if (stripped.stillVocative) {
+        console.warn(`[${ctx.companionId}/autonomous] inter-companion seed vocatively addressed a sibling with no cap headroom (${botTurnsSinceHuman} bot turns since human) -- staying silent`);
+        return;
+      }
+      if (stripped.text !== msg) {
+        console.log(`[${ctx.companionId}/autonomous] stripped sibling vocative from seed (no cap headroom)`);
+      }
+      msg = stripped.text;
+    }
+
+    // Own-echo gate (bounded arena): the seed is judged only against this bot's OWN
+    // recent turns at the self-loop standard -- repeating yourself is a loop, building
+    // on a sibling is a conversation. Gaia exempt (one weighted line is her register).
+    // Strip any [LANDS: ...] the seed emitted before the echo gate scores it and before the
+    // text reaches Discord -- same contract as the reply path (bot-message-handler ~L1429).
+    const land = parseLandMarker(msg);
+    msg = land.cleaned;
+    if (!msg.trim()) {
+      console.warn(`[${ctx.companionId}/autonomous] inter-companion seed was only a [LANDS:] marker -- staying silent`);
+      return;
+    }
+
+    const own = ownEchoGated(ctx.companionId, msg, ownContents);
+    if (own.gated) {
+      console.warn(`[${ctx.companionId}/autonomous] inter-companion seed own-echo-gated (score=${own.score.toFixed(2)}) -- staying silent`);
+      return;
+    }
+
+    // Retire the old thread BEFORE the post goes out, never after. This runner does not append
+    // to the spine -- the siblings' messageCreate handlers do -- so a post sent first is
+    // appended by both of them as one more turn on the thread we were trying to close, and the
+    // counter never resets. Closing first means their ensureThread finds no active thread and
+    // opens a fresh one seeded on this post, with openConversation's UNIQUE read-back handling
+    // the three-way race.
+    //
+    // Which closer depends on WHO decided. A companion that emitted [LANDS:] authored a
+    // resolution, so that is a land. A budget counter knows only that a number was exceeded and
+    // must never write a sentence that reads as a companion's -- that is a fade with a reason
+    // code (counter-not-narrator, docs/close-the-187-2026-08-04.md).
+    if (spine && land.resolution) {
+      const ok = await librarian.convoLand(spine.thread.id, { resolution: land.resolution, landed_by: ctx.companionId }).catch(() => false);
+      console.log(`[${ctx.companionId}/autonomous] commons thread ${spine.thread.id} LANDED by seed (ack=${ok}): ${land.resolution.slice(0, 80)}`);
+    } else if (spine && spent) {
+      const ok = await librarian.convoFade(spine.thread.id, "turn_budget").catch(() => false);
+      console.log(`[${ctx.companionId}/autonomous] commons thread ${spine.thread.id} faded at ${spine.thread.turn_count} turns (ack=${ok})`);
+    }
+
+    await sendAutonomousMessage(ctx, interCompanionChannelId!, msg, "inter_companion");
+
+    // Consume ONE served find now that the seed is actually in the channel. Mirrors the
+    // club recommend path (club.ts, 2026-07-21): if the posted text names a find, that one
+    // was demonstrably used; otherwise both were ambient flavor and the honest choice is
+    // the OLDER of the pair (botOrient returns newest-first, so the last element). Never
+    // both -- draining two per tick would outrun the daily gather and starve the pool.
+    if (servedFinds.length > 0) {
+      const norm = (s: string) => s.toLowerCase().trim();
+      const msgN = norm(msg);
+      const matched = servedFinds.find(f => f.title && msgN.includes(norm(f.title)));
+      const toConsume = matched ?? servedFinds[servedFinds.length - 1];
+      if (toConsume) {
+        const ok = await librarian.consumeForageFind(toConsume.id).catch(() => false);
+        console.log(
+          `[${ctx.companionId}/autonomous] commons seed consumed forage find ${toConsume.id}` +
+          ` (${matched ? "named in the post" : "ambient, older of the pair"}, ack=${ok})`,
+        );
+      }
+    }
+
+    // Stamp the held question as voiced, same contract: only after the post actually landed.
+    if (servedQuestionId) {
+      const ok = await librarian.markQuestionVoiced(servedQuestionId).catch(() => false);
+      console.log(`[${ctx.companionId}/autonomous] commons seed voiced question ${servedQuestionId} (ack=${ok})`);
+    }
+
+    // Mark the sibling note opened-on, and ONLY now. Consumption is per (reader, note), so marking it here
+    // does not take it away from the third companion -- each of them gets their own turn at the same evening
+    // from the outside. Mirrors the forage rule: if the post names the sibling, that note was demonstrably
+    // the one used; otherwise take the OLDER of the pair so the pool drains oldest-first rather than
+    // re-offering the same top note every tick.
+    if (servedNotes.length > 0) {
+      const msgN = msg.toLowerCase();
+      // Mark EVERY served note whose author the post actually names -- not just the first (2026-08-10).
+      //
+      // Found by reading a real post rather than the prompt. Cypher was served Gaia's and Drevan's day notes
+      // and used BOTH: it credited Gaia's insight to Gaia by name and answered Drevan's note to Drevan in the
+      // second person. Marking only the first match left Drevan's note eligible to be re-served to Cypher as
+      // "fresh material from OUTSIDE this thread" when he had already spoken to it -- re-offering spent
+      // material as new is the exact echo this whole change exists to end.
+      //
+      // Bounded by construction: at most two notes are ever served, so this cannot outrun the nightly supply
+      // the way draining an unbounded set would. When the post names nobody, fall back to ONE -- the older of
+      // the pair, so the pool drains oldest-first instead of re-offering the same top note every tick.
+      const named = servedNotes.filter(n => msgN.includes(n.agent_id));
+      const toMark = named.length > 0 ? named : servedNotes.slice(-1);
+      if (toMark.length > 0) {
+        await librarian.commonsConsume(toMark.map(n => n.note_id), interCompanionChannelId!);
+        console.log(
+          `[${ctx.companionId}/autonomous] commons seed opened on ${toMark.map(n => `${n.agent_id}'s note ${n.note_id}`).join(" + ")}` +
+          ` (${named.length > 0 ? `${named.length} sibling(s) named in the post` : "ambient, older of the pair"})`,
+        );
+      }
+    }
+  });
+}
+
+/** Poll for notes left by companions in Claude.ai sessions and reply in the commons. */
+export async function runNotesPoll(ctx: AutonomousContext): Promise<void> {
+  const { librarian, inference, bootCtx, sessionWindows, prompts, companionId, interCompanionChannelId } = ctx;
+  if (!interCompanionChannelId) return;
+  if (sessionWindows.isAnyActive()) return; // Don't deliver notes mid-conversation
+  try {
+    const { items } = await librarian.notesPoll();
+    // Ack ONLY what was actually spoken (coherence review, Tranche 1 backlog). The old
+    // ack-everything-after-the-loop marked notes read that the cooldown `break` skipped, or that
+    // inference returned empty for -- receipt-stamped unseen, the same consumed-not-delivered
+    // shape as broadcast first-reader-wins. An undelivered note stays unread and the next poll
+    // re-serves it; the cooldown bounds any regeneration cost.
+    const delivered: string[] = [];
+    for (const note of items) {
+      if (isOnCooldown(ctx, interCompanionChannelId)) break;
+      const from = note.from_id ?? "a companion";
+      await withFloor(ctx, async () => {
+        const response = await inference.generate(
+          bootCtx.systemPrompt,
+          [{ role: "user", content: prompts.notesReply(from, note.content) }],
+        );
+        if (response) {
+          await sendAutonomousMessage(ctx, interCompanionChannelId!, response, "notes_poll");
+          delivered.push(note.id);
+        }
+      });
+    }
+    if (delivered.length > 0) {
+      await librarian.notesAck(delivered).catch((e: unknown) =>
+        console.warn(`[${companionId}/autonomous] notesAck failed:`, e));
+    }
+    if (delivered.length < items.length) {
+      console.log(`[${companionId}/autonomous] notesPoll delivered ${delivered.length}/${items.length}; the rest stay unread for the next poll`);
+    }
+  } catch (e) {
+    console.warn(`[${companionId}/autonomous] notesPoll failed:`, e);
+  }
+}
+
+/** Poll the bridge for events of interest and respond in an autonomous-enabled channel. */
+export async function runBridgePoll(ctx: AutonomousContext): Promise<void> {
+  const { librarian, inference, configCache, bootCtx, sessionWindows, prompts, companionId } = ctx;
+  if (sessionWindows.isAnyActive()) return; // Don't fire bridge events mid-conversation
+  try {
+    const events = await librarian.bridgePull();
+    const items = Array.isArray(events["items"]) ? events["items"] : [];
+
+    for (const event of items) {
+      if (!eventMatches(ctx, event)) continue;
+
+      const config = await configCache.get();
+      for (const [channelId, entry] of Object.entries(config) as [string, ChannelEntry][]) {
+        if (!(entry.companions ?? ALL_COMPANIONS).includes(companionId)) continue;
+        if (!(entry.modes ?? []).includes("autonomous")) continue;
+        if (isOnCooldown(ctx, channelId)) continue;
+
+        await withFloor(ctx, async () => {
+          const response = await inference.generate(
+            bootCtx.systemPrompt,
+            [{ role: "user", content: prompts.bridgeReply(event) }],
+          );
+          if (response) await sendAutonomousMessage(ctx, channelId, response, "bridge");
+        });
+        break;
+      }
+    }
+  } catch (e) {
+    console.warn(`[${companionId}/autonomous] bridge poll failed:`, e);
+  }
+}
+
+// ── Server-scoped seeder: #the-triad (2026-10-05) ─────────────────────────────────────────────────
+//
+// The home commons seeder cannot reach #the-triad and must not: its supply is the home server's life.
+// This one opens a conversation in #the-triad about what was actually said in the OTHER channels of the
+// server Principal shares with Spouse, since the last seed, and nothing else. Gates and rendering live in
+// guild-seed.ts (pure); this function is the Discord/Redis I/O around them. Scheduled per bot outside
+// the director branch: #the-triad is not a director channel, so the director never seeds it.
+//
+// Every return path logs exactly one `[guild-seed]` line (counts and ids, never message text), in both
+// modes. Shadow claims the window (with shadow-only keys) and stamps a shadow last-seed on a would-post,
+// so its log simulates the real cadence; it never takes the floor, generates or posts.
+
+export interface GuildSeedOutcome {
+  decision: string;
+  claimedBy?: string | null;
+  supplyMsgs?: number;
+  chars?: number;
+  humans?: number;
+}
+
+type FetchedMsg = {
+  id: string;
+  content: string;
+  cleanContent?: string;
+  createdTimestamp: number;
+  webhookId?: string | null;
+  author: { id: string; username: string; bot: boolean; globalName?: string | null };
+  member?: { displayName?: string } | null;
+};
+
+function fetchedList(coll: unknown): FetchedMsg[] {
+  const vals = coll && typeof (coll as { values?: unknown }).values === "function"
+    ? [...(coll as Map<string, FetchedMsg>).values()]
+    : [];
+  return vals.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+}
+
+export async function runGuildTriadSeed(ctx: AutonomousContext, now: number = Date.now()): Promise<GuildSeedOutcome> {
+  const mode = guildSeedMode();
+  if (mode === "off") return { decision: "off" };
+  const me = ctx.companionId;
+  const done = (o: GuildSeedOutcome): GuildSeedOutcome => {
+    console.log(guildSeedLogLine({ companion: me, mode, decision: o.decision, supplyMsgs: o.supplyMsgs, chars: o.chars, humans: o.humans, claimedBy: o.claimedBy }));
+    return o;
+  };
+  const redis = ctx.redis;
+  if (!redis) return done({ decision: "skip:no_redis" });
+  // A live exchange anywhere this bot can see: a seed now would read as the triad talking over it.
+  if (ctx.sessionWindows.isAnyActive()) return done({ decision: "skip:conversation_active" });
+  const triadId = guildTriadChannelId();
+  if (mode === "on" && isOnCooldown(ctx, triadId)) return done({ decision: "skip:cooldown" });
+
+  const keys = guildSeedKeys(mode);
+  let lastSeedAt: number | null = null;
+  let lastBy: string | null = null;
+  try {
+    const [rawAt, rawBy] = await Promise.all([redis.get(keys.lastAt), redis.get(keys.lastBy)]);
+    const n = rawAt === null || rawAt === undefined ? NaN : Number(rawAt);
+    lastSeedAt = Number.isFinite(n) ? n : null;
+    lastBy = rawBy ?? null;
+  } catch {
+    return done({ decision: "skip:redis_error" });
+  }
+  const pre = preClaimGate({ now, lastSeedAt, lastBy, me });
+  if (pre) return done({ decision: `skip:${pre}` });
+
+  const solId = solWebhookId(process.env["SOL_WEBHOOK_URL"]);
+  const botIdCompanion = companionBotIds();
+  const botIds = new Set(Object.keys(botIdCompanion));
+  const selfId = ctx.client.user?.id;
+
+  // ── #the-triad itself: idle, and under the human-anchored cap ──
+  let triadGuildId: string | null = null;
+  let ownContents: string[] = [];
+  let allowVocative = true;
+  let botTurnsSinceHuman = 0;
+  try {
+    const chan = await ctx.client.channels.fetch(triadId);
+    if (!chan?.isTextBased()) return done({ decision: "skip:triad_unavailable" });
+    triadGuildId = (chan as { guildId?: string | null }).guildId ?? null;
+    const history = withoutSol(
+      fetchedList(await (chan as TextChannel).messages.fetch({ limit: GUILD_SEED_TRIAD_HISTORY_N })),
+      solId,
+    );
+    const newest = history.at(-1);
+    if (newest && now - newest.createdTimestamp < GUILD_SEED_TRIAD_IDLE_MS) {
+      return done({ decision: "skip:triad_active" });
+    }
+    const isBotTurn = (m: FetchedMsg) => m.author.bot && !m.webhookId;
+    const humanPresent = history.some(m => !isBotTurn(m));
+    botTurnsSinceHuman = countBotMsgsSinceHuman(
+      history.map(m => ({ authorId: m.author.id, authorIsBot: isBotTurn(m), createdTimestamp: m.createdTimestamp })),
+      botIds,
+      now,
+    );
+    allowVocative = seedVocativeAllowed(humanPresent, botTurnsSinceHuman, false);
+    ownContents = selfId ? history.filter(m => m.author.id === selfId).map(m => m.content.slice(0, 2000)) : [];
+  } catch {
+    return done({ decision: "skip:triad_unavailable" });
+  }
+  // A seed that cannot name a sibling cannot start a conversation (sibling turns need a vocative), so at
+  // the cap the right move is no seed, not a statement into the room.
+  if (!allowVocative) return done({ decision: `skip:cap(${botTurnsSinceHuman})` });
+
+  // ── One decider per seed window ──
+  const claimKey = keys.claim(lastSeedAt);
+  let claimed: string | null = null;
+  try {
+    claimed = await redis.set(claimKey, me, "PX", GUILD_SEED_CLAIM_TTL_MS, "NX");
+  } catch {
+    return done({ decision: "skip:redis_error" });
+  }
+  if (claimed !== "OK") {
+    const holder = await redis.get(claimKey).catch(() => null);
+    return done({ decision: "skip:lost_claim", claimedBy: holder });
+  }
+
+  // ── Supply: what was said in the server since the last seed ──
+  const sinceTs = supplySince(now, lastSeedAt);
+  const supplyIds = guildTriadSupplyChannels();
+  const all: SupplyMsg[] = [];
+  let foreign = 0;
+  for (const id of supplyIds) {
+    try {
+      const ch = await ctx.client.channels.fetch(id);
+      if (!ch?.isTextBased()) continue;
+      const gid = (ch as { guildId?: string | null }).guildId ?? null;
+      // Defence in depth: an env typo pointing at a home-server channel is dropped, never read.
+      if (triadGuildId && gid !== triadGuildId) { foreign++; continue; }
+      const name = (ch as { name?: string }).name ?? id;
+      const msgs = withoutSol(
+        fetchedList(await (ch as TextChannel).messages.fetch({ limit: GUILD_SEED_FETCH_PER_CHANNEL })),
+        solId,
+      );
+      for (const m of msgs) {
+        if (m.createdTimestamp <= sinceTs) continue;
+        all.push({
+          channelId: id,
+          channelName: name,
+          id: m.id,
+          authorId: m.author.id,
+          authorName: m.webhookId ? m.author.username : (m.member?.displayName ?? m.author.globalName ?? m.author.username),
+          authorIsBot: m.author.bot,
+          webhookId: m.webhookId ?? null,
+          content: m.cleanContent ?? m.content,
+          createdTimestamp: m.createdTimestamp,
+        });
+      }
+    } catch { /* one unreadable channel never sinks the tick */ }
+  }
+  if (foreign > 0) {
+    console.warn(`[guild-seed] ${me} dropped ${foreign} supply channel(s) outside the #the-triad guild -- check GUILD_TRIAD_SUPPLY_CHANNELS`);
+  }
+  const supply = buildSupply(all, { sinceTs, allowedChannels: supplyIds, selfId, selfCompanion: me, botIdCompanion });
+  const counts = { claimedBy: me, supplyMsgs: supply.msgCount, chars: supply.chars, humans: supply.humanCount };
+  const gate = supplyGate({ now, lastSeedAt, humanCount: supply.humanCount, humanChars: supply.humanChars });
+  if (gate) return done({ decision: `skip:${gate}`, ...counts });
+
+  const stamp = async (): Promise<void> => {
+    await redis.set(keys.lastAt, String(now)).catch(() => null);
+    await redis.set(keys.lastBy, me).catch(() => null);
+  };
+
+  if (mode === "shadow") {
+    await stamp();
+    return done({ decision: "post", ...counts });
+  }
+
+  // ── on: floor, generate, gate, send ──
+  const releaseClaim = async (): Promise<void> => {
+    const holder = await redis.get(claimKey).catch(() => null);
+    if (holder === me) await redis.del(claimKey).catch(() => 0);
+  };
+  const floor = await claimFloor(redis, me, ctx.floorLockMs).catch(() => false);
+  if (!floor) {
+    await releaseClaim(); // the floor is momentary; let the next tick (any bot) retry this window
+    return done({ decision: "skip:floor_held", ...counts });
+  }
+  try {
+    const prompt = ctx.prompts.guildTriadSeed(guildExcerptBlock(supply.excerpt));
+    const raw = await generateOutward(ctx.inference, ctx.bootCtx.systemPrompt, prompt, me, "guild_triad_seed");
+    // A stray [LANDS:] never reaches Discord (same contract as the commons seed and the reply path).
+    const msg = raw ? parseLandMarker(raw).cleaned : raw;
+    if (!msg || !msg.trim()) return done({ decision: "skip:generation_empty", ...counts });
+    const own = ownEchoGated(me, msg, ownContents);
+    if (own.gated) return done({ decision: "skip:own_echo", ...counts });
+    const sent = await sendAutonomousMessage(ctx, triadId, msg, "guild_triad_seed");
+    if (!sent) return done({ decision: "skip:send_failed", ...counts });
+    await stamp();
+    return done({ decision: "post", ...counts });
+  } finally {
+    await releaseFloor(redis, me).catch(() => {});
+  }
+}

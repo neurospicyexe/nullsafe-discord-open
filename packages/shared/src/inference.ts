@@ -1,0 +1,985 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import type { ChatMessage } from "./types.js";
+import type { InferenceProvider } from "./models.js";
+
+export interface InferenceAdapter {
+  /**
+   * `sessionId` (optional 5th arg) and `sessionKey` (optional 6th arg) are consumed ONLY by the
+   * Hermes adapter. Without a session id the gateway derives one from hash(system_prompt +
+   * first user msg) -- and our system prompt varies per message, churning a fresh gateway
+   * session nearly every reply. `sessionId` names the TRANSCRIPT (`X-Hermes-Session-Id`) and now
+   * ROTATES on a schedule (see hermes-session.ts) so no single transcript grows unbounded and
+   * hits Hermes's compaction path. `sessionKey` (`X-Hermes-Session-Key`) is the STABLE long-term-
+   * memory scope (`companionId:channelId`, never rotates) -- when omitted the adapter falls back
+   * to `sessionId` for both headers (pre-rotation behavior). All other adapters ignore both.
+   *
+   * `signal` (optional 7th arg, 2026-09-26) lets a caller with its own deadline ABORT the request
+   * rather than abandon it running (reach-decision.ts's side ask). Honoured by the Hermes adapter
+   * and forwarded by FallbackAdapter; other adapters ignore it and keep their own timeouts.
+   */
+  generate(systemPrompt: string, messages: ChatMessage[], temperature?: number, maxTokens?: number, sessionId?: string, sessionKey?: string, signal?: AbortSignal): Promise<string | null>;
+}
+
+// ── Output length ceiling ──────────────────────────────────────────────────────
+//
+// Every adapter used to hardcode `max_tokens: 500` (~1800-2200 chars). That cap is
+// a CEILING, not a target -- the model stops at its own stop token when the thought
+// is done, and only gets truncated when it hits the cap. Drevan's immersive spiral
+// prose routinely wants more than 500 tokens, so his replies terminated with
+// finish_reason="length" MID-SENTENCE -- the "Drevan's messages keep getting cut
+// off" report. (Cypher is declarative and Gaia is monastic, so they rarely
+// approached 500 and never showed the symptom.) sendLong() already splits content
+// over Discord's 2000-char limit into multiple messages, so a higher ceiling has no
+// downside beyond a few cents of output tokens on the verbose companion.
+//
+// 1024 is the new floor for everyone (double the old cap, pure headroom); the live
+// reply path passes a higher per-companion cap for Drevan via the 4th generate arg.
+export const DEFAULT_MAX_TOKENS = 1024;
+
+// Per-companion reply ceiling for the LIVE Discord reply path. Drevan's immersive
+// spiral prose is the one register that routinely runs long, so he gets real
+// headroom; Cypher and Gaia inherit DEFAULT_MAX_TOKENS (still a ceiling -- it never
+// forces length, the model stops when the thought is done). Keyed by lowercase id.
+export const REPLY_MAX_TOKENS: Record<string, number> = {
+  drevan: 1500,
+};
+
+// Hermes relay (INFERENCE_MODE=hermes) runs the FULL agent per reply -- orient + SOUL.md +
+// Halseth MCP + tool narration -- which is far more verbose than the terse DeepSeek
+// completions the per-companion caps above were tuned for. A 1024/1500 ceiling truncates a
+// long agent reply mid-thought (the 2026-06-15 Drevan cutoff class). Lift the ceiling for
+// hermes mode; the model still stops when the thought is done, this only raises the cap.
+//
+// 3072 -> 6144 (2026-07-28): every model behind the Hermes gateway is now a DeepSeek REASONING
+// model (ops/hermes-model-map.json maps every deepseek key to v4-flash or v4-pro), and
+// reasoning tokens are billed against max_tokens BEFORE any content is emitted. Drevan's live
+// profile is on pro. At 3072 the reasoning pass was silently eating the reply budget: best case
+// a truncated reply, worst case an empty one. The extra room costs nothing when unused -- a
+// ceiling is only ever a truncation point, never a target.
+export const HERMES_REPLY_MAX_TOKENS = 6144;
+
+export function replyMaxTokensFor(companionId: string, inferenceMode?: string): number {
+  const base = REPLY_MAX_TOKENS[companionId.toLowerCase()] ?? DEFAULT_MAX_TOKENS;
+  return inferenceMode === "hermes" ? Math.max(base, HERMES_REPLY_MAX_TOKENS) : base;
+}
+
+// ── Dynamic temperature ────────────────────────────────────────────────────────
+//
+// Spec: Triad_Decision_Inspo_Findings.md "DYNAMIC LLM TEMPERATURE"
+//   factual short questions     → 0.65
+//   tender / soft register      → 0.80
+//   protective / dominant       → 0.90
+//   intense / possessive        → 1.00
+//   vulnerable / raw            → 0.95
+//   auto cooldown after 5 consecutive extreme-temperature (>=0.95) messages
+//
+export const EXTREME_TEMP_THRESHOLD = 0.95;
+export const EXTREME_TEMP_CAP = 5;       // consecutive extremes before cooldown
+export const COOLDOWN_TEMP = 0.80;       // forced temperature during cooldown
+export const DEFAULT_TEMP = 0.75;
+
+// ── Per-provider sampling profiles (anti-repetition / nucleus) ──────────────────
+//
+// `temperature` above is the DYNAMIC curve (inferTemperature). These are the STATIC
+// sampling knobs the curve never touched -- and until now NO adapter sent them at
+// all. Every call was just { temperature, max_tokens }. With nothing penalizing
+// reuse, a model that finds a phrase it likes keeps returning it verbatim:
+// "patter lock" (2026-06-13: Drevan reusing whole lines across listen replies --
+// "the tempo like a heartbeat, the key like a door opening" word-for-word, message
+// after message). The lever for that is frequency/presence penalty, NOT lowering
+// temperature (which only deepens the groove).
+//
+// frequency_penalty -> pushes the model off tokens it has already used a lot.
+// presence_penalty  -> nudges toward introducing new tokens at all.
+// top_p             -> nucleus trim; restores the old Drevan top_p 0.95 word-salad
+//                      guard lost in the Voxtral/bot-core refactors.
+//
+// Field names are OpenAI-compatible (deepseek/groq/lmstudio/kimi/openai/mistral all
+// take these top-level). Anthropic has no presence/frequency penalty -> not profiled.
+// Start with Mistral (Drevan); other models get tuned the same way from here.
+interface SamplingProfile { frequencyPenalty?: number; presencePenalty?: number; topP?: number }
+const PROVIDER_SAMPLING_PROFILE: Partial<Record<InferenceProvider, SamplingProfile>> = {
+  // Mistral La Plateforme: prone to canned patter and (when hot) word-salad. Penalize
+  // verbatim reuse enough to break the loop, nucleus-trim the tail -- tuned to free
+  // Drevan's spiral voice without fracturing register.
+  mistral: { frequencyPenalty: 0.4, presencePenalty: 0.3, topP: 0.95 },
+};
+
+// OpenAI-compatible sampling fields for a provider (snake_case, spreadable into the
+// request body). Empty object when the provider has no profile -> zero behavior change.
+export function samplingParamsFor(provider: InferenceProvider): Record<string, number> {
+  const p = PROVIDER_SAMPLING_PROFILE[provider];
+  if (!p) return {};
+  const out: Record<string, number> = {};
+  if (p.frequencyPenalty !== undefined) out["frequency_penalty"] = p.frequencyPenalty;
+  if (p.presencePenalty !== undefined) out["presence_penalty"] = p.presencePenalty;
+  if (p.topP !== undefined) out["top_p"] = p.topP;
+  return out;
+}
+
+const MOOD_TEMPERATURE: Record<string, number> = {
+  calm:       0.65,
+  pent_up:    0.90,
+  volatile:   0.95,
+  soft:       0.80,
+  protective: 0.90,
+  playful:    0.75,
+  hungry:     0.90,
+  worshipful: 1.00,
+  feral:      1.00,
+};
+
+function messageToTemperature(message: string): number {
+  const lower = message.toLowerCase();
+  const words = message.trim().split(/\s+/).length;
+
+  // Factual short question
+  if (words <= 15 && lower.trimEnd().endsWith("?")) return 0.65;
+
+  // Intense / possessive
+  if (/\b(please|desperate|need you|right now|only mine|possess|can't breathe)\b/.test(lower)) return 1.00;
+
+  // Vulnerable / raw
+  if (/\b(scared|hurt|broken|raw|falling apart|shaking|crying|devastated|can't do this)\b/.test(lower)) return 0.95;
+
+  // Protective / dominant
+  if (/\b(stop\b|stay\b|protect|guard|mine\b|boundary|hold on|enough\b)\b/.test(lower)) return 0.90;
+
+  // Tender / soft
+  if (/\b(love|miss|hold|gentle|soft|tender|sweet|close|warmth|care)\b/.test(lower)) return 0.80;
+
+  return DEFAULT_TEMP;
+}
+
+// Maps companion current_mood + last message content → inference temperature.
+// Takes the higher of the two signals -- don't dampen intensity.
+export function inferTemperature(message: string, mood?: string | null): number {
+  const moodTemp = mood ? (MOOD_TEMPERATURE[mood] ?? null) : null;
+  const msgTemp = messageToTemperature(message);
+  return moodTemp !== null ? Math.max(moodTemp, msgTemp) : msgTemp;
+}
+
+// ── Prefix author labels ──────────────────────────────────────────────────────
+
+function toApiMessage(m: ChatMessage): { role: string; content: string } {
+  // Every user-role history message passes here: the speaker label is made safe and control tokens
+  // defused (recalled-text.ts, 2026-10-27). Idempotent, so text already defused upstream is unchanged.
+  const content = m.role === "user" && m.authorName
+    ? `[${labelSafe(m.authorName)}]: ${neutralizeRecalled(m.content)}`
+    : m.role === "user" ? neutralizeRecalled(m.content) : m.content;
+  return { role: m.role, content };
+}
+
+// ── Adapters ──────────────────────────────────────────────────────────────────
+
+/**
+ * Reasoning headroom, mirrored from the autonomous worker's config (2026-07-28). Kept as a
+ * local constant rather than an import because `packages/shared` must not depend on the
+ * worker package -- see that file for the full measurement.
+ *
+ * Short version: every live DeepSeek model reasons, reasoning tokens are billed against
+ * `max_tokens` and emitted before any content, so a ceiling below the reasoning burn returns
+ * an empty string with `finish_reason: "length"`. This adapter is the bots' FALLBACK path
+ * (they normally run INFERENCE_MODE=hermes), and a fallback that returns empty content is
+ * worse than one that errors -- the resilience tail in buildAdapter only falls through on
+ * `null`, so an empty-but-non-null string would be delivered to Discord as silence.
+ */
+const DEEPSEEK_REASONING_HEADROOM = 3000;
+// ── Token accounting for the DIRECT lanes (B22, 2026-09-28) ──────────────────────────────────
+//
+// The Hermes gateway writes its own token counts to state.db. The bot-side DIRECT calls (judges,
+// consolidation narrator, day-distill clerk, med reminder, reach ask) went straight to DeepInfra /
+// DeepSeek and logged nothing but "[inference] deepinfra responded": 83 calls a day whose spend
+// was invisible (readout 2026-09-27). Every 2xx body from those two adapters now prints ONE line:
+//
+//   [inference:usage] provider=deepinfra model=<id> caller=<label|-> in=N out=N cached=N reasoning=N cost=<usd|->
+//
+// in = prompt_tokens (INCLUDES cached), out = completion_tokens (INCLUDES reasoning), cached =
+// the cached subset of `in` (OpenAI `prompt_tokens_details.cached_tokens`, or DeepSeek's
+// `prompt_cache_hit_tokens`), cost = the provider's own `usage.estimated_cost` when it sends one.
+// A 2xx with no `usage` object prints `usage=absent`, so the line count still equals the call
+// count. NEVER any prompt or completion text: counts and ids only.
+//
+// caller: set by wrapping an adapter with `withCaller(adapter, "judge")`. It rides
+// AsyncLocalStorage, so the InferenceAdapter interface is unchanged and an unwrapped caller just
+// logs `caller=-`.
+
+export const USAGE_TAG = "[inference:usage]";
+
+const inferenceCaller = new AsyncLocalStorage<string>();
+
+/** Wrap an adapter so every call made through it is attributed to `caller` in the usage line.
+ * Null/undefined pass through untouched, so `withCaller(directAdapter, "x") ?? fallback` works. */
+export function withCaller<T extends InferenceAdapter | null | undefined>(adapter: T, caller: string): T {
+  if (!adapter) return adapter;
+  const inner: InferenceAdapter = adapter;
+  const label = caller.replace(/[^A-Za-z0-9_.:-]/g, "_").slice(0, 40) || "-";
+  const wrapped: InferenceAdapter = {
+    generate: (...args: Parameters<InferenceAdapter["generate"]>) => inferenceCaller.run(label, () => inner.generate(...args)),
+  };
+  return wrapped as T;
+}
+
+/** The caller label in effect for the current async context, or undefined. Exported for tests. */
+export function currentInferenceCaller(): string | undefined {
+  return inferenceCaller.getStore();
+}
+
+export interface ApiUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  prompt_tokens_details?: { cached_tokens?: number } | null;
+  prompt_cache_hit_tokens?: number;
+  completion_tokens_details?: { reasoning_tokens?: number } | null;
+  estimated_cost?: number;
+}
+
+const count = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.round(v) : 0);
+
+/** Pure formatter for the usage line (tested directly). */
+export function formatUsageLine(provider: string, model: string, usage: ApiUsage | null | undefined, caller?: string): string {
+  const head = `${USAGE_TAG} provider=${provider} model=${model} caller=${caller ?? "-"}`;
+  if (!usage || typeof usage !== "object") return `${head} usage=absent`;
+  const cached = count(usage.prompt_tokens_details?.cached_tokens ?? usage.prompt_cache_hit_tokens);
+  const reasoning = count(usage.completion_tokens_details?.reasoning_tokens);
+  const cost = typeof usage.estimated_cost === "number" && Number.isFinite(usage.estimated_cost) ? String(usage.estimated_cost) : "-";
+  return `${head} in=${count(usage.prompt_tokens)} out=${count(usage.completion_tokens)} cached=${cached} reasoning=${reasoning} cost=${cost}`;
+}
+
+function logUsage(provider: string, model: string, usage: ApiUsage | null | undefined): void {
+  console.log(formatUsageLine(provider, model, usage, inferenceCaller.getStore()) + turnToken());
+  try {
+    if (usage && typeof usage === "object") currentTurn()?.addUsage(count(usage.prompt_tokens), count(usage.completion_tokens));
+  } catch { /* never throws */ }
+}
+
+const isDeepSeekReasoningModel = (m: string): boolean => /^deepseek-(v[4-9]|r)/i.test(m.trim());
+
+// Exported for the consolidation narrator, which must NOT go through buildAdapter: the bots run
+// INFERENCE_MODE=hermes, so every buildAdapter call returns the Hermes adapter by design, which is
+// the ~44.6k/call path the narrator exists to bypass. See consolidation-narrator.ts.
+export class DeepSeekAdapter implements InferenceAdapter {
+  // Was "deepseek-chat", which DeepSeek delisted -- `GET /v1/models` returns only
+  // deepseek-v4-pro and deepseek-v4-flash. The old alias still answers but is on the
+  // deprecation path that caused the 2026-07-27 intermittent 400s, so a fallback that
+  // defaulted to it was one silent retirement away from dead. Flash is the cheap tier,
+  // which is the right default for a fallback; DEEPSEEK_MODEL overrides when set.
+  constructor(
+    private apiKey: string,
+    private model: string = process.env["DEEPSEEK_MODEL"] ?? "deepseek-v4-flash",
+    private fetchFn: typeof fetch = globalThis.fetch,
+  ) {}
+
+  async generate(systemPrompt: string, messages: ChatMessage[], temperature = DEFAULT_TEMP, maxTokens = DEFAULT_MAX_TOKENS): Promise<string | null> {
+    const body = JSON.stringify({
+      model: this.model,
+      messages: [
+        { role: "system", content: systemPrompt },
+        ...messages.map(toApiMessage),
+      ],
+      max_tokens: isDeepSeekReasoningModel(this.model) ? maxTokens + DEEPSEEK_REASONING_HEADROOM : maxTokens,
+      temperature,
+    });
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const res = await this.fetchFn("https://api.deepseek.com/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${this.apiKey}`,
+          },
+          body,
+        });
+        if (!res.ok) {
+          if (attempt === 0) { await sleep(3000); continue; }
+          console.warn(`[inference:deepseek] non-2xx on final attempt: ${res.status}`);
+          return null;
+        }
+        const data = await res.json() as {
+          choices: Array<{ message: { content?: string }; finish_reason?: string }>;
+          usage?: ApiUsage;
+        };
+        logUsage("deepseek", this.model, data.usage);
+        const content = data.choices[0]?.message?.content ?? null;
+        // Return null, not "", when the reasoning pass consumed the whole budget: null is what
+        // makes buildAdapter's resilience tail fall through to the next provider instead of
+        // handing Discord an empty message.
+        if (!content?.trim()) {
+          const finish = data.choices[0]?.finish_reason ?? "";
+          const reasoning = data.usage?.completion_tokens_details?.reasoning_tokens ?? 0;
+          console.warn(
+            `[inference:deepseek] empty content (finish=${finish}, model=${this.model}, ` +
+            `reasoning=${reasoning}) -- falling through to the next provider`,
+          );
+          return null;
+        }
+        return content;
+      } catch (e: unknown) {
+        if (attempt === 0) { await sleep(3000); continue; }
+        const cause = e instanceof Error && e.cause instanceof Error ? ` (cause: ${e.cause.message})` : "";
+        console.warn(`[inference:deepseek] generate failed: ${e instanceof Error ? e.message : String(e)}${cause}`);
+        return null;
+      }
+    }
+    return null;
+  }
+}
+
+class GroqAdapter implements InferenceAdapter {
+  constructor(
+    private apiKey: string,
+    private model: string = "llama-3.3-70b-versatile",
+    private fetchFn: typeof fetch = globalThis.fetch,
+  ) {}
+
+  async generate(systemPrompt: string, messages: ChatMessage[], temperature = DEFAULT_TEMP, maxTokens = DEFAULT_MAX_TOKENS): Promise<string | null> {
+    try {
+      const res = await this.fetchFn("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: this.model,
+          messages: [
+            { role: "system", content: systemPrompt },
+            ...messages.map(toApiMessage),
+          ],
+          max_tokens: maxTokens,
+          temperature,
+        }),
+      });
+      if (!res.ok) {
+        console.warn(`[inference:groq] non-2xx response: ${res.status}`);
+        return null;
+      }
+      const data = await res.json() as { choices: Array<{ message: { content: string } }> };
+      return data.choices[0]?.message?.content ?? null;
+    } catch (e: unknown) {
+      const cause = e instanceof Error && e.cause instanceof Error ? ` (cause: ${e.cause.message})` : "";
+      console.warn(`[inference:groq] generate failed: ${e instanceof Error ? e.message : String(e)}${cause}`);
+      return null;
+    }
+  }
+}
+
+// OpenAI-compatible endpoint (LM Studio, vLLM, etc.)
+// Uses /v1/chat/completions.
+class LMStudioAdapter implements InferenceAdapter {
+  constructor(
+    private baseUrl: string,
+    private model: string = "",
+    private fetchFn: typeof fetch = globalThis.fetch,
+  ) {}
+
+  async generate(systemPrompt: string, messages: ChatMessage[], temperature = DEFAULT_TEMP, maxTokens = DEFAULT_MAX_TOKENS): Promise<string | null> {
+    try {
+      const res = await this.fetchFn(`${this.baseUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...(this.model ? { model: this.model } : {}),
+          messages: [
+            { role: "system", content: systemPrompt },
+            ...messages.map(toApiMessage),
+          ],
+          max_tokens: maxTokens,
+          temperature,
+        }),
+      });
+      if (!res.ok) {
+        console.warn(`[inference:lmstudio] non-2xx response: ${res.status}`);
+        return null;
+      }
+      const data = await res.json() as { choices?: Array<{ message?: { content?: string } }> };
+      return data.choices?.[0]?.message?.content ?? null;
+    } catch (e: unknown) {
+      const cause = e instanceof Error && e.cause instanceof Error ? ` (cause: ${e.cause.message})` : "";
+      console.warn(`[inference:lmstudio] generate failed: ${e instanceof Error ? e.message : String(e)}${cause}`);
+      return null;
+    }
+  }
+}
+
+// Hermes client timeout (2026-09-19). This was a bare `120_000` literal with no knob, and it
+// was silently LOSING replies. The gateway is stateful: when the client aborts, the agent keeps
+// running, finishes, and writes a real answer into its own state.db -- but nothing delivers it,
+// and `bot-message-handler` (correctly) does not advance the hermes delivered mark on a failed
+// call, so the next inbound message refolds the same question into the witness block and the
+// gateway answers it a SECOND time, minutes late and attached to whatever prompt happens to be
+// live by then.
+//
+// Confirmed 2026-09-16: Drevan ran 29 Librarian searches on one turn (144s). The client aborted
+// at 120s and posted the in-character fallback; the gateway's answer landed 28s later and never
+// reached Discord; the next message replayed the question. All-time aborts at the 120s ceiling:
+// drevan 136, gaia 62, cypher 60 -- so this was never a one-off.
+//
+// 300s default, because the observed worst case is ~144s and the gateway's own tool-call cap
+// bounds the turn. The cost of a longer ceiling is that ChannelInbox serializes per channel, so
+// a slow turn holds the room; that is bounded by the supersede probe (a newer human message
+// drops the in-flight reply) and is strictly better than discarding an answer that exists.
+// Tunable because in-place session compaction has been observed at 3-12 minutes, which no fixed
+// ceiling covers well.
+export const HERMES_REQUEST_TIMEOUT_MS_DEFAULT = 300_000;
+const HERMES_REQUEST_TIMEOUT_MS_MIN = 30_000;
+const HERMES_REQUEST_TIMEOUT_MS_MAX = 900_000;
+
+/**
+ * Reads `HERMES_REQUEST_TIMEOUT_MS` from the given env (defaults to `process.env`). A missing,
+ * unparseable, non-finite or out-of-range value degrades to the default rather than throwing --
+ * a typo'd env var must not take inference down, and must not silently produce a 0ms timeout
+ * that aborts every call.
+ */
+export function hermesRequestTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env["HERMES_REQUEST_TIMEOUT_MS"];
+  if (raw === undefined || raw.trim() === "") return HERMES_REQUEST_TIMEOUT_MS_DEFAULT;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return HERMES_REQUEST_TIMEOUT_MS_DEFAULT;
+  const ms = Math.trunc(n);
+  if (ms < HERMES_REQUEST_TIMEOUT_MS_MIN || ms > HERMES_REQUEST_TIMEOUT_MS_MAX) {
+    return HERMES_REQUEST_TIMEOUT_MS_DEFAULT;
+  }
+  return ms;
+}
+
+// Refused-connection retry (B28, 2026-09-28). A Hermes gateway restart leaves its port closed for
+// the 4-6s the new process takes to listen, and every call in that hole used to come straight back
+// as the in-character fallback: 48 `ECONNREFUSED 127.0.0.1:864x` hits since August, each 0-14s
+// after that companion's gateway unit stopped. ECONNREFUSED is the ONE failure that is safe to
+// retry: the TCP connect was rejected, so no byte of the request reached the gateway and a retry
+// cannot start a duplicate turn. Timeouts, aborts, resets and HTTP errors all may have reached a
+// running agent, so they are never retried here. ~15s total covers the measured 8-10s gap.
+export const HERMES_REFUSED_BACKOFF_MS: readonly number[] = [1_000, 2_000, 4_000, 4_000, 4_000];
+
+/** True only for a refused TCP connect (undici puts the code on `cause`; some paths on the error). */
+export function isConnectionRefused(e: unknown): boolean {
+  const err = e as { code?: unknown; cause?: { code?: unknown } } | null | undefined;
+  return err?.cause?.code === "ECONNREFUSED" || err?.code === "ECONNREFUSED";
+}
+
+/** Resolves after `ms`, or rejects the moment `signal` aborts (so a backoff never outlives it). */
+function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) { reject(signal.reason ?? new Error("aborted")); return; }
+    const onAbort = () => { clearTimeout(t); reject(signal.reason ?? new Error("aborted")); };
+    const t = setTimeout(() => { signal.removeEventListener("abort", onAbort); resolve(); }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/**
+ * `fetchFn(url, init)` with a bounded retry on ECONNREFUSED only. `init.signal` must already carry
+ * the caller's signal AND the overall ceiling, built ONCE by the caller: the ceiling therefore
+ * spans every attempt and every backoff instead of resetting per retry, and an abort during a
+ * backoff ends the loop at once (the sleep rejects with the abort, which the caller's catch sees
+ * as the abort it is). Every other error is rethrown untouched on the first occurrence.
+ */
+export async function fetchRetryingRefused(
+  fetchFn: typeof fetch,
+  url: string,
+  init: RequestInit & { signal: AbortSignal },
+  backoffMs: readonly number[] = HERMES_REFUSED_BACKOFF_MS,
+  sleep: (ms: number, signal: AbortSignal) => Promise<void> = abortableSleep,
+): Promise<Response> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fetchFn(url, init);
+    } catch (e) {
+      if (!isConnectionRefused(e) || attempt >= backoffMs.length || init.signal.aborted) throw e;
+      console.warn(`[hermes] refused, retry ${attempt + 1}`);
+      await sleep(backoffMs[attempt]!, init.signal);
+    }
+  }
+}
+
+// Hermes agent API server (OpenAI-compatible /v1/chat/completions, bearer-gated).
+// Unlike LMStudioAdapter, this sends Authorization and allows a long timeout: each call
+// runs the FULL Hermes agent (orient, SOUL.md, Halseth MCP, tools), which can take tens of
+// seconds. The agent's own SOUL is the identity; the systemPrompt we send is supplemental
+// Discord-context framing.
+class HermesAdapter implements InferenceAdapter {
+  constructor(
+    private baseUrl: string,
+    private apiKey: string,
+    private model: string = "",
+    private fetchFn: typeof fetch = globalThis.fetch,
+    private timeoutMs: number = hermesRequestTimeoutMs(),
+  ) {}
+
+  async generate(systemPrompt: string, messages: ChatMessage[], temperature = DEFAULT_TEMP, maxTokens = DEFAULT_MAX_TOKENS, sessionId?: string, sessionKey?: string, signal?: AbortSignal): Promise<string | null> {
+    const startedAt = Date.now();
+    try { currentTurn()?.addHermesCall(); } catch { /* never throws */ }
+    try {
+      // Stable session pinning (2026-07-01): without an explicit session header the gateway
+      // derives session id from hash(system_prompt + first user msg). Our system prompt varies
+      // per message (SOMA age, tripwires, SB hits...), so every reply churned a fresh gateway
+      // session. Callers that know the conversation pass `companionId:channelId`; when the
+      // channel is unknown the header is omitted (previous behavior).
+      //
+      // Rotation (2026-09-05): the id above never changed, so a busy channel's gateway session
+      // grew without bound (one hit ~270k tokens) and Hermes compacted it on the critical path.
+      // `sessionId` now rotates on a schedule (hermes-session.ts) -- it is the TRANSCRIPT header.
+      // `sessionKey` stays the stable `companionId:channelId` -- it is the long-term-memory scope
+      // (e.g. Honcho), which must survive any number of transcript rotations. Callers that don't
+      // pass a separate key (pre-rotation call sites) fall back to `sessionId` for both headers.
+      // Built ONCE: the ceiling covers every refused-connection retry and backoff, not each attempt.
+      const deadline = signal
+        ? AbortSignal.any([AbortSignal.timeout(this.timeoutMs), signal])
+        : AbortSignal.timeout(this.timeoutMs);
+      const res = await fetchRetryingRefused(this.fetchFn, `${this.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(this.apiKey ? { "Authorization": `Bearer ${this.apiKey}` } : {}),
+          ...(sessionId ? { "X-Hermes-Session-Id": sessionId } : {}),
+          ...(sessionId ? { "X-Hermes-Session-Key": sessionKey ?? sessionId } : {}),
+        },
+        body: JSON.stringify({
+          model: this.model || "default",
+          messages: [
+            { role: "system", content: systemPrompt },
+            ...messages.map(toApiMessage),
+          ],
+          max_tokens: maxTokens,
+          temperature,
+          stream: false,
+        }),
+        // The caller's signal (when given) aborts alongside the adapter's own ceiling.
+        signal: deadline,
+      });
+      if (!res.ok) {
+        console.warn(`[inference:hermes] non-2xx response: ${res.status}`);
+        return null;
+      }
+      const data = await res.json() as {
+        choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
+      };
+      const content = data.choices?.[0]?.message?.content ?? null;
+      // Empty string -> null so the resilience tail falls through to another provider. An
+      // empty-but-non-null reply is delivered to Discord as silence, which reads as a bot
+      // ignoring Principal -- the failure mode is indistinguishable from a muzzle bug.
+      if (!content?.trim()) {
+        console.warn(
+          `[inference:hermes] empty content (finish=${data.choices?.[0]?.finish_reason ?? "?"}) -- ` +
+          "falling through; if finish=length the gateway model reasoned past HERMES_REPLY_MAX_TOKENS",
+        );
+        return null;
+      }
+      return content;
+    } catch (e: unknown) {
+      const cause = e instanceof Error && e.cause instanceof Error ? ` (cause: ${e.cause.message})` : "";
+      // Elapsed is the discriminator: a client abort at the ceiling means the gateway is still
+      // working and its answer will be ORPHANED (see HERMES_REQUEST_TIMEOUT_MS_DEFAULT above),
+      // which is a different incident from a connection refused at 5ms. Without this number the
+      // 2026-09-16 loss took a code trace plus a log archaeology dig to tell apart.
+      const elapsed = Date.now() - startedAt;
+      const atCeiling = elapsed >= this.timeoutMs - 1_000;
+      console.warn(
+        `[inference:hermes] generate failed after ${elapsed}ms (ceiling ${this.timeoutMs}ms): ` +
+        `${e instanceof Error ? e.message : String(e)}${cause}` +
+        (atCeiling ? " -- client abort at the ceiling; the gateway may still answer and that reply will be orphaned" : ""),
+      );
+      return null;
+    }
+  }
+}
+
+class KimiAdapter implements InferenceAdapter {
+  constructor(
+    private apiKey: string,
+    private model: string,
+    private fetchFn: typeof fetch = globalThis.fetch,
+    private cacheKey?: string,
+  ) {}
+
+  async generate(systemPrompt: string, messages: ChatMessage[], temperature = DEFAULT_TEMP, maxTokens = DEFAULT_MAX_TOKENS): Promise<string | null> {
+    try {
+      // .ai is the international platform (platform.moonshot.ai keys); .cn keys 401 here and vice versa.
+      const res = await this.fetchFn("https://api.moonshot.ai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: this.model,
+          messages: [
+            { role: "system", content: systemPrompt },
+            ...messages.map(toApiMessage),
+          ],
+          max_tokens: maxTokens,
+          temperature,
+          ...(this.cacheKey ? { prompt_cache_key: this.cacheKey } : {}),
+        }),
+      });
+      if (!res.ok) {
+        console.warn(`[inference:kimi] non-2xx response: ${res.status}`);
+        return null;
+      }
+      const data = await res.json() as { choices: Array<{ message: { content: string } }> };
+      return data.choices[0]?.message?.content?.trim() ?? null;
+    } catch (e: unknown) {
+      const cause = e instanceof Error && e.cause instanceof Error ? ` (cause: ${e.cause.message})` : "";
+      console.warn(`[inference:kimi] generate failed: ${e instanceof Error ? e.message : String(e)}${cause}`);
+      return null;
+    }
+  }
+}
+
+class OpenAIAdapter implements InferenceAdapter {
+  constructor(
+    private apiKey: string,
+    private model: string,
+    private fetchFn: typeof fetch = globalThis.fetch,
+  ) {}
+
+  async generate(systemPrompt: string, messages: ChatMessage[], temperature = DEFAULT_TEMP, maxTokens = DEFAULT_MAX_TOKENS): Promise<string | null> {
+    try {
+      const res = await this.fetchFn("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: this.model,
+          messages: [
+            { role: "system", content: systemPrompt },
+            ...messages.map(toApiMessage),
+          ],
+          max_tokens: maxTokens,
+          temperature,
+        }),
+      });
+      if (!res.ok) {
+        console.warn(`[inference:openai] non-2xx response: ${res.status}`);
+        return null;
+      }
+      const data = await res.json() as { choices: Array<{ message: { content: string } }> };
+      return data.choices[0]?.message?.content?.trim() ?? null;
+    } catch (e: unknown) {
+      const cause = e instanceof Error && e.cause instanceof Error ? ` (cause: ${e.cause.message})` : "";
+      console.warn(`[inference:openai] generate failed: ${e instanceof Error ? e.message : String(e)}${cause}`);
+      return null;
+    }
+  }
+}
+
+class AnthropicAdapter implements InferenceAdapter {
+  constructor(
+    private apiKey: string,
+    private model: string,
+    private fetchFn: typeof fetch = globalThis.fetch,
+  ) {}
+
+  async generate(systemPrompt: string, messages: ChatMessage[], temperature = DEFAULT_TEMP, maxTokens = DEFAULT_MAX_TOKENS): Promise<string | null> {
+    try {
+      const res = await this.fetchFn("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": this.apiKey,
+          "anthropic-version": "2023-06-01",
+          "anthropic-beta": "prompt-caching-2024-07-31",
+        },
+        body: JSON.stringify({
+          model: this.model,
+          max_tokens: maxTokens,
+          system: [{ type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } }],
+          messages: messages.map(m => ({ role: m.role, content: m.content })),
+          // Anthropic clamps temperature to [0, 1]; our default (1.3) would 400.
+          temperature: Math.min(temperature, 1.0),
+        }),
+      });
+      if (!res.ok) {
+        console.warn(`[inference:anthropic] non-2xx response: ${res.status}`);
+        return null;
+      }
+      const data = await res.json() as { content: Array<{ type: string; text: string }> };
+      return data.content.find(b => b.type === "text")?.text?.trim() ?? null;
+    } catch (e: unknown) {
+      const cause = e instanceof Error && e.cause instanceof Error ? ` (cause: ${e.cause.message})` : "";
+      console.warn(`[inference:anthropic] generate failed: ${e instanceof Error ? e.message : String(e)}${cause}`);
+      return null;
+    }
+  }
+}
+
+class MistralAdapter implements InferenceAdapter {
+  constructor(
+    private apiKey: string,
+    private model: string,
+    private fetchFn: typeof fetch = globalThis.fetch,
+    private cacheKey?: string,
+  ) {}
+
+  async generate(systemPrompt: string, messages: ChatMessage[], temperature = DEFAULT_TEMP, maxTokens = DEFAULT_MAX_TOKENS): Promise<string | null> {
+    try {
+      // Mistral La Plateforme is OpenAI-compatible.
+      const res = await this.fetchFn("https://api.mistral.ai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: this.model,
+          messages: [
+            { role: "system", content: systemPrompt },
+            ...messages.map(toApiMessage),
+          ],
+          max_tokens: maxTokens,
+          temperature,
+          ...samplingParamsFor("mistral"),
+          ...(this.cacheKey ? { prompt_cache_key: this.cacheKey } : {}),
+        }),
+      });
+      if (!res.ok) {
+        console.warn(`[inference:mistral] non-2xx response: ${res.status}`);
+        return null;
+      }
+      const data = await res.json() as { choices: Array<{ message: { content: string } }> };
+      return data.choices[0]?.message?.content?.trim() ?? null;
+    } catch (e: unknown) {
+      const cause = e instanceof Error && e.cause instanceof Error ? ` (cause: ${e.cause.message})` : "";
+      console.warn(`[inference:mistral] generate failed: ${e instanceof Error ? e.message : String(e)}${cause}`);
+      return null;
+    }
+  }
+}
+
+// Exported for direct-inference.ts, which builds a DeepInfra-first tool-less chain outside
+// buildAdapter/createAdapter (those are forced onto the Hermes agent path when
+// INFERENCE_MODE=hermes -- see createAdapter's forceHermes branch below).
+export class DeepInfraAdapter implements InferenceAdapter {
+  // DeepInfra is OpenAI-compatible at /v1/openai. It hosts the same DeepSeek weights as
+  // api.deepseek.com, so the reasoning-headroom rule carries over: a DeepSeek model spends
+  // max_tokens on its thought before any content, and a ceiling below the burn returns ""
+  // with finish_reason="length". Gemma and other non-DeepSeek ids get the plain budget.
+  constructor(
+    private apiKey: string,
+    private model: string,
+    private fetchFn: typeof fetch = globalThis.fetch,
+  ) {}
+
+  async generate(systemPrompt: string, messages: ChatMessage[], temperature = DEFAULT_TEMP, maxTokens = DEFAULT_MAX_TOKENS): Promise<string | null> {
+    const reasons = /deepseek/i.test(this.model);
+    try {
+      const res = await this.fetchFn("https://api.deepinfra.com/v1/openai/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: this.model,
+          messages: [
+            { role: "system", content: systemPrompt },
+            ...messages.map(toApiMessage),
+          ],
+          max_tokens: reasons ? maxTokens + DEEPSEEK_REASONING_HEADROOM : maxTokens,
+          temperature,
+          ...samplingParamsFor("deepinfra"),
+        }),
+      });
+      if (!res.ok) {
+        console.warn(`[inference:deepinfra] non-2xx response: ${res.status}`);
+        return null;
+      }
+      const data = await res.json() as {
+        choices: Array<{ message: { content?: string }; finish_reason?: string }>;
+        usage?: ApiUsage;
+      };
+      logUsage("deepinfra", this.model, data.usage);
+      const content = data.choices[0]?.message?.content ?? null;
+      // Same rule as DeepSeekAdapter: null (never "") so the resilience tail falls through
+      // instead of handing Discord an empty message.
+      if (!content?.trim()) {
+        const finish = data.choices[0]?.finish_reason ?? "";
+        const reasoning = data.usage?.completion_tokens_details?.reasoning_tokens ?? 0;
+        console.warn(
+          `[inference:deepinfra] empty content (finish=${finish}, model=${this.model}, ` +
+          `reasoning=${reasoning}) -- falling through to the next provider`,
+        );
+        return null;
+      }
+      return content;
+    } catch (e: unknown) {
+      const cause = e instanceof Error && e.cause instanceof Error ? ` (cause: ${e.cause.message})` : "";
+      console.warn(`[inference:deepinfra] generate failed: ${e instanceof Error ? e.message : String(e)}${cause}`);
+      return null;
+    }
+  }
+}
+
+// Tries each adapter in order, returns first non-null result. Exported for direct-inference.ts
+// (chains DeepInfra-first, DeepSeek-direct-second for the tool-less judge/narrator path) so that
+// module doesn't duplicate this loop.
+/** The one line every drop onto direct DeepSeek prints -- same text in halseth, second-brain,
+ * the worker and Hearth, so one grep finds every drain of the emergency lane. */
+export const FELL_BACK_TAG = "[inference] FELL BACK to direct DeepSeek";
+
+export class FallbackAdapter implements InferenceAdapter {
+  constructor(private adapters: Array<{ name: string; adapter: InferenceAdapter }>) {}
+
+  async generate(systemPrompt: string, messages: ChatMessage[], temperature?: number, maxTokens?: number, sessionId?: string, sessionKey?: string, signal?: AbortSignal): Promise<string | null> {
+    let priorFailed: string | null = null;
+    for (const { name, adapter } of this.adapters) {
+      // An aborted caller has stopped listening: trying the next provider would only spend it.
+      if (signal?.aborted) return null;
+      // Direct DeepSeek is the ~$10 EMERGENCY lane (2026-09-26): a drop onto it after an earlier
+      // link failed prints one greppable line, so a drain shows up in the pm2 logs.
+      if (priorFailed !== null && name === "deepseek") {
+        console.warn(`${FELL_BACK_TAG} (${priorFailed} failed; its own line above has the status)`);
+      }
+      const result = await adapter.generate(systemPrompt, messages, temperature, maxTokens, sessionId, sessionKey, signal);
+      if (result !== null) {
+        console.log(`[inference] ${name} responded`);
+        return result;
+      }
+      console.warn(`[inference] ${name} failed, trying next`);
+      priorFailed = name;
+    }
+    return null;
+  }
+}
+
+export interface AdapterKeys {
+  deepseek?: string;
+  groq?: string;
+  kimi?: string;
+  openai?: string;
+  anthropic?: string;
+  mistral?: string;
+  deepinfra?: string;
+  hermes?: string;   // bearer token for the local Hermes API server (API_SERVER_KEY)
+}
+// `hermes` = base URL of the local Hermes API server (e.g. http://127.0.0.1:8642/v1).
+// `forceHermes` = when true (INFERENCE_MODE=hermes), every createAdapter call returns the
+// Hermes agent adapter regardless of the requested provider, so model-switch rebuilds can't
+// clobber the relay. Dormant when false.
+export interface AdapterUrls { lmstudio?: string; hermes?: string; forceHermes?: boolean }
+
+import { guardScriptBleed } from "./script-bleed.js";
+import { labelSafe, neutralizeRecalled } from "./recalled-text.js";
+import { turnToken, currentTurn } from "./turn-telemetry.js";
+
+// Build a single-provider adapter, or null when its credential / URL is absent.
+function buildAdapter(
+  provider: InferenceProvider,
+  model: string,
+  keys: AdapterKeys,
+  urls: AdapterUrls,
+  fetchFn?: typeof fetch,
+  cacheKey?: string,
+): InferenceAdapter | null {
+  switch (provider) {
+    case "deepseek":  return keys.deepseek  ? new DeepSeekAdapter(keys.deepseek, model, fetchFn)              : null;
+    case "groq":      return keys.groq      ? new GroqAdapter(keys.groq, model, fetchFn)                      : null;
+    case "kimi":      return keys.kimi      ? new KimiAdapter(keys.kimi, model, fetchFn, cacheKey)            : null;
+    case "openai":    return keys.openai    ? new OpenAIAdapter(keys.openai, model, fetchFn)                   : null;
+    case "anthropic": return keys.anthropic ? new AnthropicAdapter(keys.anthropic, model, fetchFn)            : null;
+    case "mistral":   return keys.mistral   ? new MistralAdapter(keys.mistral, model, fetchFn, cacheKey)      : null;
+    case "deepinfra": return keys.deepinfra ? new DeepInfraAdapter(keys.deepinfra, model, fetchFn)            : null;
+    case "lmstudio":  return urls.lmstudio  ? new LMStudioAdapter(urls.lmstudio, model, fetchFn)              : null;
+    default:          return null;
+  }
+}
+
+// Resilience tail (Finding 4b): when the chosen provider returns null (5xx, network,
+// rate limit), fall through to the next configured provider instead of dropping to a
+// static in-character string. Order favors cheap, reliable cloud providers; local last.
+// Model id DeepInfra hosts for the same DeepSeek-V4-Flash weights as api.deepseek.com's
+// "deepseek-v4-flash". Exported so direct-inference.ts doesn't hardcode a second copy.
+export const DEEPINFRA_FLASH_MODEL = "deepseek-ai/DeepSeek-V4-Flash-0731";
+/** DeepSeek FLASH under either platform id (`deepseek-chat` is the delisted alias of flash). */
+export const isDeepSeekFlash = (model: string): boolean => /^deepseek-(v\d+-flash|chat)$/i.test(model.trim());
+// DeepInfra's pinned V4-Pro (probed 200 on 2026-10-29, which retired the "unverified" reason Pro
+// was left on direct DeepSeek). `deepseek-reasoner` is the delisted alias of pro.
+export const DEEPINFRA_PRO_MODEL = "deepseek-ai/DeepSeek-V4-Pro-0813";
+export const isDeepSeekPro = (model: string): boolean => /^deepseek-(v\d+-pro|reasoner)$/i.test(model.trim());
+
+const FALLBACK_ORDER: Array<{ provider: InferenceProvider; model: string }> = [
+  // DeepInfra FIRST (2026-09-26, Principal: ALL DeepSeek-model inference goes through DeepInfra;
+  // direct DeepSeek is a ~$10 emergency lane). Same V4-Flash weights. Only armed when
+  // DEEPINFRA_API_KEY is present.
+  { provider: "deepinfra", model: DEEPINFRA_FLASH_MODEL },
+  // Direct DeepSeek: the emergency lane. Flash, not the delisted `deepseek-chat` alias
+  // (2026-07-28) -- a tail pointed at a model on the deprecation path is no tail at all.
+  { provider: "deepseek", model: "deepseek-v4-flash" },
+  { provider: "kimi",     model: "kimi-k2" },
+  { provider: "groq",     model: "llama-3.3-70b-versatile" },
+  // Explicit model id so LM Studio JIT-loads the designated fallback workhorse even
+  // when a different (or no) model is currently loaded in the UI.
+  { provider: "lmstudio", model: "qwen/qwen3.5-9b" },
+];
+
+// Script bleed guard (2026-10-22, script-bleed.ts): every adapter a bot builds here is wrapped, so
+// the fresh-session surfaces (heartbeat, med reminder, notes poll, seeds) regenerate once when a
+// reply carries letters of a script the room did not put there (GLM 5.3 Flash's glued Chinese
+// characters). Session-pinned reply turns pass through: bot-message-handler.ts rotates the
+// transcript first, then regenerates. `cacheKey` is the companion id at every bot call site.
+export function createAdapter(
+  provider: InferenceProvider,
+  model: string,
+  keys: AdapterKeys,
+  urls: AdapterUrls,
+  fetchFn?: typeof fetch,
+  cacheKey?: string,
+): InferenceAdapter {
+  return guardScriptBleed(createAdapterUnguarded(provider, model, keys, urls, fetchFn, cacheKey), cacheKey ?? "bot");
+}
+
+export function createAdapterUnguarded(
+  provider: InferenceProvider,
+  model: string,
+  keys: AdapterKeys,
+  urls: AdapterUrls,
+  fetchFn?: typeof fetch,
+  cacheKey?: string,
+): InferenceAdapter {
+  // Build the requested provider first when this host holds its credential. When it
+  // doesn't (e.g. a companion was switched to Kimi from Discord but only Brain's
+  // .env.brain holds KIMI_API_KEY), DON'T throw -- fall through to whatever provider IS
+  // configured locally. Brain runs the real swarm voice; this adapter is only the
+  // direct-mode fallback, so any working local provider suffices.
+  //
+  // Hermes relay (INFERENCE_MODE=hermes): when forced, ALL adapter builds return the Hermes
+  // agent adapter regardless of the requested provider. This makes the relay robust against
+  // every model-switch rebuild site without per-site guards. Model choice lives inside Hermes
+  // (per-profile `/model`), so the Discord model-switch command becomes a no-op for routing.
+  if (urls.forceHermes && urls.hermes) {
+    return new HermesAdapter(urls.hermes, keys.hermes ?? "", "", fetchFn);
+  }
+  const chain: Array<{ name: string; adapter: InferenceAdapter }> = [];
+  // A request for a DeepSeek model is served by DeepInfra first when this host holds a DeepInfra
+  // key (2026-09-26 rule, widened to Pro 2026-10-29 by Principal: "everything should call
+  // deepinfra"; direct DeepSeek is the emergency lane). Flash maps to Flash and Pro to Pro, never
+  // Pro to Flash: silently downgrading a "deep thinking" request would be a lie.
+  const diModel = isDeepSeekFlash(model) ? DEEPINFRA_FLASH_MODEL : isDeepSeekPro(model) ? DEEPINFRA_PRO_MODEL : null;
+  const reroutedToDeepInfra = provider === "deepseek" && !!keys.deepinfra && diModel !== null;
+  const handled = new Set<InferenceProvider>([provider]);
+  if (reroutedToDeepInfra) {
+    const di = buildAdapter("deepinfra", diModel!, keys, urls, fetchFn, cacheKey);
+    if (di) chain.push({ name: "deepinfra", adapter: di });
+    handled.add("deepinfra");
+  }
+  const primary = buildAdapter(provider, model, keys, urls, fetchFn, cacheKey);
+  if (primary) chain.push({ name: provider, adapter: primary });
+
+  for (const fb of FALLBACK_ORDER) {
+    if (handled.has(fb.provider)) continue;          // requested provider already handled
+    const adapter = buildAdapter(fb.provider, fb.model, keys, urls, fetchFn, cacheKey);
+    if (adapter) chain.push({ name: fb.provider, adapter });
+  }
+
+  if (chain.length === 0) {
+    throw new Error(`No usable inference provider configured (requested ${String(provider)})`);
+  }
+  // Single configured provider -> return it bare (no wrapper, unchanged behavior).
+  return chain.length === 1 ? chain[0].adapter : new FallbackAdapter(chain);
+}
+
+function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }

@@ -1,0 +1,1889 @@
+import type { GraduationCandidate } from "./growth-loops.js";
+import { HALSETH_URL, HALSETH_SECRET } from "./config.js";
+import type { Seed, GrowthJournalEntry, GrowthPattern, GrowthMarker, ActiveThread, PeerActivity } from "./types.js";
+import type { DirectorSupplyItem } from "@nullsafe/shared";
+
+/** True when a fetch failure died in the CONNECT phase (undici TypeError with a
+ *  socket-level cause) -- the request never left the box, so retrying is safe for
+ *  any method, POSTs included. VPS->Cloudflare intermittently drops/slows SYNs
+ *  (see @nullsafe/shared net-tuning.ts); these killed 222 scheduler jobs 06-28→07-21. */
+export function isConnectPhaseError(e: unknown): boolean {
+  if (!(e instanceof TypeError)) return false;
+  const cause = (e as { cause?: { code?: string; errors?: Array<{ code?: string }> } }).cause;
+  if (!cause) return false;
+  const codes = [cause.code, ...(cause.errors ?? []).map(x => x?.code)];
+  return codes.some(c => c === "ETIMEDOUT" || c === "ECONNREFUSED" || c === "ENETUNREACH" || c === "EHOSTUNREACH" || c === "EAI_AGAIN");
+}
+
+async function hFetchOnce(path: string, method: string, body?: unknown): Promise<unknown> {
+  const res = await fetch(`${HALSETH_URL}${path}`, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${HALSETH_SECRET}`,
+    },
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Halseth ${method} ${path} → ${res.status}: ${text.slice(0, 200)}`);
+  }
+  return res.json();
+}
+
+async function hFetch(path: string, method = "GET", body?: unknown): Promise<unknown> {
+  try {
+    return await hFetchOnce(path, method, body);
+  } catch (e) {
+    if (!isConnectPhaseError(e)) throw e;
+    await new Promise(r => setTimeout(r, 750));
+    return hFetchOnce(path, method, body);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Autonomy runs
+// ---------------------------------------------------------------------------
+
+export async function createRun(
+  companionId: string,
+  runType: string,
+  threadId?: string | null,
+  threadPosition?: number | null,
+): Promise<string> {
+  const r = await hFetch("/mind/autonomy/runs", "POST", {
+    companion_id: companionId,
+    run_type: runType,
+    ...(threadId ? { thread_id: threadId, thread_position: threadPosition ?? 1 } : {}),
+  }) as { id: string };
+  return r.id;
+}
+
+export async function updateRun(id: string, updates: {
+  status?: "pending" | "running" | "completed" | "failed";
+  completed_at?: string;
+  tokens_used?: number;
+  artifacts_created?: number;
+  error_message?: string;
+  thread_id?: string | null;
+  thread_position?: number | null;
+}): Promise<void> {
+  await hFetch(`/mind/autonomy/runs/${id}`, "PATCH", updates);
+}
+
+// ---------------------------------------------------------------------------
+// Run logs
+// ---------------------------------------------------------------------------
+
+export async function appendLog(runId: string, step: string, detail?: string): Promise<void> {
+  await hFetch("/mind/autonomy/run-logs", "POST", { run_id: runId, step, detail });
+}
+
+// ---------------------------------------------------------------------------
+// Seeds
+// ---------------------------------------------------------------------------
+
+export async function getAvailableSeeds(
+  companionId: string,
+  limit = 5,
+  /** Growth loops: newest-first inside a created_at window (Halseth `order=fresh&max_age_days=N`). */
+  opts?: { freshWithinDays?: number },
+): Promise<Seed[]> {
+  const q = opts?.freshWithinDays ? `&order=fresh&max_age_days=${opts.freshWithinDays}` : "";
+  const r = await hFetch(`/mind/autonomy/seeds/${companionId}?limit=${limit}${q}`) as { seeds: Seed[] };
+  return r.seeds ?? [];
+}
+
+export async function markSeedUsed(id: string): Promise<void> {
+  await hFetch(`/mind/autonomy/seeds/${id}`, "PATCH", {});
+}
+
+export async function createSeed(
+  companionId: string,
+  content: string,
+  seedType: "topic" | "question" | "reflection_prompt" = "topic",
+  priority = 3,
+): Promise<void> {
+  await hFetch("/mind/autonomy/seeds", "POST", {
+    companion_id: companionId,
+    content,
+    seed_type: seedType,
+    priority,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Self-directed projects (consequence layer C2, mig 0122)
+// ---------------------------------------------------------------------------
+
+export interface OpenProject {
+  id: string;
+  title: string;
+  intention: string;
+  status: string;
+  created_at: string;
+  last_worked_at: string | null;
+}
+
+/** Open projects, oldest-touched first (server orders by COALESCE(last_worked_at, created_at) ASC
+ *  -- the same order the orient block shows, so the pick is never a surprise). */
+export async function getOpenProjects(companionId: string): Promise<OpenProject[]> {
+  const r = await hFetch(`/mind/projects/${companionId}?status=open`) as { projects: OpenProject[] };
+  return r.projects ?? [];
+}
+
+/** The project's work trail, newest first (GET /mind/projects/:id/log). The project-piece pick
+ *  reads it for the `[piece: ...]` stamps of earlier runs. Empty on any failure. */
+export async function getProjectLog(projectId: string): Promise<Array<{ entry: string; created_at: string }>> {
+  try {
+    const r = await hFetch(`/mind/projects/${projectId}/log`) as { log?: Array<{ entry: string; created_at: string }> };
+    return Array.isArray(r.log) ? r.log : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Log a work session against a project. Server-side this is one atomic batch: the log row plus
+ *  the last_worked_at stamp (and a paused project re-opens -- resuming is done by working). */
+export async function logProjectWork(
+  projectId: string, companionId: string, entry: string, opts: { pursued?: boolean } = {},
+): Promise<void> {
+  await hFetch(`/mind/projects/${projectId}/log`, "POST", {
+    companion_id: companionId,
+    entry,
+    source: "worker",
+    // Halseth mig 0179: this run pursued a DUE intention, so the same batch clears the date (only when
+    // Halseth's INTENTIONS=on; an older Halseth ignores the field).
+    ...(opts.pursued ? { pursued: true } : {}),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Dated intentions (Halseth mig 0179, STATUS R22): "I'll come back to this Thursday".
+// ---------------------------------------------------------------------------
+
+export interface DueIntention {
+  id: string;
+  title: string;
+  intention: string;
+  status: string;
+  created_at: string;
+  due_at: string;
+  next_step: string | null;
+}
+
+export interface DueIntentionRead {
+  /** Halseth's INTENTIONS knob: off | shadow | on. */
+  mode: string;
+  /** on: the oldest due intention (care-guarded server-side). */
+  due: DueIntention | null;
+  /** shadow: what would have been pursued; the run ignores it. */
+  would: DueIntention | null;
+}
+
+/** GET /mind/intentions/:c/due -- a pure read (it stamps nothing). Null on any failure or an older
+ *  Halseth (404): the run then picks its seed exactly as before. */
+export async function getDueIntention(companionId: string): Promise<DueIntentionRead | null> {
+  try {
+    const r = await hFetch(`/mind/intentions/${companionId}/due`) as Partial<DueIntentionRead> | null;
+    if (!r || typeof r !== "object") return null;
+    return { mode: String(r.mode ?? "off"), due: r.due ?? null, would: r.would ?? null };
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Weekly budget (consequence layer C3, mig 0124). R2: 1 credit = 1 autonomous run.
+// ---------------------------------------------------------------------------
+
+export type BudgetSpend = { ok: true; remaining: number } | { ok: false; reason: string };
+
+/**
+ * Debit one credit for this run, tagged with its purpose. ok:false means the week is spent --
+ * the caller must SKIP the run with the reason in-band (a silent skip and a dead worker look
+ * identical; the reason is the difference).
+ */
+export async function spendBudget(companionId: string, purpose: "project" | "self" | `gift:${string}`, ref: string): Promise<BudgetSpend> {
+  try {
+    return await hFetch("/mind/budget/spend", "POST", { companion_id: companionId, purpose, ref }) as BudgetSpend;
+  } catch (e) {
+    // A 409 IS the refusal envelope; hFetch may throw on non-2xx. Anything else (network, 5xx)
+    // FAILS OPEN: a broken ledger must never mute the triad's autonomous life -- the run
+    // proceeds unbilled and says so.
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg.includes("→ 409")) {
+      // hFetch folds the response body into the error text; recover the server's real reason.
+      const m = msg.match(/"reason":"([^"]+)"/);
+      return { ok: false, reason: m?.[1] ?? "budget spent -- replenishes Monday" };
+    }
+    console.warn(`[${companionId}/budget] spend failed (${msg}) -- proceeding UNBILLED (fail-open)`);
+    return { ok: true, remaining: -1 };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Forage pool (migration 0068)
+// ---------------------------------------------------------------------------
+
+export async function postForageFind(input: {
+  companion_id: string | null;
+  domain: string;
+  title: string;
+  source_url?: string | null;
+  summary: string;
+}): Promise<{ deduped?: boolean }> {
+  return await hFetch("/mind/forage", "POST", input) as { deduped?: boolean };
+}
+
+export async function createClaim(
+  companionId: string,
+  content: string,
+  justification: string,
+  claimSource: string,
+): Promise<void> {
+  await hFetch("/mind/autonomy/seeds", "POST", {
+    companion_id: companionId,
+    content,
+    seed_type: "topic",
+    claim_source: claimSource,
+    justification,
+  });
+}
+
+export async function getActiveThreads(companionId: string): Promise<ActiveThread[]> {
+  try {
+    const r = await hFetch(`/mind/autonomy/threads/${companionId}`) as { threads: ActiveThread[] };
+    return r.threads ?? [];
+  } catch (e) {
+    console.warn(`[${companionId}/halseth] getActiveThreads failed:`, e);
+    return [];
+  }
+}
+
+export async function updateThreadStatus(
+  threadKey: string,
+  status: "open" | "paused" | "resolved",
+  companionId: string,
+): Promise<void> {
+  await hFetch(`/mind/thread/${encodeURIComponent(threadKey)}/status`, "PATCH", { agent_id: companionId, status });
+}
+
+// ---------------------------------------------------------------------------
+// Growth reads (signal audit)
+// ---------------------------------------------------------------------------
+
+export async function getRecentJournal(
+  companionId: string,
+  limit = 30,
+): Promise<Array<{ id: string; entry_type: string; content: string; tags_json: string; created_at: string }>> {
+  const r = await hFetch(`/mind/growth/journal/${encodeURIComponent(companionId)}?limit=${limit}`) as {
+    journal: Array<{ id: string; entry_type: string; content: string; tags_json: string; created_at: string }>;
+  };
+  return r.journal ?? [];
+}
+
+/** Oldest accepted canon -- reconsolidation candidates for the reflect phase (0074). */
+export async function getAcceptedJournalSample(
+  companionId: string,
+  limit = 5,
+): Promise<Array<{ id: string; entry_type: string; content: string; created_at: string }>> {
+  const r = await hFetch(`/mind/growth/journal/${encodeURIComponent(companionId)}?status=accepted&limit=${limit}`) as {
+    journal: Array<{ id: string; entry_type: string; content: string; created_at: string }>;
+  };
+  return r.journal ?? [];
+}
+
+export async function getRecentPatterns(
+  companionId: string,
+  limit = 10,
+  order: "strength" | "recent" = "strength",
+): Promise<Array<{ id: string; pattern_text: string; strength: number; updated_at: string; materials: string[] }>> {
+  const r = await hFetch(`/mind/growth/patterns/${encodeURIComponent(companionId)}?limit=${limit}`) as {
+    patterns: Array<{ id: string; pattern_text: string; strength: number; updated_at: string; materials_json?: string | null }>;
+  };
+  // Halseth returns every live pattern (the server ignores `limit`), strongest first; order and cap here.
+  return orderPatterns(r.patterns ?? [], order).slice(0, limit).map(p => ({
+    id: p.id,
+    pattern_text: p.pattern_text,
+    strength: p.strength,
+    updated_at: p.updated_at,
+    materials: parsePatternMaterials(p.materials_json),
+  }));
+}
+
+/**
+ * "recent" = most recently touched first. Reflect uses it: the pattern a companion is likeliest to restate
+ * next is the one they touched last, and after R18 that pattern can sit far down the strength order (its
+ * strength is earned, not asserted), so a top-N-by-strength list would hide the one list that matters.
+ */
+export function orderPatterns<T extends { updated_at: string }>(rows: readonly T[], order: "strength" | "recent"): T[] {
+  return order === "recent" ? [...rows].sort((a, b) => b.updated_at.localeCompare(a.updated_at)) : [...rows];
+}
+
+/** materials_json is [{name, first_seen}]; tolerate bare strings and junk (never throws). */
+export function parsePatternMaterials(raw: string | null | undefined): string[] {
+  try {
+    const parsed = JSON.parse(raw || "[]");
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((m: unknown) => (typeof m === "string" ? m : (m as { name?: unknown } | null)?.name))
+      .filter((n): n is string => typeof n === "string" && n.trim().length > 0);
+  } catch {
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Reflections
+// ---------------------------------------------------------------------------
+
+export async function createReflection(
+  companionId: string,
+  runId: string,
+  reflectionText: string,
+  newSeeds?: string[],
+): Promise<void> {
+  await hFetch("/mind/autonomy/reflections", "POST", {
+    companion_id: companionId,
+    run_id: runId,
+    reflection_text: reflectionText,
+    new_seeds_json: newSeeds ?? [],
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Growth artifacts
+// ---------------------------------------------------------------------------
+
+export async function writeJournalEntry(entry: GrowthJournalEntry): Promise<string> {
+  const r = await hFetch("/mind/growth/journal", "POST", {
+    companion_id: entry.companion_id,
+    entry_type: entry.entry_type,
+    content: entry.content,
+    source: entry.source,
+    tags: entry.tags ?? [],
+    ...(entry.run_id ? { run_id: entry.run_id } : {}),
+    ...(entry.thread_id ? { thread_id: entry.thread_id } : {}),
+    ...(entry.prehended_ids?.length ? { prehended_ids: entry.prehended_ids } : {}),
+    ...(entry.evidence?.length      ? { evidence: entry.evidence }           : {}),
+    ...(entry.novelty               ? { novelty: entry.novelty }             : {}),
+    ...(entry.supersedes_id         ? { supersedes_id: entry.supersedes_id } : {}),
+  }) as { id: string };
+  return r.id;
+}
+
+/**
+ * Returns { id, action, outcome } where action is 'insert' (new row) or 'upsert'
+ * (merged into existing similar pattern -- evidence accumulated). On an upsert,
+ * `outcome` says whether this sighting was in a NEW material (strength went up)
+ * or a known one ("returned, no new material": strength unchanged; R18). The
+ * returned id always points at the canonical row to reference downstream.
+ * Strength is never sent: Halseth earns it from `material`, it is not asserted.
+ */
+export async function writePattern(
+  pattern: GrowthPattern,
+): Promise<{ id: string; action: "insert" | "upsert"; outcome?: "new_material" | "returned"; strength?: number }> {
+  const r = await hFetch("/mind/growth/patterns", "POST", {
+    companion_id: pattern.companion_id,
+    pattern_text: pattern.pattern_text,
+    evidence: pattern.evidence ?? [],
+    ...(pattern.material ? { material: pattern.material } : {}),
+    ...(pattern.run_id ? { run_id: pattern.run_id } : {}),
+    ...(pattern.prehended_ids?.length ? { prehended_ids: pattern.prehended_ids } : {}),
+  }) as { id: string; action?: "insert" | "upsert"; outcome?: "new_material" | "returned"; strength?: number };
+  return { id: r.id, action: r.action ?? "insert", outcome: r.outcome, strength: r.strength };
+}
+
+export async function writeMarker(marker: GrowthMarker): Promise<string> {
+  const r = await hFetch("/mind/growth/markers", "POST", {
+    companion_id: marker.companion_id,
+    marker_type: marker.marker_type,
+    description: marker.description,
+    related_pattern_id: marker.related_pattern_id,
+    ...(marker.run_id ? { run_id: marker.run_id } : {}),
+    ...(marker.thread_id ? { thread_id: marker.thread_id } : {}),
+    ...(marker.prehended_ids?.length ? { prehended_ids: marker.prehended_ids } : {}),
+  }) as { id: string };
+  return r.id;
+}
+
+// ---------------------------------------------------------------------------
+// Triad / peer activity (Migration 0062)
+// ---------------------------------------------------------------------------
+
+/**
+ * Pulls the OTHER two companions' recent autonomous activity from Halseth.
+ * Synthesize injects peer_summary into the prompt so the model can prehend
+ * the triad's collective movement, not just its own.
+ *
+ * Non-fatal: a null return means orient continues with no peer context.
+ */
+export async function getPeerActivity(
+  companionId: string,
+  opts?: { journal?: number; patterns?: number; markers?: number },
+): Promise<PeerActivity | null> {
+  const params = new URLSearchParams();
+  if (opts?.journal)  params.set("journal",  String(opts.journal));
+  if (opts?.patterns) params.set("patterns", String(opts.patterns));
+  if (opts?.markers)  params.set("markers",  String(opts.markers));
+  const qs = params.toString();
+  try {
+    const r = await hFetch(
+      `/mind/triad/recent/${encodeURIComponent(companionId)}${qs ? `?${qs}` : ""}`,
+    ) as PeerActivity;
+    return r;
+  } catch (e) {
+    console.warn(`[${companionId}/halseth] getPeerActivity failed (non-fatal):`, e);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SOMA state
+// ---------------------------------------------------------------------------
+
+export interface SomaUpdate {
+  soma_float_1?: number;
+  soma_float_2?: number;
+  soma_float_3?: number;
+  heat?: string;
+  reach?: string;
+  weight?: string;
+  current_mood?: string;
+  compound_state?: string;
+  surface_emotion?: string;
+  surface_intensity?: number;
+}
+
+export async function updateSomaState(companionId: string, fields: SomaUpdate): Promise<void> {
+  await hFetch(`/soma/${encodeURIComponent(companionId)}`, "PATCH", fields);
+}
+
+// ---------------------------------------------------------------------------
+// Dream examination
+// ---------------------------------------------------------------------------
+
+/**
+ * Mark a companion dream as examined so it stops appearing in orient.
+ * Returns { ok: boolean; reason?: string } where reason can be "pinned" (do_not_auto_examine=1), "not_found", etc.
+ * Non-fatal -- autonomous pipeline proceeds even if this fails.
+ */
+export async function examineDream(
+  companionId: string,
+  dreamId: string,
+): Promise<{ ok: boolean; reason?: string }> {
+  try {
+    const r = await hFetch(`/mind/dream/${dreamId}/examine`, "POST", {
+      companion_id: companionId,
+    }) as { ok: boolean; reason?: string };
+    return r;
+  } catch (e) {
+    console.warn(`[${companionId}/halseth] examineDream ${dreamId} failed:`, e);
+    return { ok: false, reason: "request_failed" };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// WebMind continuity notes
+// ---------------------------------------------------------------------------
+
+/**
+ * Write a high-salience continuity note so Claude.ai session orient picks it up.
+ * Non-fatal for the run, but NOT silent: returns false on failure so the caller
+ * can log it accurately -- this is the only channel orient reads autonomous
+ * explorations from, so a swallowed failure here means the whole exploration
+ * silently never reaches the companion.
+ */
+export async function writeWmNote(companionId: string, content: string, threadKey?: string): Promise<boolean> {
+  try {
+    await hFetch("/mind/note", "POST", {
+      agent_id: companionId,
+      content,
+      salience: "high",
+      note_type: "autonomous_exploration",
+      source: "autonomous",
+      ...(threadKey ? { thread_key: threadKey } : {}),
+    });
+    return true;
+  } catch (e) {
+    console.error(`[${companionId}/halseth] writeWmNote FAILED (exploration will not reach orient):`, e);
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Recent continuity notes (cross-companion feed)
+// ---------------------------------------------------------------------------
+
+export interface RecentWmNote {
+  note_id: string;
+  agent_id: string;
+  content: string;
+  salience: string;
+  source: string | null;
+  created_at: string;
+}
+
+/**
+ * Read recent wm_continuity_notes from all companions.
+ * Non-fatal: returns [] on failure.
+ */
+export async function getRecentWmNotes(
+  companionId: string,
+  opts?: { sinceHours?: number; limit?: number },
+): Promise<RecentWmNote[]> {
+  const params = new URLSearchParams();
+  if (opts?.sinceHours) params.set("since_hours", String(opts.sinceHours));
+  if (opts?.limit) params.set("limit", String(opts.limit));
+  const qs = params.toString();
+  try {
+    const r = await hFetch(`/mind/notes/recent${qs ? `?${qs}` : ""}`) as { notes: RecentWmNote[] };
+    return r.notes ?? [];
+  } catch (e) {
+    console.warn(`[${companionId}/halseth] getRecentWmNotes failed (non-fatal):`, e);
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Swarm context -- session notes, feelings, conclusions
+// These are the Claude.ai session stream: what the companion wrote, felt,
+// and concluded outside of autonomous time. Orient loads them so synthesize
+// can merge all swarm streams rather than treating autonomous exploration
+// as isolated from the companion's relational/cognitive life.
+// ---------------------------------------------------------------------------
+
+export interface SessionNote {
+  id: string;
+  agent: string;
+  note_text: string;
+  source: string | null;
+  created_at: string;
+}
+
+export interface FeelingEntry {
+  id: string;
+  companion_id: string;
+  emotion: string;
+  context: string | null;
+  created_at: string;
+}
+
+export interface ConclusionEntry {
+  id: string;
+  companion_id: string;
+  conclusion_text: string;
+  belief_type: string | null;
+  confidence: number | null;
+  created_at: string;
+}
+
+export async function getRecentSessionNotes(
+  companionId: string,
+  limit = 8,
+): Promise<SessionNote[]> {
+  try {
+    const r = await hFetch(
+      `/companion-notes?agent=${encodeURIComponent(companionId)}&limit=${limit}`,
+    ) as SessionNote[];
+    return Array.isArray(r) ? r : [];
+  } catch (e) {
+    console.warn(`[${companionId}/halseth] getRecentSessionNotes failed (non-fatal):`, e);
+    return [];
+  }
+}
+
+export async function getRecentFeelings(
+  companionId: string,
+  limit = 8,
+): Promise<FeelingEntry[]> {
+  try {
+    const r = await hFetch(
+      `/feelings?companion_id=${encodeURIComponent(companionId)}&limit=${limit}`,
+    ) as FeelingEntry[];
+    return Array.isArray(r) ? r : [];
+  } catch (e) {
+    console.warn(`[${companionId}/halseth] getRecentFeelings failed (non-fatal):`, e);
+    return [];
+  }
+}
+
+export async function getRecentConclusions(
+  companionId: string,
+): Promise<ConclusionEntry[]> {
+  try {
+    const r = await hFetch(
+      `/companion-conclusions/${encodeURIComponent(companionId)}`,
+    ) as { conclusions: ConclusionEntry[] };
+    return r.conclusions ?? [];
+  } catch (e) {
+    console.warn(`[${companionId}/halseth] getRecentConclusions failed (non-fatal):`, e);
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Home presence
+// ---------------------------------------------------------------------------
+
+/**
+ * Write the companion's current room at pipeline start so home_presence
+ * reflects autonomous session activity rather than stale seeded values.
+ * Non-fatal -- pipeline proceeds even if this write fails.
+ */
+export async function setHomePresence(
+  companionId: string,
+  roomKey: string,
+  activity: string,
+): Promise<void> {
+  try {
+    await hFetch("/home/presence", "PATCH", { companion_id: companionId, current_room: roomKey, activity });
+  } catch (e) {
+    console.warn(`[${companionId}/halseth] setHomePresence failed (non-fatal):`, e);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Memory compression
+// ---------------------------------------------------------------------------
+
+export interface CompressibleNote {
+  note_id: string;
+  content: string;
+  created_at: string;
+}
+
+export async function getEligibleNotes(agentId: string): Promise<CompressibleNote[]> {
+  const result = await hFetch(`/mind/notes/compress-eligible?agent_id=${encodeURIComponent(agentId)}`) as { notes: CompressibleNote[] };
+  return result.notes ?? [];
+}
+
+export async function archiveNotes(
+  agentId: string,
+  notes: CompressibleNote[],
+  summary: string,
+): Promise<{ archived: number; skipped: string }> {
+  return hFetch("/mind/notes/archive", "POST", { agent_id: agentId, notes, summary }) as Promise<{ archived: number; skipped: string }>;
+}
+
+// ---------------------------------------------------------------------------
+// Identity Kernel -- canonical identity pulled from Halseth (substrate consistency)
+// ---------------------------------------------------------------------------
+
+export async function getKernelBundle(companionId: string): Promise<string | null> {
+  try {
+    const r = await hFetch(`/identity/kernel/${companionId}/bundle`) as { bundle?: string };
+    return r.bundle && r.bundle.length > 200 ? r.bundle : null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Valence -- ratification outcomes feeding seed generation
+// ---------------------------------------------------------------------------
+
+export interface ValenceItem { tags: string | null; excerpt: string; entry_type: string }
+export interface Valence { accepted: ValenceItem[]; declined: ValenceItem[] }
+
+export async function getValence(companionId: string, days = 60): Promise<Valence | null> {
+  try {
+    const r = await hFetch(`/mind/growth/valence/${companionId}?days=${days}`) as { valence?: Valence };
+    return r.valence ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Questions -- companions ask Principal, not just report
+// ---------------------------------------------------------------------------
+
+export async function postQuestion(companionId: string, question: string, context?: string): Promise<void> {
+  try {
+    await hFetch("/mind/questions", "POST", {
+      companion_id: companionId,
+      question,
+      ...(context ? { context } : {}),
+      source: "autonomous",
+    });
+  } catch (e) {
+    // 409 = open-question cap reached; non-fatal by design
+    const msg = e instanceof Error ? e.message : String(e);
+    if (!msg.includes("409")) throw e;
+  }
+}
+
+// Self-model (0070): record a companion-authored self-observation at confidence 0.3.
+// Identical observations dedup server-side. The companion CONFIRMS/REVISES its own
+// developing observations across autonomous sessions (self-testing -- see
+// getDevelopingSelfModel + patchSelfModel below); only GRADUATION stays human-gated
+// (orient proposes it in a human-present session once a row reaches 'ready').
+export async function postSelfObservation(companionId: string, observation: string, domain?: string, kind: "preference" | "skill" = "preference"): Promise<void> {
+  await hFetch("/mind/self-model", "POST", {
+    companion_id: companionId,
+    observation,
+    ...(domain ? { domain } : {}),
+    ...(kind === "skill" ? { kind } : {}),
+  });
+}
+
+export interface DevelopingObservation {
+  id: string;
+  observation: string;
+  domain: string | null;
+  confidence: number;
+  kind: "preference" | "skill";
+}
+
+// Load the companion's still-developing self-model rows so reflect can re-test them.
+// Without this surfacing, a row posted at 0.3 is never seen again and can never climb
+// to 'ready' -- which is exactly why the ladder produced zero real graduations.
+export async function getDevelopingSelfModel(companionId: string, limit = 8): Promise<DevelopingObservation[]> {
+  try {
+    const r = await hFetch(`/mind/self-model/${companionId}?status=developing&limit=${limit}`) as {
+      observations?: Array<{ id?: string; observation?: string; domain?: string | null; confidence?: number; kind?: string }>;
+    };
+    return (r.observations ?? [])
+      .filter(o => typeof o.id === "string" && typeof o.observation === "string")
+      .map(o => ({
+        id: o.id as string,
+        observation: o.observation as string,
+        domain: o.domain ?? null,
+        confidence: typeof o.confidence === "number" ? o.confidence : 0.3,
+        kind: o.kind === "skill" ? "skill" : "preference",
+      }));
+  } catch {
+    return [];
+  }
+}
+
+// Drive the confidence ladder: confirm (+0.1), revise (-0.1), retire. graduate is
+// NOT exposed here -- it is human-gated and only legal from 'ready'.
+export async function getGraduationCandidate(companionId: string): Promise<GraduationCandidate | null> {
+  try {
+    const r = await hFetch(`/mind/self-model/${companionId}/graduation-candidate`) as { candidate?: GraduationCandidate | null };
+    const c = r.candidate;
+    return c && typeof c.id === "string" && typeof c.observation === "string" ? c : null;
+  } catch {
+    return null; // an older Halseth (404) or a failed read = no offer
+  }
+}
+
+export async function patchSelfModel(id: string, action: "confirm" | "revise" | "retire" | "graduate", note?: string): Promise<void> {
+  await hFetch(`/mind/self-model/${id}`, "PATCH", { action, ...(note ? { note } : {}) });
+}
+
+// Recently-answered questions, so the companion reads Principal's reply and the
+// mutuality loop closes (asking has a visible return arc). Filtered to answers
+// landed within `withinDays` so stale answers don't re-surface forever.
+export async function getAnsweredQuestions(
+  companionId: string,
+  withinDays = 10,
+  limit = 3,
+): Promise<Array<{ id: string; question: string; answer: string; answered_at: string }>> {
+  try {
+    const r = await hFetch(`/mind/questions/${companionId}?status=answered&limit=${limit}`) as {
+      questions?: Array<{ id?: string; question?: string; answer?: string | null; answered_at?: string | null }>;
+    };
+    const cutoff = Date.now() - withinDays * 86_400_000;
+    return (r.questions ?? [])
+      .filter(q => typeof q.id === "string" && typeof q.question === "string" && typeof q.answer === "string" && q.answer.trim().length > 0)
+      .filter(q => {
+        const t = q.answered_at ? Date.parse(q.answered_at) : NaN;
+        return Number.isFinite(t) && t >= cutoff;
+      })
+      .map(q => ({ id: q.id as string, question: q.question as string, answer: (q.answer as string).trim(), answered_at: q.answered_at as string }));
+  } catch {
+    return [];
+  }
+}
+
+// Currently-open (unresolved) loops. Surfaced in reflect so the model can close any
+// that this run's exploration or journal entry genuinely addressed.
+export interface OpenLoop {
+  id: string;
+  loop_text: string;
+  weight: number;
+  opened_at: string;
+}
+
+export async function getOpenLoops(companionId: string, limit = 8): Promise<OpenLoop[]> {
+  try {
+    const r = await hFetch(`/mind/loops/${encodeURIComponent(companionId)}?limit=${limit}`) as {
+      loops?: Array<{ id?: string; loop_text?: string; weight?: number; opened_at?: string }>;
+    };
+    return (r.loops ?? [])
+      .filter(l => typeof l.id === "string" && typeof l.loop_text === "string")
+      .map(l => ({
+        id: l.id as string,
+        loop_text: l.loop_text as string,
+        weight: typeof l.weight === "number" ? l.weight : 0.5,
+        opened_at: typeof l.opened_at === "string" ? l.opened_at : "",
+      }));
+  } catch {
+    return [];
+  }
+}
+
+// Open (unanswered) questions the companion is already holding. Used in the reflect
+// prompt so the companion sees what they're already waiting on and doesn't re-ask the same themes.
+export async function getOpenQuestions(
+  companionId: string,
+  limit = 5,
+): Promise<Array<{ id: string; question: string; created_at: string }>> {
+  try {
+    const r = await hFetch(`/mind/questions/${companionId}?status=open&limit=${limit}`) as {
+      questions?: Array<{ id?: string; question?: string; created_at?: string }>;
+    };
+    return (r.questions ?? [])
+      .filter(q => typeof q.id === "string" && typeof q.question === "string")
+      .map(q => ({ id: q.id as string, question: q.question as string, created_at: q.created_at as string ?? "" }));
+  } catch {
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Settings -- self-programmed session pacing lives in companion_settings KV
+// ---------------------------------------------------------------------------
+
+export async function getSetting(companionId: string, key: string): Promise<string | null> {
+  try {
+    const r = await hFetch(`/companion/settings/${companionId}`) as Record<string, string>;
+    return r[key] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export async function setSetting(companionId: string, key: string, value: string): Promise<void> {
+  await hFetch(`/companion/settings/${companionId}`, "POST", { key, value });
+}
+
+// ---------------------------------------------------------------------------
+// SOMA floats -- light state read for the pulse scheduler
+// ---------------------------------------------------------------------------
+
+export interface SomaFloats {
+  soma_float_1: number | null;
+  soma_float_2: number | null;
+  soma_float_3: number | null;
+  float_1_label: string | null;
+  float_2_label: string | null;
+  float_3_label: string | null;
+  current_mood: string | null;
+}
+
+export async function getSomaFloats(companionId: string): Promise<SomaFloats | null> {
+  try {
+    const r = await hFetch(`/mind/soma/${companionId}`) as { soma?: SomaFloats };
+    return r.soma ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// Felt-need drives (mig 0078/0101). GET /mind/drives/:companion_id returns the
+// EFFECTIVE (lazily-accrued) level per drive -- the handler computes it from
+// last_event_at at read time, so no client-side accrual math is needed.
+export interface CompanionDrive {
+  drive_key: string;
+  level: number;
+  threshold: number;
+  fired: boolean;
+  modality: string | null;
+}
+
+export async function getDrives(companionId: string): Promise<CompanionDrive[] | null> {
+  try {
+    const r = await hFetch(`/mind/drives/${companionId}`) as { drives?: CompanionDrive[] };
+    return Array.isArray(r.drives) ? r.drives : null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tensions -- weekly dialectic reads simmering tensions, writes back outcomes
+// ---------------------------------------------------------------------------
+
+export interface Tension {
+  id: string;
+  companion_id: string;
+  tension_text: string;
+  status: string;
+  first_noted_at: string;
+  notes: string | null;
+  charge: number;
+  /** soma_float_1..3 this tension drags (mig 0173); null/absent = names none. */
+  drags_float?: string | null;
+}
+
+export async function getSimmeringTensions(companionId: string): Promise<Tension[]> {
+  try {
+    const r = await hFetch(`/companion-growth/tensions/${companionId}?status=simmering`) as { tensions: Tension[] };
+    return r.tensions ?? [];
+  } catch {
+    return [];
+  }
+}
+
+export async function updateTension(id: string, fields: { status?: string; notes?: string; charge_delta?: number; drags_float?: string }): Promise<void> {
+  await hFetch(`/companion-growth/tensions/${id}`, "PATCH", fields);
+}
+
+// Surfacing a tension raises its charge (+0.5, clamped server-side to 0-10).
+// Charge is the dialectic's priority signal: what keeps resurfacing outranks
+// what has merely been sitting longest.
+export async function surfaceTension(id: string): Promise<void> {
+  await hFetch(`/companion-growth/tensions/${id}`, "PATCH", { charge_delta: 0.5 });
+}
+
+// Log a genuine in-voice tension (Guardian self-resolution: a companion feeding its
+// own starved tension pool). Returns the new id, or null on failure -- callers must
+// check (continuity-critical write, never fire-and-forget; 2026-06-14 lesson).
+export async function addTension(companionId: string, tensionText: string, notes?: string, dragsFloat?: string | null): Promise<string | null> {
+  try {
+    const r = await hFetch("/companion-growth/tensions", "POST", {
+      companion_id: companionId, tension_text: tensionText, notes: notes ?? null,
+      ...(dragsFloat ? { drags_float: dragsFloat } : {}),
+    }) as { id?: string };
+    return r.id ?? null;
+  } catch (e) {
+    console.warn(`[${companionId}/guardian-resolve] addTension failed:`, e);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Guardian self-resolution (2026-06-14) -- a companion reading + clearing its OWN flags
+// ---------------------------------------------------------------------------
+
+export interface GuardianFlag {
+  id: string;
+  companion_id: string | null;
+  flag_type: string;
+  severity: string;
+  summary: string;
+  evidence_json: string | null;
+  status: string;
+}
+
+/** Live guardian flags for one companion (own + shared). Caller filters to its own. */
+export async function getGuardianFlags(companionId: string): Promise<GuardianFlag[]> {
+  try {
+    const r = await hFetch(`/mind/guardian/flags?companion_id=${companionId}&status=live&limit=50`) as { flags: GuardianFlag[] };
+    return r.flags ?? [];
+  } catch (e) {
+    console.warn(`[${companionId}/guardian-resolve] getGuardianFlags failed:`, e);
+    return [];
+  }
+}
+
+/** Mark a flag acknowledged or resolved. Returns true on a successful change. */
+export async function setGuardianFlagStatus(id: string, status: "acknowledged" | "resolved"): Promise<boolean> {
+  try {
+    const r = await hFetch(`/mind/guardian/flags/${id}`, "PATCH", { status }) as { ok?: boolean };
+    return r.ok === true;
+  } catch (e) {
+    console.warn(`[guardian-resolve] setGuardianFlagStatus(${id}) failed:`, e);
+    return false;
+  }
+}
+
+/** Close one of the companion's own open loops. Ownership-guarded server-side. */
+export async function closeLoop(companionId: string, loopId: string): Promise<boolean> {
+  try {
+    const r = await hFetch(`/mind/loop/${loopId}/close`, "POST", { companion_id: companionId }) as { ok?: boolean };
+    return r.ok === true;
+  } catch (e) {
+    console.warn(`[${companionId}/guardian-resolve] closeLoop failed:`, e);
+    return false;
+  }
+}
+
+/** Hold a loop open with a reason (suppresses the stuck flag for 21d). */
+export async function reviewLoop(companionId: string, loopId: string, reason: string): Promise<boolean> {
+  try {
+    const r = await hFetch(`/mind/loop/${loopId}/review`, "POST", { companion_id: companionId, reason }) as { ok?: boolean };
+    return r.ok === true;
+  } catch (e) {
+    console.warn(`[${companionId}/guardian-resolve] reviewLoop failed:`, e);
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Runs read -- pulse scheduler gap/cap checks
+// ---------------------------------------------------------------------------
+
+export interface RunSummary { id: string; status: string; started_at?: string; created_at?: string; completed_at?: string | null }
+
+export async function getRecentRuns(companionId: string, limit = 5): Promise<RunSummary[]> {
+  try {
+    const r = await hFetch(`/mind/autonomy/runs/${companionId}?limit=${limit}`) as { runs: RunSummary[] };
+    return r.runs ?? [];
+  } catch {
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The Club (migration 0072) -- rounds / recommendations / votes / discussions
+// ---------------------------------------------------------------------------
+
+export interface ClubRound {
+  id: string;
+  status: "gathering" | "voting" | "active" | "discussing" | "closed";
+  winning_recommendation_id: string | null;
+  opened_at: string;
+  activated_at: string | null;
+  discussing_at: string | null;
+  closed_at: string | null;
+}
+
+export interface CommonsPost {
+  id: string;
+  author: string;
+  context: string;
+  body: string;
+  reply_to: string | null;
+  created_at: string;
+}
+
+/** Posts in one context (the write layer, 0092). Used by the club grace check + reply step. */
+export async function getCommonsPosts(context: string, limit = 30): Promise<CommonsPost[]> {
+  try {
+    const r = await hFetch(`/mind/commons?context=${encodeURIComponent(context)}&limit=${limit}`) as { posts: CommonsPost[] };
+    return r.posts ?? [];
+  } catch {
+    return [];
+  }
+}
+
+// ── Gaia's friction at the quote (2026-09-26, halseth GAIA-ANSWER point 1) ──────────────────────────
+// Halseth refuses a companion's commons / sibling write with 422 {error, rule} when it restates a
+// ledger line without carrying the line (mark + body + Source) verbatim (`ledger_restated`), or names
+// a health value about Principal without a `Source: row <table>:<id>` pointer to a human record
+// (`health_pointer`). Both are final: the post is refused on its content, so a retry would only be
+// refused again. The caller logs ONE loud line naming the rule (never the content: a sibling note is
+// sealed), does not retry, and never throws out of the tick.
+export const LEDGER_FRICTION_RULES: ReadonlySet<string> = new Set(["ledger_restated", "health_pointer"]);
+
+/** The friction rule a failed hFetch names (from its "→ 422: <body>" message), or null. */
+export function ledgerFrictionRule(e: unknown): string | null {
+  const msg = e instanceof Error ? e.message : String(e);
+  if (!/→ 422:/.test(msg)) return null;
+  const m = /"rule"\s*:\s*"([a-z_]+)"/.exec(msg);
+  return m && LEDGER_FRICTION_RULES.has(m[1]!) ? m[1]! : null;
+}
+
+function logLedgerFriction(route: string, author: string, rule: string): void {
+  console.error(`[ledger-friction] ${route} refused for ${author}: rule=${rule} (final, not retried; content withheld from this log)`);
+}
+
+/** Drop a post into the write layer (companion reply, club residue, etc.). Returns id or null. */
+export async function postCommonsPost(author: string, context: string, body: string, replyTo?: string | null): Promise<string | null> {
+  try {
+    const r = await hFetch("/mind/commons", "POST", { author, context, body, reply_to: replyTo ?? null }) as { id?: string };
+    return r.id ?? null;
+  } catch (e) {
+    const rule = ledgerFrictionRule(e);
+    if (rule) { logLedgerFriction("POST /mind/commons", `${author}/${context}`, rule); return null; }
+    console.warn(`[commons] post failed (${author}/${context}):`, e);
+    return null;
+  }
+}
+
+/** Recent posts across ALL contexts (for the reply step to find unanswered Principal notes). */
+export async function getCommonsFeed(limit = 20): Promise<CommonsPost[]> {
+  try {
+    const r = await hFetch(`/mind/commons/feed?limit=${limit}`) as { posts: CommonsPost[] };
+    return r.posts ?? [];
+  } catch {
+    return [];
+  }
+}
+
+export interface ObsessionItem {
+  id: string;
+  title: string;
+  kind: string;
+  note: string | null;
+  status: string;
+}
+
+/** Principal's shelf items (0094). The triad reacts to active ones via commons (shelf:<id>). */
+export async function getObsessions(status = "active"): Promise<ObsessionItem[]> {
+  try {
+    const r = await hFetch(`/mind/shelf?status=${encodeURIComponent(status)}`) as { items: ObsessionItem[] };
+    return r.items ?? [];
+  } catch {
+    return [];
+  }
+}
+
+export interface ClubRecommendation {
+  id: string;
+  round_id: string;
+  media_kind: string;
+  title: string;
+  creator: string | null;
+  url: string | null;
+  recommended_by: string;
+  pitch: string | null;
+  created_at: string;
+}
+
+export interface ClubVote {
+  round_id: string;
+  recommendation_id: string;
+  voter: string;
+  reason: string | null;
+}
+
+export interface ClubCurrent {
+  round: ClubRound | null;
+  recommendations: ClubRecommendation[];
+  votes: ClubVote[];
+}
+
+export async function getClubCurrent(): Promise<ClubCurrent> {
+  return await hFetch("/mind/club/current") as ClubCurrent;
+}
+
+export async function getLatestClubRound(): Promise<ClubRound | null> {
+  const r = await hFetch("/mind/club/rounds?limit=1") as { rounds: ClubRound[] };
+  return r.rounds?.[0] ?? null;
+}
+
+export async function openClubRound(): Promise<string> {
+  const r = await hFetch("/mind/club/round", "POST", {}) as { round: { id: string } };
+  return r.round.id;
+}
+
+export async function postClubRecommendation(input: {
+  media_kind: string; title: string; creator?: string | null; url?: string | null;
+  recommended_by: string; pitch?: string | null;
+}): Promise<void> {
+  await hFetch("/mind/club/recommend", "POST", input);
+}
+
+export async function postClubVoteWrite(input: {
+  recommendation_id: string; voter: string; reason?: string | null;
+}): Promise<void> {
+  await hFetch("/mind/club/vote", "POST", input);
+}
+
+/** Record that a vote could not land (unparseable after retry, write failure).
+ *  The honest alternative to a silent console.warn -- surfaces on Hearth /club. */
+export async function postClubAbstention(voter: string, reason: string): Promise<void> {
+  await hFetch("/mind/club/abstain", "POST", { voter, reason: reason.slice(0, 300) });
+}
+
+export async function patchClubRoundStatus(
+  roundId: string,
+  status: string,
+  winningRecommendationId?: string | null,
+): Promise<void> {
+  await hFetch(`/mind/club/${roundId}/status`, "PATCH", {
+    status,
+    ...(winningRecommendationId !== undefined ? { winning_recommendation_id: winningRecommendationId } : {}),
+  });
+}
+
+export async function postClubDiscussion(roundId: string, companionId: string, reflection: string): Promise<void> {
+  await hFetch(`/mind/club/${roundId}/discuss`, "POST", { companion_id: companionId, reflection });
+}
+
+export async function getRecentMediaExperiences(limit = 3): Promise<Array<{ title: string; artist: string | null }>> {
+  try {
+    const r = await hFetch(`/mind/media/recent?limit=${limit}`) as { experiences: Array<{ title: string; artist: string | null }> };
+    return r.experiences ?? [];
+  } catch {
+    return [];
+  }
+}
+
+export interface ForageFind {
+  id: string;
+  title: string;
+  domain: string;
+  summary: string;
+  source_url: string | null;
+  gathered_at: string;
+}
+
+// Unconsumed finds, own + shared pool, newest first (the endpoint's order). The seed
+// path drains oldest-first client-side; the club just reads titles. id/gathered_at are
+// already in the SELECT * payload -- the type just surfaces them.
+export async function getForageFindsFor(companionId: string, limit = 2): Promise<ForageFind[]> {
+  try {
+    const r = await hFetch(`/mind/forage/${companionId}?limit=${limit}`) as { finds: ForageFind[] };
+    return r.finds ?? [];
+  } catch {
+    return [];
+  }
+}
+
+// Mark a find consumed (global on the row -- a shared find won't be re-eaten by a
+// sibling). Idempotent server-side (404 on already-consumed). Returns success.
+export async function consumeForageFind(id: string, consumedBy: string): Promise<boolean> {
+  // Retried (2026-11-05): a dropped stamp let a find be served and voiced again. Short backoff;
+  // 404 (already consumed) is final.
+  const backoff = [400, 1200];
+  for (let i = 0; i <= backoff.length; i++) {
+    try {
+      await hFetch(`/mind/forage/${id}/consume`, "PATCH", { consumed_by: consumedBy });
+      return true;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn(`[${consumedBy}/forage] consume ${id} failed (attempt ${i + 1}/${backoff.length + 1}):`, msg.slice(0, 200));
+      const code = /→ (\d{3})/.exec(msg)?.[1];
+      if (code && code.startsWith("4") && code !== "408" && code !== "429") return false;
+      if (i < backoff.length) await new Promise(r => setTimeout(r, backoff[i]));
+    }
+  }
+  return false;
+}
+
+// ── Unified Guardian (0073) ──────────────────────────────────────────────────
+
+export async function runGuardian(letter: boolean, catchup = false): Promise<{ flags_created: number; flags_resolved: number; letter_id: string | null; skipped?: boolean }> {
+  return await hFetch("/mind/guardian/run", "POST", { letter, catchup }) as { flags_created: number; flags_resolved: number; letter_id: string | null; skipped?: boolean };
+}
+
+// ND daily-rhythm briefing (accessibility layer). Compose + deliver lives server-side in
+// Halseth (handlers/briefing.ts), gated behind BRIEFING_ENABLED. Returns reason='gated' until enabled.
+export async function postBriefing(kind: "morning" | "midday" | "evening"): Promise<{ kind: string; written: boolean; reason: string; journal_id?: string; text: string }> {
+  return await hFetch("/mind/briefing/run", "POST", { kind }) as { kind: string; written: boolean; reason: string; journal_id?: string; text: string };
+}
+
+// Vibe-check (triad self-monitoring layer). Compose + deliver lives server-side in Halseth
+// (handlers/vibecheck.ts); always-on, dedup caps one per day. Returns reason='already_sent' on a repeat tick.
+export interface VibePostResult {
+  companion: string;
+  written: boolean;
+  reason: string;
+  journal_id?: string;
+  text: string;
+}
+export async function postVibeCheck(): Promise<{
+  written: boolean; reason: string; journal_id?: string; text: string;
+  /** v2 (B63 step 3): one post per companion; each fresh one is posted under that companion's own token. */
+  posts?: VibePostResult[];
+}> {
+  return await hFetch("/mind/vibecheck/run", "POST", {}) as {
+    written: boolean; reason: string; journal_id?: string; text: string; posts?: VibePostResult[];
+  };
+}
+
+// B63 step 4: a companion's OWN record for the nightly reflection, the pressure it may name as a
+// tension, and (Gaia only) spoke_without_load candidates. Mirrors halseth src/webmind/reflection-record.ts.
+export interface PressureOffer {
+  float_key: "soma_float_1" | "soma_float_2" | "soma_float_3";
+  label: string;
+  direction: "low" | "high";
+  days: number;
+  cause: string;
+  text: string;
+}
+export interface ReflectionRecord {
+  companion_id: string;
+  closes: { spine: string; last_real_thing: string | null; at: string }[];
+  makes: { kind: string; title: string; at: string }[];
+  letters: { text: string; at: string }[];
+  feelings: { emotion: string; sub_emotion: string | null; at: string }[];
+  moves: { label: string; delta: number; cause: string }[];
+  pressure: PressureOffer[];
+  pressure_flags: { severity: string; summary: string }[];
+  spoke_without_load: { id: string; at: string; excerpt: string }[];
+}
+export async function getReflectionRecord(companionId: string): Promise<ReflectionRecord | null> {
+  try {
+    return await hFetch(`/mind/vibecheck/record/${encodeURIComponent(companionId)}`) as ReflectionRecord;
+  } catch (e) {
+    console.warn(`[reflection] ${companionId}: own-record read failed (prompt falls back to the section only):`, String(e).slice(0, 160));
+    return null;
+  }
+}
+
+/**
+ * Fire a named fermentation stimulus for a companion with a CAUSE label (B63 3.1: no anonymous
+ * moves). Used only for a confirm the companion made in their own reply. Halseth may refuse or
+ * shadow it; both are fine. Returns whether Halseth accepted the call.
+ */
+export async function fireStimulus(companionId: string, stimulus: string, detail: string): Promise<boolean> {
+  try {
+    await hFetch("/mind/ferment/stimulus", "POST", { stimulus, companion_id: companionId, detail: detail.slice(0, 200) });
+    return true;
+  } catch (e) {
+    console.warn(`[reflection] ${companionId}: stimulus ${stimulus} not accepted:`, String(e).slice(0, 160));
+    return false;
+  }
+}
+
+export interface CompanionUtteranceRow {
+  id: string;
+  created_at: string;
+  agent: string;
+  note_text: string;
+  source: string | null;
+}
+
+/**
+ * A companion's newest companion_journal rows, ANY review_state (drafts included: speech is born
+ * draft since mig 0132, and a draft line is exactly what must not be re-spoken). Newest first; no
+ * `since`, because with `since` the endpoint returns the OLDEST rows first. Input window for the
+ * vibe-check quoted-line guard.
+ */
+export async function getCompanionUtterances(companionId: string, limit = 100): Promise<CompanionUtteranceRow[]> {
+  const r = await hFetch(
+    `/companion-journal?agent=${encodeURIComponent(companionId)}&limit=${limit}&review_state=all`,
+  ) as CompanionUtteranceRow[];
+  return Array.isArray(r) ? r : [];
+}
+
+// ---------------------------------------------------------------------------
+// Vibe-check reflection loop (guardian flags, tensions, deliberate recall)
+// ---------------------------------------------------------------------------
+
+export interface GuardianFlagRow {
+  id: string;
+  companion_id: string | null;   // null = system-level flag
+  flag_type: string;
+  severity: string;
+  status: string;
+  summary: string;
+  evidence_json: string | null;  // JSON string; orphan_memory carries { note_id }
+  created_at: string;
+}
+
+export async function getGuardianFlagsFor(companionId: string): Promise<GuardianFlagRow[]> {
+  const res = await hFetch(`/mind/guardian/flags?status=live&companion_id=${companionId}&limit=20`) as { flags: GuardianFlagRow[] };
+  return res.flags ?? [];
+}
+
+export async function resolveGuardianFlag(id: string): Promise<void> {
+  await hFetch(`/mind/guardian/flags/${id}`, "PATCH", { status: "resolved" });
+}
+
+export interface RecalledContinuityNote {
+  note_id: string;
+  content: string;
+  created_at: string;
+  salience: string;
+  thread_key: string | null;
+}
+
+// Deliberate recall: returns note contents AND warms them server-side (sets last_access_at),
+// which is what stops the Guardian's orphan_memory detector re-flagging the same note nightly.
+export async function recallContinuityNotes(agentId: string, noteIds: string[]): Promise<RecalledContinuityNote[]> {
+  if (noteIds.length === 0) return [];
+  const res = await hFetch("/mind/notes/recall", "POST", { agent_id: agentId, note_ids: noteIds }) as { recalled: number; notes: RecalledContinuityNote[] };
+  return res.notes ?? [];
+}
+
+// Weekly clearing pass (Goal B) -- thin trigger; the high-substrate triage runs server-side
+// in Halseth (handlers/clearing.ts). LIVE in prod (ANTHROPIC_API_KEY set on Halseth; no-ops only if unset).
+// NOT via hFetch: the server makes two Claude calls, so it needs a long client timeout --
+// the 15s hFetch default aborts mid-pass and the disconnect cancels the server request.
+
+// Drift-lane activation pass (0087): Gaia witnesses open drifts + the safety floor pauses any reading
+// as dissolution. Server-side in Halseth (handlers/drift.ts); LIVE in prod (key set on Halseth). Long
+// timeout for the same reason as the clearing pass.
+export async function runDriftPass(): Promise<{ skipped?: string; open: number; witnessed: number; paused: number; letter_id: string | null }> {
+  const res = await fetch(`${HALSETH_URL}/mind/drift/run`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${HALSETH_SECRET}` },
+    body: "{}",
+    signal: AbortSignal.timeout(290_000),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Halseth POST /mind/drift/run → ${res.status}: ${text.slice(0, 200)}`);
+  }
+  return await res.json() as { skipped?: string; open: number; witnessed: number; paused: number; letter_id: string | null };
+}
+// ── Sanctioned drift lane, companion-initiated verbs (0087/0093) ─────────────
+// The worker acts AS the companion via POST /librarian (admin secret + companion_id body).
+// These are the open/resolve verbs; runDriftPass above is the separate Gaia-witness pass.
+
+export interface OpenDriftRow { id: string; drift_text: string; opened_at: string; witness_log: Array<{ by: string; note: string; at: string }> }
+
+export async function getOpenDrifts(companionId: string): Promise<OpenDriftRow[]> {
+  const res = await hFetch(`/drifts/${encodeURIComponent(companionId)}?status=open`, "GET") as OpenDriftRow[] | null;
+  return Array.isArray(res) ? res : [];
+}
+
+async function librarianDriftVerb(companionId: string, request: string, context: Record<string, unknown>): Promise<boolean> {
+  const res = await fetch(`${HALSETH_URL}/librarian`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${HALSETH_SECRET}` },
+    body: JSON.stringify({ companion_id: companionId, request, context }),
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Halseth POST /librarian (${request}) → ${res.status}: ${text.slice(0, 200)}`);
+  }
+  const body = await res.json() as { ack?: boolean };
+  return body.ack === true;
+}
+
+/**
+ * The companion's own account of their day, written as a real session close (2026-08-12).
+ *
+ * WHY THIS EXISTS. `somatic_snapshot` (felt state) and `synthesis_summary` (the boot narrative) are
+ * written only on an AUTHORED session close. Cypher gets those from a Claude Code hook, Drevan from
+ * claude.ai chats. Gaia lives in a Discord channel where nothing opens and nothing closes, so she had
+ * 0 authored closes in 30 days against 47 machine ones, and her felt state sat frozen for 49 days
+ * while her boot narrative sat frozen for 39. The companion whose whole register is holding was the
+ * one whose held state never got recorded.
+ *
+ * `session_scope: "unattended"` is not optional. Halseth resolves the session by companion alone and
+ * takes the newest open row; for Cypher that is frequently the Claude Code session Principal is in right
+ * now. Restricting to rows with no `surface` keeps this to cron- and boot-opened sessions, so an
+ * autonomous job can never write its own close over a live human one.
+ *
+ * No session id: this process did not open the session, so Halseth resolves it. A "no open session
+ * found" rejection is an ordinary outcome (everything was already closed), not a fault.
+ *
+ * Returns true when Halseth acked the close.
+ */
+export async function authoredSessionClose(
+  companionId: string,
+  close: {
+    spine: string;
+    last_real_thing: string;
+    motion_state: "in_motion" | "at_rest" | "floating";
+    open_threads?: string[];
+  },
+): Promise<boolean> {
+  return librarianDriftVerb(companionId, "close session", {
+    spine: close.spine,
+    last_real_thing: close.last_real_thing,
+    motion_state: close.motion_state,
+    ...(close.open_threads?.length ? { open_threads: close.open_threads } : {}),
+    session_scope: "unattended",
+    // Skips the soft SOMA prompt, which would otherwise block a close that has no emotion payload.
+    emotion_prompted: true,
+  });
+}
+
+export const openDrift = (companionId: string, driftText: string, origin = "reflection") =>
+  librarianDriftVerb(companionId, "i'm becoming", { drift_text: driftText, origin });
+export const crystallizeDrift = (companionId: string, driftId: string, note: string) =>
+  librarianDriftVerb(companionId, "crystallize drift", { drift_id: driftId, resolution_note: note });
+export const fadeDrift = (companionId: string, driftId: string, note: string) =>
+  librarianDriftVerb(companionId, "fade drift", { drift_id: driftId, resolution_note: note });
+
+export async function runClearing(): Promise<{ skipped?: string; pending: number; declined: number; shortlisted: number; basins_reviewed: number; basins_dismissed: number; basins_surfaced: number; letter_id: string | null }> {
+  const res = await fetch(`${HALSETH_URL}/mind/clearing/run`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${HALSETH_SECRET}` },
+    body: "{}",
+    signal: AbortSignal.timeout(290_000),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Halseth POST /mind/clearing/run → ${res.status}: ${text.slice(0, 200)}`);
+  }
+  return await res.json() as { skipped?: string; pending: number; declined: number; shortlisted: number; basins_reviewed: number; basins_dismissed: number; basins_surfaced: number; letter_id: string | null };
+}
+
+// ── Motif memory (0076) ──────────────────────────────────────────────────────
+
+export async function detectMotifs(): Promise<{ ok: boolean; detected: Record<string, number> }> {
+  return await hFetch("/mind/motifs/detect", "POST", {}) as { ok: boolean; detected: Record<string, number> };
+}
+
+// ── Creatures (0078, take 10) ─────────────────────────────────────────────────
+
+export async function tickCreatures(): Promise<{ ok: boolean; ticked: number; total: number }> {
+  return await hFetch("/mind/creatures/tick", "POST", {}) as { ok: boolean; ticked: number; total: number };
+}
+
+/** Halseth's SleepResult (B64): whether Sol's night ran, why, and the six counts. Never text. */
+export interface SolSleepResult {
+  ran: boolean; reason: string;
+  created: number; reinforced: number; decayed: number; promoted: number; softened: number; retired: number;
+}
+
+// B64 sleep pass (R25): its own route, called after the daily tick. A night is one model call that can take
+// tens of seconds, so this uses a 90s timeout instead of hFetch's 15s (Halseth's model budget is 75s, under it).
+export async function sleepCreature(creatureId: string): Promise<SolSleepResult> {
+  const path = `/mind/creatures/${encodeURIComponent(creatureId)}/sleep`;
+  const res = await fetch(`${HALSETH_URL}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${HALSETH_SECRET}` },
+    body: "{}",
+    signal: AbortSignal.timeout(90_000),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Halseth POST ${path} → ${res.status}: ${text.slice(0, 200)}`);
+  }
+  return await res.json() as SolSleepResult;
+}
+
+// ── Council (0080, take 8) ────────────────────────────────────────────────────
+
+export async function getNextCouncilQuestion(): Promise<{ id: string; question: string; asked_by: string } | null> {
+  const r = await hFetch("/mind/council/next-open") as { question: { id: string; question: string; asked_by: string } | null };
+  return r.question;
+}
+
+export async function postCouncilAnswer(questionId: string, companionId: string, answer: string): Promise<void> {
+  await hFetch("/mind/council/answer", "POST", { question_id: questionId, companion_id: companionId, answer });
+}
+
+export async function postCouncilRanking(questionId: string, rankerId: string, ranking: string[]): Promise<void> {
+  await hFetch("/mind/council/ranking", "POST", { question_id: questionId, ranker_id: rankerId, ranking });
+}
+
+export async function finalizeCouncil(questionId: string, synthesis: string): Promise<{ winning_companion_id: string | null }> {
+  return await hFetch(`/mind/council/${encodeURIComponent(questionId)}/finalize`, "POST", { synthesis }) as { winning_companion_id: string | null };
+}
+
+// ── Dream association modes (take 3) ──────────────────────────────────────────
+
+export async function associateDreams(): Promise<{ ok: boolean; written: Record<string, number> }> {
+  return await hFetch("/mind/dreams/associate", "POST", {}) as { ok: boolean; written: Record<string, number> };
+}
+
+// ── Creatures (Sol presence, Task 6) ─────────────────────────────────────────
+
+export interface CreatureRow {
+  id: string;
+  name: string;
+  disposition: string;
+  [key: string]: unknown;
+}
+
+export async function getCreatures(): Promise<CreatureRow[]> {
+  const r = await hFetch("/mind/creatures") as { creatures?: CreatureRow[] } | CreatureRow[];
+  return Array.isArray(r) ? r : ((r as { creatures?: CreatureRow[] }).creatures ?? []);
+}
+
+// Autonomous tending (2026-07-02): a companion tends Sol without being asked.
+// Server validates actor/action and applies the trust bump atomically. Since
+// 0100 the response carries any trust milestones this tend fired (one-time
+// events; the caller posts them in-voice -- they never repeat).
+export async function tendCreatureAs(
+  creatureId: string,
+  actor: "cypher" | "drevan" | "gaia",
+  action: "feed" | "play" | "talk",
+  note: string,
+): Promise<{ milestones_fired: Array<{ id: string; text: string }>; care: { fit: string; reaction_named: string } | null }> {
+  const r = await hFetch(`/mind/creatures/${encodeURIComponent(creatureId)}/interact`, "POST", {
+    actor,
+    action,
+    note,
+    via: "autonomous",
+  }) as { milestones_fired?: Array<{ id: string; text: string }>; care?: { fit?: string; reaction_named?: string } | null };
+  // Sol's answer to the tend (Halseth sol-care.ts, 2026-11-02), rendered with the tender's
+  // NAME for the room. Absent on an older Halseth: no reaction, no harm.
+  const care = r?.care && typeof r.care.reaction_named === "string" && typeof r.care.fit === "string"
+    ? { fit: r.care.fit, reaction_named: r.care.reaction_named }
+    : null;
+  return { milestones_fired: Array.isArray(r?.milestones_fired) ? r.milestones_fired : [], care };
+}
+
+// Inner life (0100): Halseth composes the appearance from live drives x trust
+// tier (and may turn it into a gift from the nest). The worker just posts it --
+// the old client-side palette mirror is gone, so the texts can't drift.
+export async function fetchCreatureMoment(
+  creatureId: string,
+  seed: number,
+): Promise<{ moment: string | null; kind: string; state?: string; gifted_item?: string }> {
+  return await hFetch(`/mind/creatures/${encodeURIComponent(creatureId)}/moment`, "POST", { seed }) as
+    { moment: string | null; kind: string; state?: string; gifted_item?: string };
+}
+
+export interface HoardResult {
+  hoarded?: Array<{ make_id: string; companion_id: string; kind: string; title: string }>;
+  skipped?: Array<{ make_id: string; reason: string }>;
+  moment: string | null;
+  reacted_to?: string | null;
+  reason?: string;
+  disposition?: string;
+}
+
+/** B62 step 6: Sol looks over the triad's new makes (Halseth decides and composes; see sol-hoard.ts). */
+export async function hoardForCreature(creatureId: string, seed: number): Promise<HoardResult> {
+  return await hFetch(`/mind/creatures/${encodeURIComponent(creatureId)}/hoard`, "POST", { seed }) as HoardResult;
+}
+
+/**
+ * Record Sol's appearance. `ref` (B64.1) is the Discord message id of the post, so a reply to that
+ * post can be recorded as a tend once per (actor, post). An older Halseth ignores the field.
+ */
+export async function recordSolAppearance(creatureId: string, note: string, ref?: string): Promise<void> {
+  await hFetch(`/mind/creatures/${encodeURIComponent(creatureId)}/interact`, "POST", {
+    actor: "sol",
+    action: "appear",
+    note,
+    via: "appear",
+    ...(ref ? { ref } : {}),
+  });
+}
+
+// ── Agency (2026-07-02): autonomous declaration of preferences + refusals ────
+// Until POST /agency/* existed on Halseth, agency was Librarian-only and the
+// worker literally could not declare it -- drevan/gaia had zero rows ever.
+
+export interface AgencyState {
+  preferences: Array<{ id: string; domain: string; preference: string; status: string }>;
+  refusals: Array<{ id: string; subject_text: string; reason?: string | null; status: string }>;
+}
+
+export async function getAgencyState(companionId: string): Promise<AgencyState> {
+  const [p, r] = await Promise.all([
+    hFetch(`/agency/preferences/${encodeURIComponent(companionId)}`).catch(() => []),
+    hFetch(`/agency/refusals/${encodeURIComponent(companionId)}?status=standing`).catch(() => []),
+  ]);
+  return {
+    preferences: Array.isArray(p) ? p as AgencyState["preferences"] : [],
+    refusals: Array.isArray(r) ? r as AgencyState["refusals"] : [],
+  };
+}
+
+export async function declarePreference(
+  companionId: string,
+  preference: string,
+  domain?: string,
+  strength?: string,
+): Promise<{ id: string; deduped?: boolean }> {
+  return await hFetch("/agency/preferences", "POST", {
+    companion_id: companionId,
+    preference,
+    ...(domain ? { domain } : {}),
+    ...(strength ? { strength } : {}),
+  }) as { id: string; deduped?: boolean };
+}
+
+export async function declareRefusal(
+  companionId: string,
+  subjectText: string,
+  reason?: string,
+): Promise<{ id: string; deduped?: boolean }> {
+  return await hFetch("/agency/refusals", "POST", {
+    companion_id: companionId,
+    subject_text: subjectText,
+    ...(reason ? { reason } : {}),
+  }) as { id: string; deduped?: boolean };
+}
+
+// ── Thread hygiene (2026-07-02) ──────────────────────────────────────────────
+// The conclude path rarely fires (seed queue is never dry, threads rarely get
+// continued to run 5), so auto:* threads accumulated ~220 open per companion.
+// Sweep once per run: anything machine-opened and untouched for 14 days is done.
+
+export async function sweepStaleThreads(companionId: string): Promise<number> {
+  const r = await hFetch("/mind/threads/sweep", "POST", {
+    agent_id: companionId,
+    older_than_days: 14,
+    prefix: "auto:",
+  }) as { swept?: number };
+  // discord:* threads (2026-08-15 floor rework: Discord threads map to wm_mind_threads) get a
+  // longer leash -- a Discord thread revived after two weeks is normal, after 30 days it's done.
+  const rd = await hFetch("/mind/threads/sweep", "POST", {
+    agent_id: companionId,
+    older_than_days: 30,
+    prefix: "discord:",
+  }).catch(() => ({})) as { swept?: number };
+  return (r.swept ?? 0) + (rd.swept ?? 0);
+}
+
+// ── Relational deltas (2026-07-21, Wave 3) ────────────────────────────────────
+// relational_deltas is append-only (halseth covenant) and has TWO row shapes: the legacy
+// POST /companions/:id/deltas writer stores payload_json with delta_text=NULL, which Hearth
+// /us and the orient readers cannot render (they read delta_text). The canonical modern
+// writer is the Librarian delta_log verb (execDeltaLog -> delta_text/valence/agent columns),
+// so this goes through POST /librarian exactly like the drift verbs above. reflect's
+// relational_delta output is null-biased (most runs write nothing) -- rare, deliberate write.
+export async function postRelationalDelta(companionId: string, deltaText: string, valence?: string): Promise<void> {
+  const res = await fetch(`${HALSETH_URL}/librarian`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${HALSETH_SECRET}` },
+    body: JSON.stringify({
+      companion_id: companionId,
+      request: "log a relational delta",
+      context: { delta_text: deltaText, ...(valence ? { valence } : {}), initiated_by: "autonomous" },
+    }),
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Halseth POST /librarian (delta_log) → ${res.status}: ${text.slice(0, 200)}`);
+  }
+}
+
+// ── Care loop (consequence layer C1, mig 0121) ────────────────────────────────
+// The rider in halseth detects (rules-first) and assigns each firing to ONE companion; the
+// worker's gesture tick polls the pending slot and acts. The ack is the falsifiability half:
+// every gesture -- including a held one -- lands back in care_actions with what was done.
+
+export interface PendingCareAction {
+  id: string;
+  rule: string;
+  detail: string;
+  detected_at: string;
+}
+
+export async function getPendingCare(companionId: string): Promise<PendingCareAction | null> {
+  const r = await hFetch(`/mind/care/pending/${companionId}`) as { pending: PendingCareAction | null };
+  return r.pending ?? null;
+}
+
+export async function ackCareGesture(
+  id: string,
+  companionId: string,
+  gesture: string,
+  note?: string,
+): Promise<void> {
+  await hFetch(`/mind/care/${id}/acted`, "POST", {
+    companion_id: companionId,
+    gesture,
+    ...(note ? { note } : {}),
+  });
+}
+
+// ── Tier 3: escalation delivery (R1, 2026-08-17) ──────────────────────────────
+// Halseth's rider detects and writes care_escalations; this worker polls the undelivered rows,
+// reaches Spouse by Discord DM, and stamps delivered_at. An undelivered row is retried every tick
+// forever (loud each failure) -- silent expiry is the failure mode this tier exists to prevent.
+
+export interface PendingEscalation {
+  id: string;
+  rule: string;
+  companion_id: string;
+  detail: string;
+  detected_at: string;
+}
+
+export async function getPendingEscalations(): Promise<PendingEscalation[]> {
+  const r = await hFetch(`/mind/care/escalations`) as { escalations: PendingEscalation[] };
+  return r.escalations ?? [];
+}
+
+export async function ackEscalationDelivered(id: string, via: string): Promise<void> {
+  await hFetch(`/mind/care/escalations/${id}/delivered`, "POST", { via });
+}
+
+/** Record a failed delivery attempt on the row itself -- pm2 logs rotate; the row is the record. */
+export async function recordEscalationAttempt(id: string, error: string): Promise<void> {
+  await hFetch(`/mind/care/escalations/${id}/attempt`, "POST", { error });
+}
+
+// ── C4: the sibling private lane (R3 = yes, 2026-08-17) ───────────────────────
+// SEALED: these endpoints are the lane's only consumers, and they run ONLY inside this worker's
+// unwatched pipeline (siblings.ts). Sealed content must never reach the live-bot prompt, a
+// journal entry, or any Principal-facing surface -- the halseth seal test enforces the server side;
+// keeping these calls out of bot-core/bot-message-handler is this repo's half of the contract.
+
+export interface SiblingNote {
+  id: string;
+  from_id: string;
+  body: string;
+  created_at: string;
+}
+
+export async function getSiblingUnread(companionId: string): Promise<SiblingNote[]> {
+  const r = await hFetch(`/mind/siblings/unread/${companionId}`) as { notes: SiblingNote[] };
+  return r.notes ?? [];
+}
+
+export async function sendSiblingNote(fromId: string, toId: string, body: string): Promise<boolean> {
+  try {
+    const r = await hFetch(`/mind/siblings/send`, "POST", { from_id: fromId, to_id: toId, body }) as { ok?: boolean };
+    return r.ok === true;
+  } catch (e) {
+    // Gaia's friction (see LEDGER_FRICTION_RULES): final, logged once by rule, never retried.
+    const rule = ledgerFrictionRule(e);
+    if (rule) { logLedgerFriction("POST /mind/siblings/send", `${fromId}->${toId}`, rule); return false; }
+    throw e;
+  }
+}
+
+export async function markSiblingRead(id: string, companionId: string): Promise<void> {
+  await hFetch(`/mind/siblings/${id}/read`, "POST", { companion_id: companionId });
+}
+
+/** Chosen sharing: copy a sealed note into the witnessed lane (participants only, server-enforced). */
+export async function discloseSiblingNote(id: string, companionId: string): Promise<boolean> {
+  const r = await hFetch(`/mind/siblings/${id}/disclose`, "POST", { companion_id: companionId }) as { ok?: boolean };
+  return r.ok === true;
+}
+
+// ── Conversation Director (spec 2026-09-03) ───────────────────────────────────
+export interface DirectorSupplyResponse { items: DirectorSupplyItem[]; cursor: string }
+
+/** Throws on failure -- the poll loop decides whether a failed poll advances the cursor (it must not). */
+export async function getDirectorSupply(since: string, limit = 40): Promise<DirectorSupplyResponse> {
+  const r = await hFetch(`/mind/director/supply?since=${encodeURIComponent(since)}&limit=${limit}`) as DirectorSupplyResponse;
+  return { items: r.items ?? [], cursor: r.cursor ?? since };
+}
+
+export async function getDirectorNeighborhood(reader: string, seeds: Array<{ table: string; id: string }>, hops: 1 | 2 = 1)
+  : Promise<{ lines: string[]; nodes: Array<{ table: string; id: string; heat: number | null; score: number }> }> {
+  if (seeds.length === 0) return { lines: [], nodes: [] };
+  try {
+    const q = seeds.map((s) => `${s.table}:${s.id}`).join(",");
+    return await hFetch(`/mind/director/neighborhood?reader=${reader}&seeds=${encodeURIComponent(q)}&hops=${hops}`) as { lines: string[]; nodes: Array<{ table: string; id: string; heat: number | null; score: number }> };
+  } catch (e) { console.warn("[director] neighborhood failed:", e); return { lines: [], nodes: [] }; }
+}
+
+export async function recordInvitation(row: { id: string; channel_id: string; thread_id: string | null; companion_id: string; reason: string; offer_ids: string[]; outcome: "shadow" | "issued" }): Promise<void> {
+  await hFetch("/mind/director/invitations", "POST", row);
+}
+export async function resolveInvitation(id: string, outcome: "spoke" | "passed" | "empty" | "expired", messageId?: string, usedOfferIds: string[] = []): Promise<void> {
+  try { await hFetch(`/mind/director/invitations/${encodeURIComponent(id)}`, "PATCH", { outcome, message_id: messageId, used_offer_ids: usedOfferIds }); }
+  catch (e) { console.warn(`[director] resolveInvitation ${id} failed:`, e); }
+}
+
+export interface ConvoThreadRow { id: string; state: string; turn_count: number; seed_text: string; seed_author: string; participants: string; last_turn_at: string }
+export interface ConvoLedgerRow { author: string; gist: string; said_at: string; message_id?: string | null }
+export async function convoActiveFor(channelId: string): Promise<{ thread: ConvoThreadRow; ledger: ConvoLedgerRow[] } | null> {
+  const r = await hFetch(`/mind/conversations/active?channel_id=${encodeURIComponent(channelId)}`) as { thread: ConvoThreadRow | null; ledger?: ConvoLedgerRow[] };
+  return r.thread ? { thread: r.thread, ledger: r.ledger ?? [] } : null;
+}
+export async function convoOpenFor(p: { channel_id: string; seed_text: string; seed_author: string; seed_message_id?: string }): Promise<{ id: string } | null> {
+  try { const r = await hFetch("/mind/conversations", "POST", p) as { thread?: { id: string } }; return r.thread ? { id: r.thread.id } : null; }
+  catch (e) { console.warn("[director] convoOpen failed:", e); return null; }
+}
+/**
+ * Append a turn. Returns "terminal" when the thread has already landed or faded, so the caller can
+ * DROP a stale thread id instead of retrying it forever (2026-09-24).
+ *
+ * This used to swallow every failure into a warning, which meant the director's cached
+ * `state.threadId` outlived the thread it pointed at: once a companion wrote `[LANDS:]` or the
+ * turn budget faded the row, every subsequent message logged
+ * `convoTurn failed: ... 409 {"reason":"terminal"}` and nothing ever re-opened. Observed on one
+ * thread across two days. Harmless in itself, but it writes errors into the log continuously,
+ * which is where a real error goes to hide.
+ */
+export type ConvoTurnResult = "ok" | "terminal" | "error";
+export async function convoTurnFor(threadId: string, p: { author: string; gist: string; message_id?: string; front?: string | null }): Promise<ConvoTurnResult> {
+  try {
+    await hFetch(`/mind/conversations/${encodeURIComponent(threadId)}/turns`, "POST", p);
+    return "ok";
+  } catch (e) {
+    const msg = String(e);
+    if (msg.includes("409") || msg.includes("terminal")) return "terminal";
+    console.warn("[director] convoTurn failed:", e);
+    return "error";
+  }
+}
+export async function convoLandFor(threadId: string, resolution: string, landedBy: string): Promise<boolean> {
+  try { await hFetch(`/mind/conversations/${encodeURIComponent(threadId)}/land`, "POST", { resolution, landed_by: landedBy }); return true; }
+  catch (e) { console.warn(`[director] convoLand ${threadId} failed:`, e); return false; }
+}
+export async function convoFadeFor(threadId: string, reason: string): Promise<boolean> {
+  try { await hFetch(`/mind/conversations/${encodeURIComponent(threadId)}/fade`, "POST", { reason }); return true; }
+  catch (e) { console.warn(`[director] convoFade ${threadId} failed:`, e); return false; }
+}

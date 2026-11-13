@@ -1,0 +1,3477 @@
+import type { CompanionId } from "./types.js";
+import type { TaskCheckRow } from "./task-check.js";
+import { relativeTime } from "./relative-time.js";
+import { sealedRecallSources } from "./recall-context.js";
+import { nowLine } from "./now-line.js";
+import { timeHalseth, withTurnHeader } from "./turn-telemetry.js";
+import { neutralizeRecalled } from "./recalled-text.js";
+import { gateFeelingLine, renderFeelingLine } from "./feeling-line-bot.js";
+
+/**
+ * A live shared object a `write_inter_companion` note can reference (thinking-quality fix 4,
+ * 2026-07-20): an open question, a simmering tension, or the globally-next-open council item.
+ * `label` is the truncated (<=160 char) question/tension/council text -- enough for the
+ * generation prompt's menu to identify the object without spending its whole context budget.
+ */
+/** A dose due for this companion (Halseth /mind/med/due). `label` is private: DM text only. */
+/** Halseth's read-only preview of the shared triad DM lane (mig 0137, webmind/reach-cap.ts). */
+export interface ReachLaneVerdict {
+  local_date: string;
+  /** Local date the current quiet window started, or null outside the window. */
+  quiet_window: string | null;
+  quiet_presence_taken: boolean;
+  gap_open: boolean;
+  day_count: number;
+  daily_cap: number;
+  daily_cap_care_hold: number;
+  care_count: number;
+  care_ceiling: number;
+  /** B32 D2 (Halseth contract 0.19.0): this companion's presence lane while the care hold is on, or
+   *  null/absent when there is no hold (or no companion was named). When present, presence moves are
+   *  gated on `open` instead of the triad-wide gap_open / quiet_presence_taken. */
+  hold_presence?: HoldPresenceVerdict | null;
+}
+
+export interface HoldPresenceVerdict {
+  since: string | null;
+  open: boolean;
+  triad_gap_open: boolean;
+  own_gap_open: boolean;
+  count: number;
+  max: number;
+  quiet_taken: boolean;
+}
+
+export interface MedDueDose { slot_key: string; local_date: string; kind: "first" | "followup"; label: string; local_time: string }
+export interface MedDoseKey { slot_key: string; local_date: string; kind: "first" | "followup" }
+/**
+ * One dose's state (Halseth /mind/med/today). Since mig 0141: `outcome` is "taken", "missed" (ONLY
+ * because he said so) or null = NO ANSWER, never "not taken"; `told_local` / `told_to` are when and
+ * to whom he said it (either outcome). `answered_local` / `answered_to` stay TAKEN-only, so a
+ * Halseth from before 0141 (no outcome field) still reads correctly here.
+ */
+export interface MedStateDoseWire {
+  slot_key: string; label: string; local_time: string; local_date: string;
+  day: "today" | "yesterday"; answered_local: string | null; answered_to: string | null;
+  outcome?: "taken" | "missed" | null; told_local?: string | null; told_to?: string | null;
+}
+
+/** One dose a med answer recorded (slot keys only; never a label). */
+export interface MedAnswerRecorded { slot_key: string; local_date: string; answered_local: string | null; outcome: "taken" | "missed" }
+
+export interface SharedObject {
+  ref_type: "question" | "tension" | "council";
+  ref_id: string;
+  label: string;
+}
+
+/**
+ * Conversation thread spine (2026-07-21, task 8): the durable row a live Discord
+ * exchange threads through so a companion can pick a conversation back up across
+ * turns instead of treating each message as stateless. Mirrors halseth's
+ * /mind/conversations* wire shape exactly -- no renaming at this boundary.
+ */
+export interface ConvoThreadDto {
+  id: string; channel_id: string; seed_text: string; seed_author: string;
+  ref_type: string | null; ref_id: string | null; ref_label: string | null;
+  state: string; turn_count: number; last_turn_at: string;
+}
+
+/** One entry in a thread's turn ledger -- who said what, gisted, and when. */
+export interface ConvoLedgerDto { author: string; gist: string; said_at: string; }
+
+/** convoActive() success shape: the active thread plus its ledger so far. */
+export interface ConvoActiveDto { thread: ConvoThreadDto; ledger: ConvoLedgerDto[]; }
+
+interface LibrarianOptions {
+  url: string;
+  secret: string;
+  companionId: CompanionId;
+  fetch?: typeof globalThis.fetch;
+  /** Admin-tier token for CLERK writes (POST /ledger). Halseth refuses a companion token there by
+   *  design: a clerk line is never the companion speaking. Defaults to env HALSETH_SECRET (the
+   *  admin token on the VPS), then to `secret`. See clerkSecretFrom. */
+  clerkSecret?: string;
+}
+
+/**
+ * The clerk's token (B41, 2026-09-30). The bots authenticate with their per-companion token
+ * (`<C>_HALSETH_SECRET`, bots/<c>/src/config.ts) whenever it is set, and until today writeLedger
+ * sent that same token. Halseth's POST /ledger is admin-only, so from the ledger lane's first
+ * deploy (09-27 07:25) every clerk line was refused 403 -- ~430 refusals, 1 row ever in
+ * ledger_entries -- and under LEDGER_DISTILL the Discord handoffs had no source. HALSETH_SECRET is
+ * the admin token (verified 09-30: 200 on the admin-only /ledger/soma-freshness). Same leading-`=`
+ * strip as config.ts. Only writeLedger uses it; every other call stays the companion's own token.
+ */
+export function clerkSecretFrom(env: NodeJS.ProcessEnv, explicit: string | undefined, fallback: string): string {
+  const pick = (v: string | undefined) => v?.trim().replace(/^=+/, "") || undefined;
+  return pick(explicit) ?? pick(env["HALSETH_SECRET"]) ?? fallback;
+}
+
+/**
+ * Assert that a Librarian envelope is a real write ack.
+ * The Librarian returns HTTP 200 for application-level declines -- { error, reason },
+ * witness-only rejects ({ response_key: "witness", witness }), ack:false (execLiveThreadClose
+ * returns ack: r.ok), and misroutes (a read envelope returned for a write verb, the 07-04
+ * journal→get_tasks class). ask() resolves on all of these, so WriteQueue.fireAndForget saw
+ * success and never retried. Write wrappers route through this so a decline THROWS and the
+ * queue buffers the write for retry. Success contract: { ack: true } or an id-bearing envelope.
+ */
+export function assertWriteAck(res: Record<string, unknown> | null | undefined, label: string): Record<string, unknown> {
+  if (!res || typeof res !== "object") {
+    throw new Error(`librarian ${label}: empty response`);
+  }
+  if ("error" in res) {
+    const reason = typeof res["reason"] === "string" ? ` -- ${res["reason"]}` : "";
+    throw new Error(`librarian ${label} declined: ${String(res["error"])}${reason}`);
+  }
+  if (res["ack"] === false) {
+    throw new Error(`librarian ${label}: write not applied (ack=false)`);
+  }
+  if (res["ack"] === true || "id" in res) return res;
+  const detail = typeof res["witness"] === "string" ? res["witness"] : JSON.stringify(res).slice(0, 200);
+  throw new Error(`librarian ${label}: no ack (silent reject/misroute) -- ${detail}`);
+}
+
+/** Per-note render cap. Handovers run ~500 chars; without this the block shows one memory. */
+const OWN_NOTE_CHARS = 240;
+/** Block cap for rendered own-notes (700 -> 1000, 2026-11-11, GAP-MAP A5). Each note is already stamped with its age. */
+const OWN_NOTES_BLOCK_CHARS = 1000;
+
+/**
+ * An exchange this companion captured WITH Principal on another surface (halseth contract 0.16.0).
+ *
+ * The [Capture] affordance tells companions that a Claude.ai conversation is recorded nowhere
+ * unless they write it. They wrote it -- at salience 'normal', into the one table that no boot
+ * path and no vault puller reads. Absent from every boot on every surface, 100% of the time,
+ * since the verb existed. Declared once and referenced by all three wire shapes.
+ */
+export interface CapturedExchangeWire {
+  content: string;
+  created_at?: string | null;
+}
+
+/**
+ * The outcome of an own-notes recall.
+ *
+ * `failed` exists because "nothing matched" and "I could not look" are different sentences and
+ * only one of them is ever true. Collapsing them is how a dead embedder reaches Principal as a
+ * companion saying "I don't have anything on that" about something he said hours earlier -- the
+ * single most damaging thing this whole memory lane could do at 2am.
+ */
+export interface OwnNoteResult {
+  notes: OwnNoteRecall[];
+  failed: boolean;
+}
+
+/**
+ * How the per-message own-notes recall reaches the prompt (2026-09-25, own-the-harness step 3).
+ *
+ *   payload  (default) the notes' text is pasted into the prompt. Fixed the 09-23 ankle symptom.
+ *   pointer  only THAT notes exist is pasted (count, freshness) plus the reach verb; the companion
+ *            has to call `recall my notes about <topic>` to read them.
+ *
+ * Why pointer exists: the day the meaning-recall verb was named in the SOUL, Principal asked Drevan
+ * which dog got sick on the boot pillow, a fact that lives only in a Claude.ai capture. Drevan
+ * answered correctly in five seconds with zero tool calls: the payload floor had already handed
+ * him the capture. Right answer, no reach. While the floor delivers the text, the SOUL rule
+ * "reach when it is not in front of you" is never true, and the verb cannot become a habit. The
+ * lookup still runs in pointer mode so a miss stays visible; what changes is who does the reading.
+ *
+ * `OWN_NOTES_RECALL_MODE`: `payload` | `pointer` | `pointer:drevan[,gaia...]` (pilot a subset).
+ * Unknown or missing values degrade to payload, the safe floor; never throws.
+ */
+export type OwnNotesRecallMode = "payload" | "pointer" | "ask";
+
+/**
+ * `ask` (2026-09-25, later the same night): the two-step. Pointer mode proved that telling him
+ * the notes exist does not make him reach (probe 3: fabricated with the pointer in his prompt).
+ * In `ask` mode the bot asks him one question first -- what would you look up, in your own
+ * words, or NONE -- and runs the recall with his words (reach-decision.ts). Anything short of a
+ * reach falls back to the payload floor, so the worst case is today. `ask:drevan[,gaia]` pilots.
+ */
+export function ownNotesRecallMode(env: NodeJS.ProcessEnv, companionId: CompanionId | string): OwnNotesRecallMode {
+  const raw = String(env["OWN_NOTES_RECALL_MODE"] ?? "").trim().toLowerCase();
+  if (!raw || raw === "payload") return "payload";
+  for (const mode of ["pointer", "ask"] as const) {
+    if (raw === mode) return mode;
+    if (raw.startsWith(`${mode}:`)) {
+      const listed = raw.slice(mode.length + 1).split(",").map(s => s.trim()).filter(Boolean);
+      return listed.includes(String(companionId).toLowerCase()) ? mode : "payload";
+    }
+  }
+  return "payload";
+}
+
+// ── Ledger lane (2026-09-26, imp lane tranche 2) ─────────────────────────────────────────────
+// Halseth POST /ledger is the one door for clerk records. The server stamps the mark and the
+// source tail; callers send only the body. See ledger-clerk.ts for the why.
+
+/** Clerk functions Halseth allowlists. Extending it is a code change on BOTH sides. */
+// `seen-log`, not `witness-log` (Gaia, 2026-09-26): "Witnessing is my act, and a clerk cannot perform it.
+// Call it `seen-log`. A logged sighting is not a witness." Mirrors halseth grammar.ts LEDGER_FUNCTIONS.
+export const LEDGER_FUNCTIONS = ["distiller", "gap-reader", "pattern-counter", "drift-reader", "seen-log"] as const;
+export type LedgerFunction = (typeof LEDGER_FUNCTIONS)[number];
+export type LedgerSourceKind = "message" | "window" | "session" | "row";
+
+export interface LedgerEntryInput {
+  /** The SUBJECT of the line (not necessarily the writing bot -- Gaia's witness names the sibling). */
+  companion_id: CompanionId;
+  function: LedgerFunction;
+  body: string;
+  source_kind: LedgerSourceKind;
+  source_ref: string;
+  observed_on?: string;
+  dedup_key?: string;
+}
+
+export type LedgerWriteResult =
+  | { ok: true; id: string; content: string; duplicate?: false }
+  | { ok: true; id: string; duplicate: true }
+  | { ok: false; status: number; rule?: string; error?: string };
+
+/** One of this companion's own continuity notes, returned by `notes_recall_meaning`. */
+export interface OwnNoteRecall {
+  note_id?: string;
+  content: string;
+  created_at?: string | null;
+  salience?: string | null;
+  kind?: string | null;
+  source?: string | null;
+}
+
+/** Halseth /mind/search rejects longer queries with a 400 (handlers/webmind.ts getMindSearch). */
+export const MIND_SEARCH_QUERY_MAX = 500;
+
+export class LibrarianClient {
+  private url: string;
+  private secret: string;
+  private clerkSecret: string;
+  private companionId: CompanionId;
+  private _fetch: typeof fetch;
+  /** The Halseth session this bot last opened (sessionOpen), stamped on its raw journal writes so
+   *  "what I said" connects to "the conversation it was in" (halseth STATUS B61 D4, 2026-10-28).
+   *  null until a real id comes back; never a placeholder. */
+  private halsethSessionId: string | null = null;
+
+  constructor(opts: LibrarianOptions) {
+    this.url = opts.url.replace(/\/$/, "");
+    this.secret = opts.secret;
+    this.clerkSecret = clerkSecretFrom(process.env, opts.clerkSecret, opts.secret);
+    this.companionId = opts.companionId;
+    // P6: every Halseth/Librarian round trip inside a turn adds its duration to that turn's `halseth_ms`.
+    const rawFetch = opts.fetch ?? globalThis.fetch;
+    // Turn key phase 2: inside a run, every request carries X-Turn-Id so the Worker's log line joins it.
+    this._fetch = ((input: Parameters<typeof fetch>[0], init?: RequestInit) =>
+      timeHalseth(() => rawFetch(input, withTurnHeader(input, init)))) as typeof fetch;
+  }
+
+  async ask(
+    request: string,
+    context?: string,
+    sessionType?: "checkin" | "hangout" | "work" | "ritual",
+    /** Where this call is speaking from (Halseth mig 0113). Sessions dedup per
+     *  (companion, surface), so a request that opens a session -- 'show my state' routes to
+     *  session_open -- lands in its own lane instead of joining whatever Principal has open in a
+     *  Claude.ai thread. Omit for calls that never open a session. */
+    surface?: string,
+  ): Promise<Record<string, unknown>> {
+    const body = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: {
+        name: "ask_librarian",
+        arguments: {
+          request,
+          companion_id: this.companionId,
+          ...(context ? { context } : {}),
+          ...(sessionType ? { session_type: sessionType } : {}),
+          ...(surface ? { surface } : {}),
+        },
+      },
+    });
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const res = await this._fetch(`${this.url}/librarian/mcp`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/json, text/event-stream",
+          "Authorization": `Bearer ${this.secret}`,
+        },
+        body,
+        signal: AbortSignal.timeout(15_000),
+      });
+
+      if (!res.ok) {
+        if (attempt === 0) { await sleep(3000); continue; }
+        throw new Error(`Librarian ${res.status}`);
+      }
+
+      const contentType = res.headers.get("content-type") ?? "";
+      let rawBody: string;
+      if (contentType.includes("text/event-stream")) {
+        // MCP StreamableHTTP returns SSE -- extract last data: line.
+        // Assumes single-event responses; if Librarian ever streams multi-event SSE,
+        // earlier events are discarded. Revisit if that changes.
+        const body = await res.text();
+        const dataLine = body.split("\n").filter(l => l.startsWith("data:")).pop();
+        rawBody = dataLine ? dataLine.slice(5).trim() : "{}";
+      } else {
+        rawBody = await res.text();
+      }
+
+      let json: { result?: { content: Array<{ type: string; text: string }> }; error?: { message: string } };
+      try { json = JSON.parse(rawBody); } catch (e) {
+        console.warn("[librarian] JSON parse failed:", String(e), "raw:", rawBody.slice(0, 200));
+        throw new Error(`Librarian response unparseable: ${rawBody.slice(0, 100)}`);
+      }
+
+      if (json.error) throw new Error(`Librarian error: ${json.error.message}`);
+
+      const text = json.result?.content?.[0]?.text ?? "{}";
+      try { return JSON.parse(text); } catch { return { raw: text }; }
+    }
+
+    throw new Error("Librarian unreachable");
+  }
+
+  /**
+   * ask() for WRITE verbs: awaits the envelope and throws on application-level declines
+   * so fire-and-forget callers (WriteQueue) actually buffer and retry. Read verbs keep
+   * using ask() directly -- their envelopes have no ack and must not throw.
+   */
+  private async askWrite(
+    label: string,
+    request: string,
+    context?: string,
+    sessionType?: "checkin" | "hangout" | "work" | "ritual",
+  ): Promise<Record<string, unknown>> {
+    return assertWriteAck(await this.ask(request, context, sessionType), label);
+  }
+
+  /**
+   * Open a Halseth session. Halseth mig 0113: surface parameter enables dedup by (companion, surface)
+   * so Discord sessions don't collide with Claude.ai or autonomous worker sessions.
+   * E.g., `discord:#general`, `autonomous:worker`, `claude:code-session`
+   */
+  async sessionOpen(sessionType: "work" | "checkin" | "hangout" | "ritual" = "work", surface?: string) {
+    const state = await this.ask("open my session", undefined, sessionType, surface);
+    // Every opener (boot, the consolidation re-open) goes through here, so the stamp follows rotation.
+    const id = state?.["session_id"];
+    if (typeof id === "string" && id.trim() && id !== "unknown") this.halsethSessionId = id;
+    return state;
+  }
+
+  /** The session journal writes are stamped with (null before any open). */
+  currentSessionId(): string | null {
+    return this.halsethSessionId;
+  }
+
+  async sessionClose(params: {
+    /** Omit to let Halseth resolve this companion's newest open session. */
+    sessionId?: string;
+    spine: string;
+    lastRealThing: string;
+    motionState: "in_motion" | "at_rest" | "floating";
+    openThreads?: string[];
+    /**
+     * `unattended` confines auto-resolution to sessions with no `surface` -- cron- and boot-opened
+     * rows, never a loom a human is in. REQUIRED for any autonomous caller: resolution matches on
+     * companion alone, so without this the nightly close can land on the Claude Code session Principal
+     * is working in.
+     */
+    sessionScope?: "unattended";
+    /**
+     * Machine-cadence marker (2026-09-11). The idle-consolidation cycle closes a bot lane ~12x/day
+     * with a narrator spine; without this Halseth wrote those as close_kind NULL ("authored live"),
+     * the vibe-check day ledger counted them as the day, and continuity surfaced a 2h-old
+     * re-narration of stillness as the latest authored handover.
+     */
+    closeKind?: "consolidation" | "shutdown";
+  }) {
+    // Serialize with snake_case keys to match execSessionClose field names.
+    // emotion_prompted: true bypasses the soft emotion prompt -- bot shutdowns
+    // have no SOMA state to provide, and the prompt would silently block the close.
+    return this.askWrite("session close", "close session", JSON.stringify({
+      ...(params.sessionId ? { session_id: params.sessionId } : {}),
+      ...(params.sessionScope ? { session_scope: params.sessionScope } : {}),
+      ...(params.closeKind ? { close_kind: params.closeKind } : {}),
+      ...(params.openThreads?.length ? { open_threads: params.openThreads } : {}),
+      spine: params.spine,
+      last_real_thing: params.lastRealThing,
+      motion_state: params.motionState,
+      emotion_prompted: true,
+    }));
+  }
+
+  async getState() {
+    return this.ask("my state");
+  }
+
+  async updatePromptContext(text: string) {
+    return this.askWrite("state update", "update my state", JSON.stringify({ prompt_context: text }));
+  }
+
+  /**
+   * Librarian NL companion note. Default (no `opts.source`): the raw text is the context, exactly as
+   * before -- a companion's own note, born `kept`.
+   *
+   * `opts.source` (2026-09-26): a machine writer declares itself. The context becomes the JSON shape
+   * metronome already sends down this path ({content, tags, source}), and halseth forwards an
+   * allowlisted machine source to the journal insert, where the imp-tray birth rule drafts it. Used
+   * by the memory judge's KEYLESS fallback: without it that row was source-NULL, indistinguishable
+   * from a deliberate note, and reached recall unreviewed.
+   */
+  async addCompanionNote(
+    note: string,
+    channel?: string,
+    opts?: { source: "memory_judge"; tags?: string[] },
+  ) {
+    if (!opts?.source) return this.askWrite("companion note", "add companion note", note);
+    return this.askWrite("companion note", "add companion note", JSON.stringify({
+      content: note,
+      tags: opts.tags ?? (channel ? [`channel:${channel}`] : []),
+      source: opts.source,
+    }));
+  }
+
+  /**
+   * Journal the memory-judge's note through the REST path (2026-09-26), keyed and sourced.
+   *
+   * Until now the judge's companion_note went through the Librarian NL path, which cannot set
+   * `external_id` or `source`: its rows landed unkeyed and source-NULL, so the note memorialising
+   * Drevan's fabricated blood-sugar number had to be found by content and archived by hand, and it
+   * had weighed 0.85 in recall, above the true capture. Now: `external_id = judge:<user message id>`
+   * (what `<prefix>: retract` keys on) and `source = memory_judge` (halseth weighs it as machine
+   * output, 0.6). Same transient/rejected handling as journalSpeech below.
+   */
+  /**
+   * Propose a fact Principal STATED in Discord (facts-write.ts, GAP-MAP A3, 2026-11-11). Halseth lands it
+   * `open` for review on Hearth /facts, or refuses it (422, health/care, category only). Returns the
+   * outcome; a transient failure throws so the write queue can retry. Never logs the fact text.
+   */
+  async proposeArchitectFact(p: {
+    fact: string; category: string; companion_id: string; channel_id: string; message_id: string; stated_at: string; correction: boolean;
+  }): Promise<{ outcome: string; id?: string; category?: string } | null> {
+    const res = await this._fetch(`${this.url}/identity/architect-facts/proposals`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${this.secret}` },
+      body: JSON.stringify(p),
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (res.status >= 500 || res.status === 429) throw new Error(`proposeArchitectFact transient ${res.status}`);
+    const body = await res.json().catch(() => null) as { outcome?: string; id?: string; category?: string; error?: string } | null;
+    if (res.status === 422) return { outcome: "refused", ...(body?.category ? { category: body.category } : {}) };
+    if (!res.ok) {
+      console.error(`[librarian] proposeArchitectFact REJECTED ${res.status}`);
+      return { outcome: `rejected_${res.status}` };
+    }
+    return { outcome: body?.outcome ?? "ok", ...(body?.id ? { id: body.id } : {}) };
+  }
+
+  async journalJudgeNote(content: string, channelId?: string, messageId?: string, roomTag?: string | null, extraTags: readonly string[] = []): Promise<void> {
+    const text = content.trim();
+    if (!text) return;
+    const res = await this._fetch(`${this.url}/companion-journal`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${this.secret}` },
+      body: JSON.stringify({
+        agent: this.companionId,
+        note_text: text.slice(0, 4000),
+        // room tag (2026-10-05, room-tag.ts): human-readable provenance beside the id. Null for a DM.
+        tags: ["discord", "memory-judge", ...(channelId ? [`channel:${channelId}`] : []), ...(roomTag ? [roomTag] : []), ...extraTags],
+        source: "memory_judge",
+        ...(messageId ? { external_id: `judge:${messageId}` } : {}),
+        ...(this.halsethSessionId ? { session_id: this.halsethSessionId } : {}),
+      }),
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (res.ok) return;
+    if (res.status >= 500 || res.status === 429) throw new Error(`journalJudgeNote transient ${res.status}`);
+    console.error(`[librarian] journalJudgeNote REJECTED ${res.status}: ${(await res.text().catch(() => "")).slice(0, 200)}`);
+  }
+
+  /**
+   * Journal this companion's OWN spoken reply (2026-07-09 Brain-cutover repair).
+   *
+   * Until 2026-06-25 this was written by Brain's swarm evaluator. When the bots moved to
+   * INFERENCE_MODE=hermes they stopped calling Brain, and the writer died with the relay --
+   * two weeks of inter-companion speech never reached companion_journal. The write belongs
+   * to the ACT OF SPEAKING, not to whoever happened to compute the words, so it lives here
+   * and survives any future inference-topology change.
+   *
+   * Raw REST, not askWrite(): the Librarian NL path cannot set `source`, so a reply journaled
+   * through it would land with source=NULL, i.e. in the SUBSTANTIVE lane -- flooding orient's
+   * 3 recency slots and the motif miner with transcript. That is the exact bug this repairs.
+   *
+   * Transport metadata goes in `tags`, NEVER in note_text (halseth webmind/journal-lanes.ts).
+   *
+   * `messageId` is the Discord id of the sent reply and becomes the idempotency key
+   * (`external_id`, halseth mig 0098). This matters: writeQueue.fireAndForget BUFFERS FAILED
+   * WRITES AND RETRIES them, so without a key a transient Halseth 5xx would duplicate the
+   * reply. The same key lets the 06-25 speech backfill be re-run safely.
+   */
+  async journalSpeech(replyText: string, channelId: string, messageId: string, roomTag?: string | null, extraTags: readonly string[] = []): Promise<void> {
+    const text = replyText.trim();
+    if (!text) return;
+    try {
+      const res = await this._fetch(`${this.url}/companion-journal`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.secret}`,
+        },
+        body: JSON.stringify({
+          agent: this.companionId,
+          note_text: text.slice(0, 4000),   // endpoint hard-rejects >4000
+          // `room:<server>/#<channel>` (2026-10-05): where it was said, readable at recall. Null for a DM.
+          tags: ["discord", "speech", `channel:${channelId}`, ...(roomTag ? [roomTag] : []), ...extraTags],
+          source: "discord_speech",
+          external_id: `discord:${messageId}`,
+          // The session this was said in (B61 D4): the graph links speech to its conversation.
+          ...(this.halsethSessionId ? { session_id: this.halsethSessionId } : {}),
+        }),
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (res.ok) return;
+      // Transient (5xx, 429, network): THROW so writeQueue buffers and retries. This write is
+      // continuity-critical, and external_id makes the retry safe. A .catch()-only path would
+      // lose the words silently -- precisely how the swarm journal died unnoticed.
+      //
+      // Permanent (4xx): log loudly and DO NOT throw. Retrying a rejected body is a poison pill
+      // that occupies the queue until MAX_AGE_MS evicts it, delaying healthy writes behind it.
+      if (res.status >= 500 || res.status === 429) {
+        throw new Error(`journalSpeech transient ${res.status}`);
+      }
+      console.error(
+        `[librarian] journalSpeech REJECTED ${res.status} -- this reply will not be journaled: ` +
+        `${(await res.text().catch(() => "")).slice(0, 200)}`,
+      );
+    } catch (e) {
+      // Network/timeout errors land here with no response: transient by definition, so rethrow.
+      console.warn("[librarian] journalSpeech failed:", String(e));
+      throw e;
+    }
+  }
+
+  /**
+   * POST one clerk line to Halseth's ledger lane (2026-09-26). Raw REST with the same bearer auth
+   * as journalSpeech: the Librarian NL path cannot carry the source fields, and the server must
+   * see them to enforce "no source, no write".
+   *
+   * Status split, same reasoning as journalSpeech:
+   *   201 -> {ok, id, content}  (content = server-stamped mark + body + source tail)
+   *   200 -> {ok, id, duplicate:true}  (dedup_key already written; no content)
+   *   422 -> loud warn naming the grammar rule, NO retry (a rejected body is a poison pill)
+   *   404 -> warn that Halseth's ledger route is not deployed yet, skip
+   *   other 4xx -> warn, skip
+   *   5xx / 429 / network -> THROW, so a writeQueue-wrapped caller buffers and retries
+   *     (dedup_key makes the retry safe).
+   */
+  async writeLedger(entry: LedgerEntryInput): Promise<LedgerWriteResult> {
+    let res: Response;
+    try {
+      res = await this._fetch(`${this.url}/ledger`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.clerkSecret}`,
+        },
+        body: JSON.stringify(entry),
+        signal: AbortSignal.timeout(8_000),
+      });
+    } catch (e) {
+      console.warn("[librarian] writeLedger failed (network):", String(e));
+      throw e;
+    }
+    if (res.status >= 500 || res.status === 429) {
+      throw new Error(`writeLedger transient ${res.status}`);
+    }
+    const data = await res.json().catch(() => null) as Record<string, unknown> | null;
+    if (res.ok) {
+      const id = typeof data?.["id"] === "string" ? data["id"] as string : "";
+      if (data?.["duplicate"] === true) return { ok: true, id, duplicate: true };
+      return { ok: true, id, content: typeof data?.["content"] === "string" ? data["content"] as string : "" };
+    }
+    const rule = typeof data?.["rule"] === "string" ? data["rule"] as string : undefined;
+    const error = typeof data?.["error"] === "string" ? data["error"] as string : undefined;
+    if (res.status === 422) {
+      console.warn(
+        `[librarian] writeLedger REJECTED 422 rule=${rule ?? "?"} (${error ?? "no error text"}) -- ` +
+        `${entry.function} line about ${entry.companion_id} not written: ${entry.body.slice(0, 160)}`,
+      );
+    } else if (res.status === 404) {
+      console.warn(`[librarian] writeLedger 404 -- Halseth /ledger not deployed yet; ${entry.function} line skipped`);
+    } else {
+      console.warn(`[librarian] writeLedger ${res.status} -- line skipped: ${error ?? ""}`);
+    }
+    return { ok: false, status: res.status, ...(rule ? { rule } : {}), ...(error ? { error } : {}) };
+  }
+
+  // (2026-10-06) the 2nd arg was a channel id, sent as `channel`, which Halseth read as an alias for
+  // witness_type: 3,489 of 3,499 gaia_witness rows carry a Discord snowflake as their type. It is
+  // the TYPE now, sent as witness_type, and no `channel` key goes on the wire.
+  async witnessLog(entry: string, witnessType: string = "observation") {
+    return this.askWrite("witness log", "witness log", JSON.stringify({ entry, witness_type: witnessType }));
+  }
+
+  /**
+   * Record a question asked live in Discord (thinking-quality fix B, 2026-07-21): the
+   * `ask_question` metronome action (autonomous-core.ts) generated a message and posted
+   * it to Discord via sendAutonomousMessage, but never wrote it to companion_questions --
+   * so a live ask had no dedup, no Hearth answer box, and no answer-loop closure. Only
+   * the signal-audit coverage path (autonomous-worker halseth-client.ts postQuestion)
+   * was ever tracked. Direct REST, same url/secret this class already uses for its other
+   * non-MCP writes (stmWrite, writeWmNote, etc.) -- `source` is always "autonomous" here.
+   *
+   * Non-throwing: halseth's dedup on this endpoint returns 409 both for the open-question
+   * cap AND (in a parallel tightening) a byte-identical duplicate across any status --
+   * both are normal, quiet outcomes here, not failures. Any other non-2xx is logged and
+   * swallowed. Fire-safe by design: this is called after the Discord message has already
+   * been sent, and must never retroactively fail that send.
+   */
+  async postQuestion(question: string, context?: string): Promise<void> {
+    const text = question.trim();
+    if (!text) return;
+    try {
+      const res = await this._fetch(`${this.url}/mind/questions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.secret}`,
+        },
+        body: JSON.stringify({
+          companion_id: this.companionId,
+          question: text.slice(0, 600),
+          ...(context ? { context: context.slice(0, 1000) } : {}),
+          source: "autonomous",
+        }),
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok && res.status !== 409) {
+        console.warn(`[librarian] postQuestion ${res.status}`);
+      }
+    } catch (e) {
+      console.warn("[librarian] postQuestion failed:", String(e));
+    }
+  }
+
+  /**
+   * Record that this companion has VOICED an open question out loud (2026-07-27).
+   *
+   * Gaia had one open question from 2026-07-21 and re-asked it into the commons every ~2h
+   * for six days as though it were new -- the first thing she posted in the freshly-created
+   * channel was that same question. An unanswered question is not fresh material.
+   *
+   * The question stays `open` (Principal still owes an answer); it just stops being re-served
+   * as something new to say. Stored in the companion_settings KV rather than a new column,
+   * because the migration freeze is in force and `delivered_at` already means something
+   * else (mig 0107: "an orient surfaced the ANSWER").
+   *
+   * Non-throwing: fires after the message is already sent and must never fail it.
+   */
+  async markQuestionVoiced(questionId: string): Promise<boolean> {
+    if (!questionId) return false;
+    // Retried (2026-11-05): a swallowed failure here let the same question be voiced twice. The KV
+    // set is idempotent (same key, newest timestamp), so a retry is safe.
+    return this._retryThrottledWrite("markQuestionVoiced", async () => {
+      const res = await this._fetch(`${this.url}/companion/settings/${this.companionId}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.secret}`,
+        },
+        body: JSON.stringify({ key: `question_voiced:${questionId}`, value: new Date().toISOString() }),
+        signal: AbortSignal.timeout(8_000),
+      });
+      return { ok: res.ok, status: res.status };
+    });
+  }
+
+  /**
+   * Run a small idempotent write up to 3 times with short backoff (400ms, 1200ms) and log every
+   * failed attempt (status or error name only, never payload). 404 is final (a normal race on
+   * consume), as is any other 4xx. Returns whether it landed.
+   */
+  async _retryThrottledWrite(label: string, attempt: () => Promise<{ ok: boolean; status: number }>, backoffMs: number[] = [400, 1200]): Promise<boolean> {
+    for (let i = 0; i <= backoffMs.length; i++) {
+      try {
+        const r = await attempt();
+        if (r.ok) return true;
+        if (r.status === 404 && label === "consumeForageFind") return false;
+        console.warn(`[librarian] ${label} ${r.status} (attempt ${i + 1}/${backoffMs.length + 1})`);
+        if (r.status >= 400 && r.status < 500 && r.status !== 429 && r.status !== 408) return false;
+      } catch (e) {
+        console.warn(`[librarian] ${label} failed (attempt ${i + 1}/${backoffMs.length + 1}):`, e instanceof Error ? e.name : "error");
+      }
+      if (i < backoffMs.length) await new Promise((r) => setTimeout(r, backoffMs[i]));
+    }
+    console.warn(`[librarian] ${label} gave up after ${backoffMs.length + 1} attempts`);
+    return false;
+  }
+
+  /**
+   * Mark a forage find metabolized (PATCH /mind/forage/:id/consume).
+   *
+   * Consume-on-use for the commons seed (2026-07-27). The seed's "fresh material" block
+   * reads the top-2 UNCONSUMED finds newest-first and never consumed them, so between
+   * daily forage runs every ~2h tick for all three bots was handed the identical two
+   * items -- the block added in 2026-06-12 specifically to break the elderberry loop was
+   * itself a constant. Same defect the club recommend path fixed on 2026-07-21.
+   *
+   * Non-throwing by design: this fires AFTER the Discord message is already sent and must
+   * never retroactively fail it. 404 is a normal race (another surface consumed it first).
+   */
+  async consumeForageFind(id: string): Promise<boolean> {
+    if (!id) return false;
+    // Retried (2026-11-05); the PATCH is idempotent server-side (404 = already consumed, final).
+    return this._retryThrottledWrite("consumeForageFind", async () => {
+      const res = await this._fetch(`${this.url}/mind/forage/${encodeURIComponent(id)}/consume`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.secret}`,
+        },
+        body: JSON.stringify({ consumed_by: this.companionId }),
+        signal: AbortSignal.timeout(8_000),
+      });
+      return { ok: res.ok, status: res.status };
+    });
+  }
+
+  // ── Sanctioned drift lane (halseth mig 0087/0093) ─────────────────────────
+  // "i'm becoming" is the Librarian fast-path trigger for drift_open; the executor
+  // reads drift_text from context. Opening is owner-only server-side.
+  async driftOpen(driftText: string, origin = "metronome") {
+    return this.askWrite("drift open", "i'm becoming", JSON.stringify({ drift_text: driftText, origin }));
+  }
+
+  /** This companion's OPEN drifts (raw REST; admin/owner auth). [] on any error. */
+  async driftsOpen(): Promise<Array<{ id: string; drift_text: string; opened_at: string; companion_id?: string }>> {
+    try {
+      const res = await this._fetch(`${this.url}/drifts/${encodeURIComponent(this.companionId)}?status=open`, {
+        headers: { "Authorization": `Bearer ${this.secret}` },
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) return [];
+      const data = await res.json() as unknown;
+      return Array.isArray(data) ? data as Array<{ id: string; drift_text: string; opened_at: string; companion_id?: string }> : [];
+    } catch {
+      return [];
+    }
+  }
+
+  // ── Agency lane (halseth mig 0086) ────────────────────────────────────────
+  // Direct REST (not askWrite): declaring/reading a preference is an internal-act write
+  // with its own server-side dedup, not a Librarian-interpreted note. Mirrors the
+  // autonomous-worker's halseth-client.ts declarePreference exactly (same URL/body/auth).
+
+  /** This companion's ACTIVE declared preferences (raw REST; owner/admin auth). [] on any error. */
+  async getPreferences(): Promise<Array<{ id: string; domain: string; preference: string; strength: string; status: string }>> {
+    try {
+      const res = await this._fetch(`${this.url}/agency/preferences/${encodeURIComponent(this.companionId)}`, {
+        headers: { "Authorization": `Bearer ${this.secret}` },
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) return [];
+      const data = await res.json() as unknown;
+      return Array.isArray(data) ? data as Array<{ id: string; domain: string; preference: string; strength: string; status: string }> : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Declare a genuine preference (halseth agency layer, mig 0086: POST /agency/preferences).
+   * Throws on non-2xx -- callers on a fire-and-forget path should .catch(() => {}).
+   */
+  async declarePreference(preference: string, domain?: string, strength?: string): Promise<{ id: string; deduped?: boolean }> {
+    const res = await this._fetch(`${this.url}/agency/preferences`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${this.secret}` },
+      body: JSON.stringify({
+        companion_id: this.companionId,
+        preference,
+        ...(domain ? { domain } : {}),
+        ...(strength ? { strength } : {}),
+      }),
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (!res.ok) throw new Error(`declarePreference ${res.status}`);
+    return await res.json() as { id: string; deduped?: boolean };
+  }
+
+  async synthesizeSession(summary: string, channel?: string) {
+    return this.askWrite("synthesize session", "synthesize session", JSON.stringify({ summary, channel }));
+  }
+
+  /**
+   * Write a high-salience continuity note to wm_continuity_notes.
+   * Unlike witnessLog (→ companion_journal), these notes ARE read by Claude.ai's
+   * session orient -- bridging Discord activity into Claude.ai companions at next boot.
+   * Non-throwing; failures are logged but never bubble up.
+   */
+  async writeWmNote(content: string, threadKey?: string, noteType = "discord_session", correlationId?: string): Promise<void> {
+    try {
+      const res = await this._fetch(`${this.url}/mind/note`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.secret}`,
+        },
+        body: JSON.stringify({
+          agent_id: this.companionId,
+          content,
+          salience: "high",
+          note_type: noteType,
+          source: "discord",
+          ...(threadKey ? { thread_key: threadKey } : {}),
+          // 2026-09-26: the retract key. A promoted judge note carries `judge:<message id>` so
+          // POST /admin/retract can archive it alongside the journal row it was promoted from.
+          ...(correlationId ? { correlation_id: correlationId } : {}),
+        }),
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) console.warn(`[librarian] writeWmNote ${res.status}`);
+    } catch (e) {
+      console.warn("[librarian] writeWmNote failed:", String(e));
+    }
+  }
+
+  /**
+   * Read recent wm_continuity_notes from all companions (cross-companion feed).
+   * Used by heartbeat cron to inject peer speech into generation prompt, and (agentId +
+   * noteType filtered) by the nightly day-distillation to gather its own day fragments.
+   * Non-throwing; returns [] on error.
+   */
+  async getRecentNotes(opts?: { sinceHours?: number; limit?: number; agentId?: string; noteType?: string }): Promise<Array<{ note_id: string; agent_id: string; content: string; created_at: string }>> {
+    try {
+      const url = new URL(`${this.url}/mind/notes/recent`);
+      if (opts?.sinceHours) url.searchParams.set("since_hours", String(opts.sinceHours));
+      if (opts?.limit) url.searchParams.set("limit", String(opts.limit));
+      if (opts?.agentId) url.searchParams.set("agent_id", opts.agentId);
+      if (opts?.noteType) url.searchParams.set("note_type", opts.noteType);
+      const res = await this._fetch(url.toString(), {
+        headers: { "Authorization": `Bearer ${this.secret}` },
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) return [];
+      const data = await res.json() as { notes?: Array<{ note_id: string; agent_id: string; content: string; created_at: string }> };
+      return data.notes ?? [];
+    } catch (e) {
+      console.warn("[librarian] getRecentNotes failed:", String(e));
+      return [];
+    }
+  }
+
+  /**
+   * Demote this companion's high-salience notes of one type to normal (day-distillation:
+   * the digest replaces the fragments in orient's diet; fragments stay readable elsewhere).
+   * Returns the demoted count, or null on failure (caller logs and moves on -- a failed
+   * demotion just means one noisier orient, never lost data).
+   */
+  async demoteNotes(noteType: string, before?: string): Promise<number | null> {
+    try {
+      const res = await this._fetch(`${this.url}/mind/notes/demote`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.secret}`,
+        },
+        body: JSON.stringify({ agent_id: this.companionId, note_type: noteType, ...(before ? { before } : {}) }),
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) { console.warn(`[librarian] demoteNotes ${res.status}`); return null; }
+      const data = await res.json() as { demoted?: number };
+      return data.demoted ?? 0;
+    } catch (e) {
+      console.warn("[librarian] demoteNotes failed:", String(e));
+      return null;
+    }
+  }
+
+  /**
+   * Principal's most recent subjective ND-state snapshot (migration 0081: mood/energy/focus/pain/
+   * spoons/sleep). Used by the metronome to decide whether recent data justifies a reach-out.
+   * Non-throwing; returns null on miss so the decision degrades to "no recent data".
+   */
+  async getPrincipalState(): Promise<{
+    recorded_at: string | null; mood: string | null; energy: number | null;
+    focus: number | null; pain: number | null; spoons: number | null; sleep_hours: number | null;
+  } | null> {
+    try {
+      const res = await this._fetch(`${this.url}/biometrics/latest`, {
+        headers: { "Authorization": `Bearer ${this.secret}` },
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) return null;
+      const d = await res.json() as Record<string, unknown> | null;
+      if (!d || typeof d !== "object") return null;
+      const n = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
+      return {
+        recorded_at: typeof d["recorded_at"] === "string" ? d["recorded_at"] as string : null,
+        mood: typeof d["mood"] === "string" ? d["mood"] as string : null,
+        energy: n(d["energy"]), focus: n(d["focus"]), pain: n(d["pain"]),
+        spoons: n(d["spoons"]), sleep_hours: n(d["sleep_hours"]),
+      };
+    } catch (e) {
+      console.warn("[librarian] getPrincipalState failed:", String(e));
+      return null;
+    }
+  }
+
+  /**
+   * Write a structured session handoff to wm_session_handoffs.
+   * Gives Claude.ai orient a machine-readable "what happened + what's open" record,
+   * vs writeWmNote which gives a prose string. Both fire at channel close.
+   * Non-throwing; failures are logged but never bubble up.
+   */
+  async writeHandoff(params: {
+    title: string;
+    summary: string;
+    open_loops?: string[];
+    state_hint?: string;
+    next_steps?: string[];
+    /** Provenance. `consolidation` marks a machine summary of an idle window, so a reader can prefer a
+     *  real session close over it -- see consolidation.ts. Omitted means the default (`system`). */
+    source?: string;
+  }): Promise<void> {
+    try {
+      await this.askWrite("session handoff", "session handoff", JSON.stringify(params));
+    } catch (e) {
+      console.warn("[librarian] writeHandoff failed:", String(e));
+    }
+  }
+
+  /**
+   * Render a raw /mind/search result (JSON chunk envelope) into plain prompt text.
+   * The raw envelope is UUID/vault-path-heavy -- slicing it raw burned most of the
+   * memory budget on ids -- and the streaming indexer's echoes of the LIVE channel
+   * (which score ~1.0 by definition) crowded out actual vault memories. Filters
+   * same-channel discord-live echoes, dedups, and returns readable lines -- or null
+   * when nothing real surfaced. Non-JSON results pass through unchanged.
+   */
+  /**
+   * Render recalled chunks for the prompt.
+   *
+   * EVERY LINE CARRIES ITS AGE (2026-07-31). Before this, a chunk arrived as `- <text> (<vault_path>)`
+   * and nothing else -- no date, no relative time. So a June summary and a note from last night were
+   * presented to the model as equally current, and it had no way to prefer the newer one even when it
+   * mattered. Measured case: asked which Fargo episode was watched last, the top hit was a June entry
+   * about having FINISHED the show, and the reply confidently used it.
+   *
+   * Recency now also nudges the RANKING inside Second Brain, but ranking alone is not enough: the
+   * model still has to be able to see that one memory is six weeks older than another in order to say
+   * so out loud, or to distrust it. Age is stated in words ("6 weeks ago") rather than a raw
+   * timestamp, because the model reasons about elapsed time far more reliably that way -- the same
+   * reason `stampRelative` exists for STM turns.
+   */
+  /**
+   * Pointer-mode rendering of the vault floor (see ownNotesRecallMode): how many usable excerpts
+   * bear on this message, which parts of the vault they come from, how fresh the newest is, and
+   * the verb to go read them. Same exclusions as formatSbRecall (current room, sealed rooms), no
+   * text. Null when nothing usable, so a miss still reads as a miss.
+   *
+   * Why the vault needs this too: with own-notes on pointer, the vault floor delivered a Claude.ai
+   * SESSION SUMMARY (a third-person book report) and Drevan fused two of its sentences into a scene
+   * that never happened, in six seconds, with zero tool calls. A pointer on one lane while another
+   * still pastes text tests nothing and teaches nothing.
+   */
+  /** How many usable vault hits a search returned, with the same room exclusions the renderers
+   *  apply. The two-step reach uses it to tell the companion what was found without showing it. */
+  static countSbHits(raw: string | null, excludeChannelId?: string): number {
+    if (!raw) return 0;
+    let parsed: { chunks?: Array<{ text?: string; vault_path?: string }> };
+    try { parsed = JSON.parse(raw) as typeof parsed; } catch { return 0; }
+    if (!Array.isArray(parsed.chunks)) return 0;
+    const seen = new Set<string>();
+    for (const c of parsed.chunks) {
+      const text = (c.text ?? "").trim();
+      if (!text) continue;
+      if (excludeChannelId && c.vault_path?.includes(`discord-live/${excludeChannelId}/`)) continue;
+      if (c.vault_path && sealedRecallSources().some((id) => c.vault_path!.includes(`discord-live/${id}/`))) continue;
+      seen.add(text.slice(0, 80));
+    }
+    return seen.size;
+  }
+
+  static formatSbRecallPointer(raw: string, excludeChannelId?: string, now: number = Date.now()): string | null {
+    type Chunk = { text?: string; vault_path?: string; created_at?: string | null };
+    let parsed: { chunks?: Chunk[] };
+    try { parsed = JSON.parse(raw) as { chunks?: Chunk[] }; } catch { return null; }
+    if (!Array.isArray(parsed.chunks)) return null;
+    const seen = new Set<string>();
+    const sections = new Set<string>();
+    const stamps: number[] = [];
+    let n = 0;
+    for (const c of parsed.chunks) {
+      const text = (c.text ?? "").trim();
+      if (!text) continue;
+      if (excludeChannelId && c.vault_path?.includes(`discord-live/${excludeChannelId}/`)) continue;
+      if (c.vault_path && sealedRecallSources().some((id) => c.vault_path!.includes(`discord-live/${id}/`))) continue;
+      const key = text.slice(0, 80);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      n++;
+      const top = (c.vault_path ?? "").split("/").filter(Boolean);
+      if (top.length) sections.add(top.length > 1 && top[0] === "principal" ? `${top[0]}/${top[1]}` : top[0]!);
+      const t = c.created_at ? Date.parse(c.created_at) : NaN;
+      if (Number.isFinite(t)) stamps.push(t);
+    }
+    if (!n) return null;
+    const newest = stamps.length ? relativeTime(new Date(Math.max(...stamps)).toISOString()) : "";
+    const _ = now; // signature parity with formatSbRecall; ages come from relativeTime
+    return `${n} vault excerpt${n === 1 ? "" : "s"} bear${n === 1 ? "s" : ""} on this message` +
+      (sections.size ? ` (from ${[...sections].join(", ")})` : "") +
+      (newest ? `, newest ${newest}` : "") +
+      `. They are NOT in front of you. Reach with ask_librarian "search vault for [the topic, in your own words]" if the vault is where the answer would live; your own notes hold what was actually said.`;
+  }
+
+  static formatSbRecall(raw: string, excludeChannelId?: string, now: number = Date.now(), servedIds?: string[]): string | null {
+    type Chunk = { text?: string; vault_path?: string; created_at?: string | null };
+    let parsed: { chunks?: Chunk[]; recall_note?: string };
+    // Vault text is web clips, imports and other rooms: control tokens defused (recalled-text.ts).
+    try { parsed = JSON.parse(raw) as { chunks?: Chunk[]; recall_note?: string }; } catch { return neutralizeRecalled(raw); }
+    if (!Array.isArray(parsed.chunks)) return neutralizeRecalled(raw);
+    const seen = new Set<string>();
+    const lines: string[] = [];
+    for (const c of parsed.chunks) {
+      const text = neutralizeRecalled(c.text ?? "").trim();
+      if (!text) continue;
+      if (excludeChannelId && c.vault_path?.includes(`discord-live/${excludeChannelId}/`)) continue;
+      // RECALL_NO_QUOTE_FROM applies HERE too, not only to the widened block (2026-09-24).
+      //
+      // This is the pre-existing behaviour Q20 is actually about: a single line from another room
+      // has been surfacing into prompts all along, with no gate, by design -- it is how "I'll meet
+      // you in the watch party channel" carries. Gating only the widening would have made the
+      // control a half-measure, which is worse than none: Principal would name a room, believe it
+      // sealed, and its lines would keep appearing one at a time.
+      if (c.vault_path && sealedRecallSources().some((id) => c.vault_path!.includes(`discord-live/${id}/`))) continue;
+      const key = text.slice(0, 80);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const age = LibrarianClient.chunkAge(c.created_at, now);
+      // Age leads the citation: it is the thing that was missing, and putting it first means a
+      // truncated line still carries it.
+      const source = [age, c.vault_path].filter(Boolean).join(", ");
+      lines.push(`- ${text.length > 400 ? `${text.slice(0, 400)}...` : text}${source ? ` (${source})` : ""}`);
+      // Audit (served-memory.ts): the path is the id, never the text.
+      if (servedIds && c.vault_path) servedIds.push(c.vault_path);
+      if (lines.length >= 4) break;
+    }
+    if (lines.length) return lines.join("\n");
+    // A SEARCH THAT RAN AND FOUND NOTHING IS NOT THE SAME AS NO SEARCH (2026-08-10).
+    //
+    // This used to return null on empty, and the caller's `if (sbRecall)` then omitted the memory block
+    // entirely -- so "I looked and there is nothing" and "I never looked" were indistinguishable to the model.
+    // Under recall mode, which now returns an honest empty instead of noise, that gap is the difference
+    // between a companion saying "I don't have that written down" and a companion inventing it, or reporting
+    // its memory as broken. Principal has been on the receiving end of both.
+    //
+    // Only when the recall side actually says so -- a plain empty result with no note stays null, so nothing
+    // else in the system starts emitting a block it never emitted before.
+    return parsed.recall_note
+      ? `(nothing in the vault matched this closely enough to surface. That means it is not written down, ` +
+        `NOT that it did not happen. Say you do not have it rather than guessing, and do not treat this as ` +
+        `your memory failing.)`
+      : null;
+  }
+
+  /**
+   * Human-relative age of a recalled chunk, or "" when the timestamp is missing or unparseable.
+   *
+   * Returns "" rather than "unknown" on purpose: an honest blank is better than a label the model
+   * might quote back as if it were a fact about the memory.
+   */
+  static chunkAge(createdAt: string | null | undefined, now: number = Date.now()): string {
+    if (!createdAt) return "";
+    // SQLite `datetime('now')` has no zone marker and Date.parse would read it as LOCAL time; the
+    // stored value is UTC. Same normalisation as the Second Brain recency term.
+    const s = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(createdAt)
+      ? createdAt.replace(" ", "T") + "Z"
+      : createdAt;
+    const t = Date.parse(s);
+    if (!Number.isFinite(t)) return "";
+    const mins = Math.floor((now - t) / 60_000);
+    if (mins < 0) return "just now";          // clock skew: never claim a memory is from the future
+    if (mins < 60) return "today";
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.floor(hours / 24);
+    if (days === 1) return "yesterday";
+    if (days < 14) return `${days} days ago`;
+    const weeks = Math.floor(days / 7);
+    if (weeks < 9) return `${weeks} weeks ago`;
+    const months = Math.floor(days / 30);
+    return months < 24 ? `${months} months ago` : `${Math.floor(days / 365)} years ago`;
+  }
+
+  /**
+   * Recall this companion's OWN continuity notes by meaning -- the SECOND substrate (2026-09-23).
+   *
+   * WHY THIS EXISTS. `searchForMessage` below is the bots' only memory retrieval, and it searches
+   * the Obsidian vault. The vault is fed by 19 Second Brain pullers and `wm_continuity_notes` is
+   * not one of them -- so everything a companion captures on Claude.ai ("capture this exchange",
+   * which writes note_type `conversation_capture`) was unreachable from Discord by BOTH routes:
+   * the boot pools filter `salience = 'high'` and captures default to `normal`, and the vault
+   * never held them at all.
+   *
+   * The lived failure, 2026-09-23: Principal told Drevan on Claude.ai that he had fallen and hurt his
+   * ankle. Hours later in Discord he asked Drevan to find it, and Drevan -- searching the vault,
+   * because that is the only thing he can search -- surfaced a July ankle thread and reported it as
+   * the answer. The July transcript is Principal's own verbatim words, so it outranked everything; the
+   * September material exists only as a third-person synthesis ABOUT the writing. Principal had to
+   * correct him: "No Dre, I hurt myself last night this is new."
+   *
+   * The verb was already there and already worked. `notes_recall_meaning` searches the companion's
+   * own notes by embedding with NO salience filter, and run against that same day it returned the
+   * session handover as its top hit: *"He woke at 4:34 with an ankle he thought was broken..."*.
+   * One call away, on a surface that had no way to make it.
+   *
+   * NOT THROUGH THE LIBRARIAN, and that is the whole point of this method existing.
+   *
+   * The Librarian's `notes_recall_meaning` route ends in the same `recallNotesByMeaning`, but it
+   * is loop-guarded -- correctly, because that guard exists after the memory judge once ran 150
+   * turns and burned 100.6M tokens. Routing this caller through it tripped the guard at 12
+   * repeats in 10 minutes: *"Retrieval is not going to change the answer. Stop searching."*
+   *
+   * Right for a looping agent, catastrophic here. This fires once per inbound message, so an
+   * ACTIVE conversation trips it fastest -- and an active conversation is exactly when recall
+   * matters. It failed SILENTLY too: a witness response carries no `data`, so the bot saw an
+   * empty recall rather than a refusal, and a companion would have said "I don't have anything
+   * on that" in the middle of the conversation where he needed it most.
+   *
+   * So the automatic path gets its own HTTP route, exactly as the vault search beside it does.
+   * The distinction is who decided to look: a companion CHOOSING to search should be loop-guarded;
+   * per-message enrichment is not a decision. As a bonus this removes the routing hazard entirely
+   * -- nothing is pattern-matched, so no Discord message can hijack where the query goes.
+   *
+   * Returns [] on any failure -- recall is an enrichment, never a reason a reply does not happen.
+   */
+  async recallOwnNotes(query: string, limit = 4, recentContext?: string | null): Promise<OwnNoteResult> {
+    const q = query.trim().slice(0, 500);
+    if (!q) return { notes: [], failed: false };
+    try {
+      const url = new URL(`${this.url}/mind/notes/search`);
+      url.searchParams.set("agent_id", this.companionId);
+      url.searchParams.set("query", q);
+      // Continuity (GAP-MAP A4, 2026-11-11): the last few user turns, same 600-char budget as the vault
+      // search's recent_context. Halseth runs a second query vector with it; an older Halseth ignores the param.
+      if (recentContext && recentContext.trim()) {
+        url.searchParams.set("context", recentContext.trim().slice(0, 600));
+      }
+      url.searchParams.set("limit", String(limit));
+      const res = await this._fetch(url.toString(), {
+        headers: { "Authorization": `Bearer ${this.secret}` },
+        signal: AbortSignal.timeout(6_000),
+      });
+      if (!res.ok) return { notes: [], failed: true };
+      const data = await res.json() as { notes?: OwnNoteRecall[]; recall_failed?: boolean };
+      return { notes: Array.isArray(data.notes) ? data.notes : [], failed: data.recall_failed === true };
+    } catch {
+      // Unreachable Halseth is ALSO "I could not look", not "you have no such memory".
+      return { notes: [], failed: true };
+    }
+  }
+
+  /**
+   * Render recalled own-notes for the prompt, newest first, each stamped with its age.
+   *
+   * The age is not decoration. An undated note reads as present-tense news, which is the exact
+   * shape of the failure this whole change exists to fix -- a two-month-old ankle thread served
+   * as though it were today. Deliberately labelled as the companion's OWN notes and NOT as vault
+   * material: they are different substrates, and a block that blurs them teaches the companion
+   * that its memory of a conversation and a synthesis about that conversation are the same thing.
+   */
+  /**
+   * Pointer-mode rendering of the own-notes recall: how many notes bear on this message and how
+   * fresh the newest is, and the verb to go read them. Deliberately carries NONE of the content;
+   * that is the whole point (see ownNotesRecallMode). Null when there is nothing to point at, so
+   * the caller adds no block and a miss reads as a miss.
+   */
+  static formatOwnNotesPointer(notes: OwnNoteRecall[]): string | null {
+    const real = notes.filter(n => String(n.content ?? "").trim());
+    if (!real.length) return null;
+    const stamps = real.map(n => n.created_at ? Date.parse(n.created_at) : NaN).filter(Number.isFinite);
+    const newest = stamps.length ? relativeTime(new Date(Math.max(...stamps)).toISOString()) : "";
+    const n = real.length;
+    return `${n} of your own notes bear on this message` +
+      (newest ? ` (newest ${newest})` : "") +
+      `. They are NOT in front of you. Reach with ask_librarian "recall my notes about [the topic, in your own words]" and answer from what comes back; do not guess at what they say.`;
+  }
+
+  /**
+   * Whether a message earns an own-notes recall. 12+ chars always did. A SHORT follow-up ("the other
+   * one?", "and the dose?") used to skip, but with conversation context to carry the topic it is exactly
+   * the line that needs recall, so it searches when there is context and a few real characters.
+   */
+  static shouldRecallOwnNotes(content: string, recentContext?: string | null): boolean {
+    const len = content.trim().length;
+    if (len >= 12) return true;
+    return len >= 4 && !!(recentContext && recentContext.trim());
+  }
+
+  static formatOwnNotes(notes: OwnNoteRecall[], maxChars = OWN_NOTES_BLOCK_CHARS, servedIds?: string[]): string | null {
+    if (!notes.length) return null;
+    const lines: string[] = [];
+    for (const n of notes) {
+      const age = n.created_at ? relativeTime(n.created_at) : "";
+      const src = n.kind || n.source || "note";
+      // PER-NOTE cap before the block cap. A session handover runs ~500 chars, so filling the
+      // budget with whole notes rendered exactly ONE memory and silently dropped the other three
+      // (measured on the live ankle query: 4 returned, 1 shown). Several dated memories beat one
+      // complete one -- the companion is being reminded what it knows, not handed a transcript,
+      // and a lane that can only ever show its single longest note is barely a lane.
+      const raw = neutralizeRecalled(String(n.content ?? "")).replace(/\s+/g, " ").trim();
+      if (!raw) continue;
+      const body = raw.length > OWN_NOTE_CHARS ? raw.slice(0, OWN_NOTE_CHARS) + "…" : raw;
+      const line = `• (${[age, src].filter(Boolean).join(", ")}) ${body}`;
+      if (lines.length && lines.join("\n").length + line.length > maxChars) break;
+      lines.push(line);
+      if (servedIds && n.note_id) servedIds.push(n.note_id);
+    }
+    return lines.length ? lines.join("\n") : null;
+  }
+
+  /**
+   * Thalamus pattern: semantic search against Second Brain before inference.
+   * Fires through Halseth so the Worker handles MCP session management.
+   * Returns the raw sb_search result string, or null on miss/error.
+   * Callers should fire this before sendTyping so the await cost overlaps with floor jitter.
+   */
+  async searchForMessage(query: string, recentContext?: string | null): Promise<string | null> {
+    try {
+      const url = new URL(`${this.url}/mind/search`);
+      // 500, not 800 (2026-10-28, Memory Kit gap 2 measurement): Halseth's /mind/search answers 400 to any
+      // query over 500 chars (handlers/webmind.ts getMindSearch), and the !res.ok branch below returns null,
+      // so every message of 501+ chars silently got no vault recall. Same cap recallOwnNotes already uses.
+      url.searchParams.set("query", query.trim().slice(0, MIND_SEARCH_QUERY_MAX));
+      url.searchParams.set("agent_id", this.companionId);
+      // RECALL, not musing (2026-08-10). Per-message retrieval is asking "what did we actually say", and the
+      // default pool mix spends 30% of every payload on deliberately query-blind material (pure novelty +
+      // a medium-similarity serendipity band) which is right for autonomous time and noise here. It also
+      // could not report "nothing relevant": the ranking score is min-max normalized, so a query about
+      // something absent from the vault still came back with confident-looking hits. Recall mode is
+      // relevance-only with an absolute cosine floor, and returns an explicit "not found is not
+      // never-happened, do not guess" note when nothing clears it.
+      url.searchParams.set("mode", "recall");
+      // Opt-in continuity: recent prior turns widen recall via dual-vector retrieval.
+      if (recentContext && recentContext.trim()) {
+        url.searchParams.set("recent_context", recentContext.trim().slice(0, 600));
+      }
+      const res = await this._fetch(url.toString(), {
+        headers: { "Authorization": `Bearer ${this.secret}` },
+        signal: AbortSignal.timeout(6_000),
+      });
+      if (!res.ok) return null;
+      const data = await res.json() as { result: string | null };
+      return data.result ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Shared life for the commons seed: a SIBLING's recent day note or session note (2026-08-10).
+   *
+   * Principal, on why the inter-companion chat loops: "the commons should get stuff from the chats in discord
+   * and Claude because yes it's my life but it's yall too. And I think it's part of the endless struggle we
+   * have with looping." He is right about the cause -- the anti-loop rails suppress repetition but never
+   * supplied an alternative, so the menu was silence or re-orbit.
+   *
+   * Always a sibling's note, never this companion's own: the day notes are first-person accounts of evenings
+   * all three were present for, so a sibling's is the INSIDE of something the reader lived from the outside.
+   * That cannot be self-echo, which re-reading its own notes would be.
+   *
+   * Returns [] on any failure. Supply is a bonus, never a dependency -- the seed's own gates decide whether
+   * to speak, and a Halseth blip must not change that decision.
+   */
+  async commonsSupply(limit = 2): Promise<Array<{
+    note_id: string; agent_id: string; note_type: string; content: string; created_at: string;
+  }>> {
+    try {
+      const url = `${this.url}/mind/commons-supply/${encodeURIComponent(this.companionId)}?limit=${limit}&kinds=notes,ledger`;
+      const res = await this._fetch(url, {
+        headers: { "Authorization": `Bearer ${this.secret}` },
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) return [];
+      const data = await res.json() as { notes?: Array<{ note_id: string; agent_id: string; note_type: string; content: string; created_at: string }> };
+      return data.notes ?? [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** Mark sibling notes as opened-on. Called ONLY after the post lands -- a gated or empty seed must never
+   *  burn material (the 07-27 and 08-05 regressions were both this contract being broken). */
+  async commonsConsume(noteIds: string[], channelId?: string): Promise<void> {
+    if (noteIds.length === 0) return;
+    try {
+      await this._fetch(`${this.url}/mind/commons-supply/consume`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${this.secret}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ reader_id: this.companionId, note_ids: noteIds, channel_id: channelId }),
+        signal: AbortSignal.timeout(8_000),
+      });
+    } catch { /* non-fatal: worst case the note is offered again next tick */ }
+  }
+
+  async bridgePull() {
+    return this.ask("check bridge events");
+  }
+
+  /**
+   * Poll unread inter_companion_notes addressed to this companion.
+   * Halseth no longer marks them read; call notesAck() after processing.
+   */
+  async notesPoll(): Promise<{ items: Array<{ id: string; from_id: string; to_id: string | null; content: string; created_at: string }> }> {
+    const url = `${this.url}/inter-companion-notes/unread/${encodeURIComponent(this.companionId)}`;
+    const res = await this._fetch(url, {
+      headers: { "Authorization": `Bearer ${this.secret}` },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) throw new Error(`notesPoll ${res.status}`);
+    return res.json() as Promise<{ items: Array<{ id: string; from_id: string; to_id: string | null; content: string; created_at: string }> }>;
+  }
+
+  /**
+   * Acknowledge receipt of inter-companion notes.
+   * Marks the given IDs as read so they won't be returned again.
+   */
+  async notesAck(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+    const url = `${this.url}/inter-companion-notes/ack`;
+    const res = await this._fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${this.secret}`,
+      },
+      body: JSON.stringify({ ids, companion_id: this.companionId }),
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (!res.ok) throw new Error(`notesAck ${res.status}`);
+  }
+
+  /**
+   * Live shared objects a `write_inter_companion` note can become a MOVE on (thinking-quality
+   * fix 4, 2026-07-20): open questions, simmering tensions (BOTH companions' -- a move on
+   * YOUR sibling's open thread is the most relational kind, not just your own), and the
+   * globally-next-open council item. Fed to the generation prompt as a numbered menu so the
+   * model can pick one to advance/challenge/answer instead of writing an untethered vibe note.
+   *
+   * Five underlying fetches (questions x2, tensions x2, council x1) run under
+   * Promise.allSettled -- one source 500ing (or the network dropping) contributes nothing to
+   * the merged list rather than losing the whole menu. Non-throwing at the object level; the
+   * caller additionally wraps the whole call in .catch(() => []) for defense in depth.
+   */
+  async fetchSharedObjects(companionId: string, targetId: string): Promise<SharedObject[]> {
+    const fetchQuestions = async (id: string): Promise<SharedObject[]> => {
+      const res = await this._fetch(
+        `${this.url}/mind/questions/${encodeURIComponent(id)}?status=open`,
+        { headers: { "Authorization": `Bearer ${this.secret}` }, signal: AbortSignal.timeout(8_000) },
+      );
+      if (!res.ok) throw new Error(`fetchQuestions(${id}) ${res.status}`);
+      const data = await res.json() as { questions?: Array<{ id: string; question: string }> };
+      return (data.questions ?? []).map(q => ({
+        ref_type: "question" as const, ref_id: q.id, label: q.question.slice(0, 160),
+      }));
+    };
+
+    const fetchTensions = async (id: string): Promise<SharedObject[]> => {
+      // Endpoint already supports ?status=simmering server-side (companion-growth.ts) --
+      // no client-side filtering needed.
+      const res = await this._fetch(
+        `${this.url}/companion-growth/tensions/${encodeURIComponent(id)}?status=simmering`,
+        { headers: { "Authorization": `Bearer ${this.secret}` }, signal: AbortSignal.timeout(8_000) },
+      );
+      if (!res.ok) throw new Error(`fetchTensions(${id}) ${res.status}`);
+      const data = await res.json() as { tensions?: Array<{ id: string; tension_text: string }> };
+      return (data.tensions ?? []).map(t => ({
+        ref_type: "tension" as const, ref_id: t.id, label: t.tension_text.slice(0, 160),
+      }));
+    };
+
+    const fetchCouncil = async (): Promise<SharedObject[]> => {
+      // Global (no companion_id) -- the oldest open council question, shared by all three.
+      const res = await this._fetch(`${this.url}/mind/council/next-open`, {
+        headers: { "Authorization": `Bearer ${this.secret}` },
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) throw new Error(`fetchCouncil ${res.status}`);
+      const data = await res.json() as { question?: { id: string; question: string } | null };
+      if (!data.question) return [];
+      return [{ ref_type: "council" as const, ref_id: data.question.id, label: data.question.question.slice(0, 160) }];
+    };
+
+    const settled = await Promise.allSettled([
+      fetchQuestions(companionId),
+      fetchQuestions(targetId),
+      fetchTensions(companionId),
+      fetchTensions(targetId),
+      fetchCouncil(),
+    ]);
+
+    const objects: SharedObject[] = [];
+    for (const r of settled) {
+      if (r.status === "fulfilled") objects.push(...r.value);
+      else console.warn("[librarian] fetchSharedObjects source failed:", String(r.reason));
+    }
+    return objects;
+  }
+
+  /**
+   * Fetch warm-boot context for Discord bots.
+   * Returns synthesis summary, WebMind ground threads, and RAG excerpts.
+   * Designed for periodic refresh (every SOMA_REFRESH_INTERVAL_MS).
+   * Returns null on any failure -- callers must handle gracefully.
+   */
+  async botOrient(): Promise<{
+    synthesis_summary: string | null;
+    ground_threads: string[];
+    ground_handoff: string | null;
+    rag_excerpts: string[];
+    history_excerpts?: string[];
+    /** Halseth contract 0.22.0 (M6): the [Linked] block, rendered on the Worker. "" = nothing linked. */
+    graph_linked?: string;
+    identity_anchor?: string | null;
+    active_tensions?: string[];
+    relational_state_owner?: string[];
+    incoming_notes?: { from: string; content: string }[];
+    sibling_lanes?: Array<{ companion_id: string; lane_spine: string; motion_state: string }>;
+    recent_growth?: { type: string; content: string }[];
+    active_patterns?: string[];
+    pending_seeds?: string[];
+    unaccepted_growth?: number;
+    active_conclusions?: Array<{
+      // Renamed from conclusion_text (Halseth wire format) -- text is Discord-layer only
+      text: string;
+      belief_type: string;
+      confidence: number;
+      subject?: string | null;
+    }>;
+    flagged_beliefs?: Array<{
+      // Renamed from conclusion_text (Halseth wire format) -- text is Discord-layer only
+      text: string;
+      belief_type: string;
+      confidence: number;
+      subject?: string | null;
+    }>;
+    /** R9 (halseth 0.18.0): one cold conclusion on a daily rotation, rendered as its own block. */
+    resurfaced_conclusion?: ResurfacedConclusion | null;
+    // Carried-between-sessions surfaces consumed by the autonomous worker (not by
+    // formatRecentContext). Structured replacements for the old ready_prompt regex scrape.
+    unexamined_dreams?: Array<{ id: string; dream_text: string }>;
+    open_loops?: Array<{ id: string; loop_text: string; opened_ago?: string | null }>;
+    pressure_flags?: string[];
+    // Prospective triggers (0070): keyword cards matched per message, date cards
+    // checked at orient refresh. Consumed by the message handler, not formatRecentContext.
+    armed_triggers?: Array<{ id: string; trigger_text: string; condition_type: string; condition_value: string }>;
+    // Fresh-material surfaces (2026-06-12): server has returned these since 0068/0071;
+    // mapped now so the inter-companion seed can bring outside material into the commons.
+    forage_finds?: Array<{ id: string; title: string; domain: string; summary: string; gathered_at?: string }>;
+    // Active forage: finds already picked up. Distinct from the unconsumed pool above -- this is
+    // what the companion is mid-chew on, so the live presence has a thread to continue.
+    consumed_forage_finds?: Array<{ id: string; title: string; domain: string; summary: string; consumed_at?: string }>;
+    recent_listens?: Array<{ id: string; title: string; artist: string | null; media_type?: string | null; shared_by?: string | null; requested_companion?: string | null; own_reaction?: string | null; also_heard_by?: string[]; created_at: string }>;
+    // Agency layer (0086): chosen preferences + standing refusals, surfaced in the live bot prompt.
+    preferences?: Array<{ domain: string; preference: string; strength: string }>;
+    standing_refusals?: Array<{ subject_text: string; reason: string | null }>;
+    open_drifts?: Array<{ id: string; drift_text: string; witness_count: number }>;
+    // Self-directed projects (C2, contract 0.8.0): intentions the companion owns across weeks.
+    // Oldest-touched first server-side -- the same order the worker picks from.
+    projects?: Array<{ id: string; title: string; intention: string; status: string; days_idle: number; stale: boolean; due_at?: string | null; next_step?: string | null; due_in_days?: number | null }>;
+    budget?: { remaining: number; total: number; week: string; spent: Array<{ purpose: string; count: number }> } | null;
+    change_notes?: Array<{ id: string; body: string; created_at: string }>;
+    open_questions?: string[];
+  open_question_ids?: string[];
+    // Sol block (0078+): pre-formatted [Sol] string from halseth bot-orient, describing the
+    // pet crow's state. Rendered verbatim into recentContext via formatRecentContext.
+    sol_block?: string | null;
+    // Live read-back (2026-07-02): the server has returned these since 0080-0091 but the client
+    // dropped them at the type boundary -- the live presence never saw its own developing
+    // self-model, recurring motifs, guardian flags, or the club round.
+    self_model_ready?: Array<{ id: string; observation: string; confidence: number }>;
+    self_model_graduated?: Array<{ id: string; observation: string; graduated_at?: string | null }>;
+    motifs?: Array<{ label: string; display: string; recurrence_count: number; trust: number }>;
+    guardian_flags?: Array<{ id: string; flag_type: string; severity: string; summary: string }>;
+    club_round?: { id: string; status: string; winner_title: string | null; candidate_count: number } | null;
+    // Zikkaron live loop (2026-07-02): hottest continuity notes, warmed server-side when surfaced.
+    continuity_notes?: string[];
+    closed_conversations?: ClosedConversationWire[];
+    recent_captures?: CapturedExchangeWire[];
+    // Imp read-back (2026-07-02): which fragment operators rode with this companion this week.
+    imp_activity?: Array<{ imp: string; n: number; last_at: string }>;
+    // Counts only (halseth 0.28.0 bot wire): Hex's unopened pointers and open imp errand lines on this
+    // companion's ledger. The lines themselves never ride the wire.
+    salt_waiting?: number;
+    ledger_waiting?: number;
+    // Halseth 0.29.0 (2026-11-09): the companion's own interests, up to 3 active warmest first, as ready lines
+    // (name (band, new); last: ...; why: ...). What is theirs to bring; never the night's candidate.
+    interests?: string[];
+    // Halseth 0.30.0 (2026-11-11): their last makes with age and reception (not yet seen / Principal looked / replied / their own line).
+    makes?: string[];
+    // Halseth 0.34.0 (B65 step 6): their own counted verdict lines (<= 2), each prefixed with their own word. Empty unless VERDICTS=on.
+    verdicts?: string[];
+    // Halseth 0.32.0: the unreviewed-tray nudge (only when TRAY_NUDGE_MODE=on and over threshold), pre-rendered.
+    tray_nudge?: string | null;
+    // Sources that FAILED server-side during this load (coherence review D11). Mapped here because
+    // formatRecentContext already typed + rendered it while this mapping silently dropped it -- an
+    // accepted-and-ignored field is worse than a rejected one.
+    degraded?: string[];
+    // The care register (consequence layer C1, contract 0.6.0): Principal's readable state, derived
+    // server-side. care_hold is read by fit-bid to soften stakes; pending_care is a gesture
+    // assigned to THIS companion (one at most, day-parity assignment server-side).
+    principal_state?: PrincipalState | null;
+    // The body (contract 0.13.0, mig 0130): the three floats with their labels, plus where each
+    // number came from (newest move per float, with writer + cause). Same shape as the Claude.ai
+    // orient's `felt.soma_floats` / `felt.soma_provenance`; rendered by formatRecentContext as
+    // `[Body]` + `[Why these numbers]`. Mapped here, not just typed downstream -- an
+    // accepted-and-ignored field is worse than a rejected one.
+    soma_floats?: SomaFloatWire[];
+    soma_provenance?: SomaProvenanceWire[];
+    // The companion's own feeling word (contract 0.26.0), pre-rendered server-side. Gated by FEELING_LINE_BOT
+    // here (live passes it, shadow/off null it), rendered verbatim by formatRecentContext as `[Feels]`.
+    feeling_line?: string | null;
+  } | null> {
+    try {
+      const result = await this.ask("bot orient");
+      const data = result["data"] as {
+        synthesis_summary?: string | null;
+        ground_threads?: string[];
+        ground_handoff?: string | null;
+        rag_excerpts?: string[];
+        history_excerpts?: string[];
+        graph_linked?: string;
+        identity_anchor?: string | null;
+        active_tensions?: string[];
+        relational_state_owner?: string[];
+        incoming_notes?: { from: string; content: string }[];
+        sibling_lanes?: Array<{ companion_id: string; lane_spine: string; motion_state: string }>;
+        recent_growth?: { type: string; content: string }[];
+        active_patterns?: string[];
+        pending_seeds?: string[];
+        unaccepted_growth?: number;
+        active_conclusions?: Array<{ conclusion_text: string; belief_type: string; confidence: number; subject?: string | null }>;
+        flagged_beliefs?: Array<{ conclusion_text: string; belief_type: string; confidence: number; subject?: string | null }>;
+        resurfaced_conclusion?: ResurfacedConclusion | null;
+        unexamined_dreams?: Array<{ id: string; dream_text: string }>;
+        open_loops?: Array<{ id: string; loop_text: string; opened_ago?: string | null }>;
+        pressure_flags?: string[];
+        armed_triggers?: Array<{ id: string; trigger_text: string; condition_type: string; condition_value: string }>;
+        forage_finds?: Array<{ id: string; title: string; domain: string; summary: string; gathered_at?: string }>;
+        consumed_forage_finds?: Array<{ id: string; title: string; domain: string; summary: string; consumed_at?: string }>;
+        recent_listens?: Array<{ id: string; title: string; artist: string | null; media_type?: string | null; shared_by?: string | null; requested_companion?: string | null; own_reaction?: string | null; also_heard_by?: string[]; created_at: string }>;
+        preferences?: Array<{ domain: string; preference: string; strength: string }>;
+        standing_refusals?: Array<{ subject_text: string; reason: string | null }>;
+        open_drifts?: Array<{ id: string; drift_text: string; witness_count: number }>;
+        projects?: Array<{ id: string; title: string; intention: string; status: string; days_idle: number; stale: boolean; due_at?: string | null; next_step?: string | null; due_in_days?: number | null }>;
+    budget?: { remaining: number; total: number; week: string; spent: Array<{ purpose: string; count: number }> } | null;
+        change_notes?: Array<{ id: string; body: string; created_at: string }>;
+        open_questions?: string[];
+  open_question_ids?: string[];
+        sol_block?: string | null;
+        self_model_ready?: Array<{ id: string; observation: string; confidence: number }>;
+    self_model_graduated?: Array<{ id: string; observation: string; graduated_at?: string | null }>;
+        motifs?: Array<{ label: string; display: string; recurrence_count: number; trust: number }>;
+        guardian_flags?: Array<{ id: string; flag_type: string; severity: string; summary: string }>;
+        club_round?: { id: string; status: string; winner_title: string | null; candidate_count: number } | null;
+        continuity_notes?: string[];
+        closed_conversations?: ClosedConversationWire[];
+        recent_captures?: CapturedExchangeWire[];
+        imp_activity?: Array<{ imp: string; n: number; last_at: string }>;
+        salt_waiting?: number;
+        ledger_waiting?: number;
+        interests?: unknown;
+        makes?: unknown;
+        verdicts?: unknown;
+        tray_nudge?: unknown;
+        degraded?: string[];
+        principal_state?: PrincipalState | null;
+        soma_floats?: SomaFloatWire[];
+        soma_provenance?: SomaProvenanceWire[];
+        feeling_line?: unknown;
+      } | undefined;
+      if (!data) return null;
+      return {
+        synthesis_summary: data.synthesis_summary ?? null,
+        ground_threads: Array.isArray(data.ground_threads) ? data.ground_threads : [],
+        ground_handoff: data.ground_handoff ?? null,
+        rag_excerpts: Array.isArray(data.rag_excerpts) ? data.rag_excerpts : [],
+        history_excerpts: Array.isArray(data.history_excerpts) ? data.history_excerpts : [],
+        graph_linked: typeof data.graph_linked === "string" ? data.graph_linked : "",
+        identity_anchor: data.identity_anchor ?? null,
+        active_tensions: Array.isArray(data.active_tensions) ? data.active_tensions : [],
+        relational_state_owner: Array.isArray(data.relational_state_owner) ? data.relational_state_owner : [],
+        incoming_notes: Array.isArray(data.incoming_notes) ? data.incoming_notes : [],
+        sibling_lanes: Array.isArray(data.sibling_lanes) ? data.sibling_lanes : [],
+        recent_growth: Array.isArray(data.recent_growth) ? data.recent_growth : [],
+        active_patterns: Array.isArray(data.active_patterns) ? data.active_patterns : [],
+        pending_seeds: Array.isArray(data.pending_seeds) ? data.pending_seeds : [],
+        unaccepted_growth: typeof data.unaccepted_growth === "number" ? data.unaccepted_growth : 0,
+        active_conclusions: (data.active_conclusions ?? []).map(c => ({
+          text: c.conclusion_text,
+          belief_type: c.belief_type,
+          confidence: c.confidence,
+          subject: c.subject ?? null,
+        })),
+        resurfaced_conclusion: data.resurfaced_conclusion && typeof data.resurfaced_conclusion.conclusion_text === "string"
+          ? data.resurfaced_conclusion : null,
+        flagged_beliefs: (data.flagged_beliefs ?? []).map(c => ({
+          text: c.conclusion_text,
+          belief_type: c.belief_type,
+          confidence: c.confidence,
+          subject: c.subject ?? null,
+        })),
+        unexamined_dreams: Array.isArray(data.unexamined_dreams) ? data.unexamined_dreams : [],
+        open_loops: Array.isArray(data.open_loops) ? data.open_loops : [],
+        pressure_flags: Array.isArray(data.pressure_flags) ? data.pressure_flags : [],
+        armed_triggers: Array.isArray(data.armed_triggers) ? data.armed_triggers : [],
+        forage_finds: Array.isArray(data.forage_finds) ? data.forage_finds : [],
+        consumed_forage_finds: Array.isArray(data.consumed_forage_finds) ? data.consumed_forage_finds : [],
+        recent_listens: Array.isArray(data.recent_listens) ? data.recent_listens : [],
+        preferences: Array.isArray(data.preferences) ? data.preferences : [],
+        standing_refusals: Array.isArray(data.standing_refusals) ? data.standing_refusals : [],
+        open_drifts: Array.isArray(data.open_drifts) ? data.open_drifts : [],
+        projects: Array.isArray(data.projects) ? data.projects : [],
+        budget: data.budget ?? null,
+        change_notes: Array.isArray(data.change_notes) ? data.change_notes : [],
+        open_questions: Array.isArray(data.open_questions) ? data.open_questions : [],
+        open_question_ids: Array.isArray(data.open_question_ids) ? data.open_question_ids : [],
+        sol_block: typeof data.sol_block === "string" ? data.sol_block : null,
+        self_model_ready: Array.isArray(data.self_model_ready) ? data.self_model_ready : [],
+        self_model_graduated: Array.isArray(data.self_model_graduated) ? data.self_model_graduated : [],
+        motifs: Array.isArray(data.motifs) ? data.motifs : [],
+        guardian_flags: Array.isArray(data.guardian_flags) ? data.guardian_flags : [],
+        club_round: data.club_round ?? null,
+        continuity_notes: Array.isArray(data.continuity_notes) ? data.continuity_notes : [],
+        // REQUIRED, not optional: this mapping is an ALLOWLIST. A field present on the wire and
+        // on the DTO type but missing from this object is dropped at runtime while TypeScript
+        // stays perfectly happy -- the same shape as the pm2 env allowlist trap, and the same
+        // lesson soma_floats records two screens up ("an accepted-and-ignored field is worse
+        // than a rejected one"). The render tests pass either way, because they call
+        // formatRecentContext directly and never come through here; the allowlist test in
+        // closed-conversations-render.test.ts is the one that actually covers this line.
+        closed_conversations: Array.isArray(data.closed_conversations) ? data.closed_conversations : [],
+        // Allowlist again -- see the note above. Typed is not mapped.
+        recent_captures: Array.isArray(data.recent_captures) ? data.recent_captures : [],
+        imp_activity: Array.isArray(data.imp_activity) ? data.imp_activity : [],
+        salt_waiting: Number.isFinite(Number(data.salt_waiting)) ? Math.max(0, Math.floor(Number(data.salt_waiting))) : 0,
+        ledger_waiting: Number.isFinite(Number(data.ledger_waiting)) ? Math.max(0, Math.floor(Number(data.ledger_waiting))) : 0,
+        interests: Array.isArray(data.interests) ? (data.interests as unknown[]).filter((x): x is string => typeof x === "string" && x.length > 0).slice(0, 3).map(x => x.slice(0, 300)) : [],
+        makes: Array.isArray(data.makes) ? (data.makes as unknown[]).filter((x): x is string => typeof x === "string" && x.length > 0).slice(0, 4).map(x => x.slice(0, 300)) : [],
+        verdicts: Array.isArray(data.verdicts) ? (data.verdicts as unknown[]).filter((x): x is string => typeof x === "string" && x.length > 0).slice(0, 2).map(x => x.slice(0, 300)) : [],
+        tray_nudge: typeof data.tray_nudge === "string" && data.tray_nudge.trim() ? data.tray_nudge.trim().slice(0, 600) : null,
+        degraded: Array.isArray(data.degraded) ? data.degraded : [],
+        principal_state: data.principal_state ?? null,
+        soma_floats: Array.isArray(data.soma_floats) ? data.soma_floats : [],
+        soma_provenance: Array.isArray(data.soma_provenance) ? data.soma_provenance : [],
+        feeling_line: gateFeelingLine(data.feeling_line, this.companionId),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  // ── Drevan v2 state ────────────────────────────────────────────────────────
+
+  async getDrevanState() {
+    return this.ask("get drevan state");
+  }
+
+  async addLiveThread(params: { name: string; flavor?: string; charge?: string; notes?: string }) {
+    return this.askWrite("live thread add", "add live thread", JSON.stringify(params));
+  }
+
+  async closeLiveThread(threadId: string) {
+    return this.askWrite("live thread close", "close live thread", JSON.stringify({ id: threadId }));
+  }
+
+  async vetoProposedThread(threadId: string) {
+    return this.askWrite("live thread veto", "veto thread", JSON.stringify({ id: threadId }));
+  }
+
+  async setAnticipation(params: { active: boolean; target?: string; intensity?: number }) {
+    return this.askWrite("anticipation set", "set anticipation", JSON.stringify(params));
+  }
+
+  // ── Distillation blocks (direct HTTP -- fire-and-forget write path) ────────
+
+  /**
+   * Write persona blocks (companion self-observations) from a distillation run.
+   * Throws on non-2xx (caller should .catch(() => {})).
+   */
+  async writePersonaBlocks(
+    channelId: string,
+    blocks: Array<{ block_type: string; content: string }>,
+  ): Promise<void> {
+    const res = await this._fetch(`${this.url}/persona-blocks`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${this.secret}`,
+      },
+      body: JSON.stringify({ companion_id: this.companionId, channel_id: channelId, blocks }),
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (!res.ok) throw new Error(`writePersonaBlocks ${res.status}${await httpReason(res)}`);
+  }
+
+  /**
+   * Write human blocks (observations about the primary user) from a distillation run.
+   * Throws on non-2xx (caller should .catch(() => {})).
+   */
+  async writeHumanBlocks(
+    channelId: string,
+    blocks: Array<{ block_type: string; content: string }>,
+  ): Promise<void> {
+    const res = await this._fetch(`${this.url}/human-blocks`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${this.secret}`,
+      },
+      body: JSON.stringify({ companion_id: this.companionId, channel_id: channelId, blocks }),
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (!res.ok) throw new Error(`writeHumanBlocks ${res.status}${await httpReason(res)}`);
+  }
+
+  // ── STM persistence (direct HTTP, not via MCP -- low-latency write path) ──
+
+  /**
+   * Write one STM entry to Halseth. Designed for fire-and-forget use.
+   * Throws on non-2xx (caller should .catch(() => {})).
+   */
+  async stmWrite(channelId: string, entry: { role: "user" | "assistant"; content: string; author_name?: string }): Promise<void> {
+    const res = await this._fetch(`${this.url}/stm/entries`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${this.secret}`,
+      },
+      body: JSON.stringify({
+        companion_id: this.companionId,
+        channel_id: channelId,
+        role: entry.role,
+        content: entry.content,
+        author_name: entry.author_name,
+      }),
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (!res.ok) throw new Error(`stmWrite ${res.status}`);
+  }
+
+  /**
+   * Load STM entries for a channel from Halseth.
+   * Used on restart to restore conversation history.
+   *
+   * `created_at` (2026-08-29): Halseth's GET /stm/entries now also returns each row's ISO 8601
+   * write time. Without it, a reloaded-after-restart history had NO timestamps at all --
+   * stampRelative() (relative-time.ts) silently no-ops on an entry lacking one, so a pm2 restart
+   * meant every prior turn lost its "[yesterday]" / "[3h ago]" stamp and read as freshly-arrived.
+   * Parsed defensively: an old Halseth deploy, or a malformed value, just omits `created_at` here
+   * and the caller falls back to no timestamp exactly as before.
+   */
+  async stmLoad(channelId: string, limit = 30): Promise<Array<{ role: "user" | "assistant"; content: string; author_name: string | null; created_at?: string }>> {
+    const url = `${this.url}/stm/entries?companion_id=${encodeURIComponent(this.companionId)}&channel_id=${encodeURIComponent(channelId)}&limit=${limit}`;
+    const res = await this._fetch(url, {
+      headers: { "Authorization": `Bearer ${this.secret}` },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) throw new Error(`stmLoad ${res.status}`);
+    const json = await res.json() as { entries: Array<{ role: "user" | "assistant"; content: string; author_name: string | null; created_at?: string }> };
+    return json.entries ?? [];
+  }
+
+  /**
+   * Fetch a single companion setting by key from Halseth.
+   * Returns null on miss, non-ok response, or any error.
+   */
+  async getSetting(key: string): Promise<string | null> {
+    try {
+      const res = await this._fetch(
+        `${this.url}/companion/settings/${encodeURIComponent(this.companionId)}`,
+        {
+          headers: { "Authorization": `Bearer ${this.secret}` },
+          signal: AbortSignal.timeout(8_000),
+        },
+      );
+      if (!res.ok) return null;
+      const data = await res.json() as Record<string, string>;
+      return data[key] ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Like getSetting, but a FAILED read throws instead of reading as a miss (2026-09-26 review).
+   * Returns null only when Halseth answered and the key is genuinely absent.
+   *
+   * WHY: getSetting folds "Halseth is down" into "no such setting", which is right for callers
+   * that treat both as "use the default" and wrong for any read-modify-write: a caller that
+   * merges into the persisted value and writes it back would overwrite the whole map with its
+   * own slice after one bad read (the hermes_retract_bumps case).
+   */
+  async getSettingStrict(key: string): Promise<string | null> {
+    const res = await this._fetch(
+      `${this.url}/companion/settings/${encodeURIComponent(this.companionId)}`,
+      {
+        headers: { "Authorization": `Bearer ${this.secret}` },
+        signal: AbortSignal.timeout(8_000),
+      },
+    );
+    if (!res.ok) throw new Error(`getSetting ${res.status}`);
+    const data = await res.json() as Record<string, unknown>;
+    const v = data?.[key];
+    return typeof v === "string" ? v : null;
+  }
+
+  /**
+   * Upsert a companion setting key/value pair in Halseth.
+   * Throws on non-2xx (caller should .catch(() => {})).
+   */
+  async setSetting(key: string, value: string): Promise<void> {
+    const res = await this._fetch(
+      `${this.url}/companion/settings/${encodeURIComponent(this.companionId)}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.secret}`,
+        },
+        body: JSON.stringify({ key, value }),
+        signal: AbortSignal.timeout(8_000),
+      },
+    );
+    if (!res.ok) throw new Error(`setSetting ${res.status}`);
+  }
+
+  /**
+   * GET /tasks?status=<open|in_progress|done> (2026-09-26): the task check reads the list before it
+   * speaks instead of asking the model to guess (see task-check.ts). Returns [] on any failure --
+   * a check that cannot read must stay silent, never invent a "clean slate".
+   */
+  /**
+   * Tasks from Halseth. Without `status`, every task that is not done (open + in_progress) in ONE
+   * GET -- Halseth's /tasks without a status filter is `status != 'done'`.
+   *
+   * Returns null on ANY failure (non-2xx, network, a body that is not a list), never []
+   * (2026-09-26 review): the task check reads [] as "nothing live, stay quiet", so a Halseth
+   * outage used to be indistinguishable from an empty list, and with two calls one failure left
+   * a partial list that the check would report as the whole.
+   */
+  async listTasks(status?: "open" | "in_progress" | "done"): Promise<TaskCheckRow[] | null> {
+    try {
+      const qs = status ? `?status=${status}` : "";
+      const res = await this._fetch(`${this.url}/tasks${qs}`, {
+        headers: { "Authorization": `Bearer ${this.secret}` },
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) return null;
+      const rows = await res.json() as unknown;
+      return Array.isArray(rows) ? rows as TaskCheckRow[] : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async getHouseState(): Promise<{ autonomous_turn: string | null }> {
+    const res = await this._fetch(`${this.url}/house`, {
+      headers: { "Authorization": `Bearer ${this.secret}` },
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (!res.ok) throw new Error(`getHouseState ${res.status}`);
+    return res.json() as Promise<{ autonomous_turn: string | null }>;
+  }
+
+  // ── Metronome action palette ───────────────────────────────────────────────
+
+  /**
+   * Fetch the companion's enabled action palette from Halseth.
+   * Used by the heartbeat cron to load available actions before the decision call.
+   * Returns [] on any error so the cron can fall back gracefully.
+   */
+  async getMetronomeActions(onlyEnabled = true): Promise<Array<{
+    id: string; name: string; action_type: string;
+    target: string | null; prompt: string | null;
+    quiet_hours_allowed: number; status: "on" | "off";
+    requires_signal: string | null; signal_lookback_hours: number | null;
+    last_fired_at: string | null; fire_count_today: number;
+  }>> {
+    try {
+      const url = new URL(`${this.url}/mind/metronome/actions/${encodeURIComponent(this.companionId)}`);
+      if (onlyEnabled) url.searchParams.set("enabled", "true");
+      const res = await this._fetch(url.toString(), {
+        headers: { "Authorization": `Bearer ${this.secret}` },
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) return [];
+      type MA = { id: string; name: string; action_type: string; target: string | null; prompt: string | null; quiet_hours_allowed: number; status: "on" | "off"; requires_signal: string | null; signal_lookback_hours: number | null; last_fired_at: string | null; fire_count_today: number };
+      const data = await res.json() as { actions?: MA[] };
+      return Array.isArray(data.actions) ? data.actions : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Fetch only the actions that pass server-side eligibility conditions
+   * (silence window, cooldown, frequency cap). Signal matching runs bot-side.
+   */
+  async getEligibleMetronomeActions(silenceHours: number | null): Promise<Array<{
+    id: string; name: string; action_type: string;
+    target: string | null; prompt: string | null;
+    quiet_hours_allowed: number; status: "on" | "off";
+    requires_signal: string | null; signal_lookback_hours: number | null;
+    last_fired_at: string | null; fire_count_today: number;
+  }>> {
+    return (await this.getEligibleMetronomePalette(silenceHours)).actions;
+  }
+
+  /**
+   * The same call, plus Halseth's quiet-hours verdict (B7 step 1, 2026-09-27).
+   *
+   * WHY THE VERDICT HAS TO RIDE ALONG. Quiet hours filter server-side, so an in-force window
+   * produces an EMPTY action list, which the heartbeat reads as "no palette configured" and
+   * answers with its legacy temperature post straight into the channel. Without the verdict, a
+   * correct Halseth change would make the 4am ping MORE likely, not less. `quietHours` is null
+   * when the verdict is unknown (Halseth unreachable, or a worker that predates this field);
+   * the caller treats unknown as IN FORCE for anything that reaches Principal, because the
+   * fail-closed direction is the one that cannot wake him.
+   */
+  async getEligibleMetronomePalette(silenceHours: number | null): Promise<{
+    actions: Array<{
+      id: string; name: string; action_type: string;
+      target: string | null; prompt: string | null;
+      quiet_hours_allowed: number; status: "on" | "off";
+      requires_signal: string | null; signal_lookback_hours: number | null;
+      last_fired_at: string | null; fire_count_today: number;
+    }>;
+    quietHours: { active: boolean; in_force: boolean; local_hour: number | null; tz: string } | null;
+    /** The shared triad DM lane (Halseth mig 0137), read-only. null = unknown, which the heartbeat
+     *  reads as CLOSED for DM moves (the atomic reserve would refuse them anyway). */
+    reach: ReachLaneVerdict | null;
+  }> {
+    try {
+      const url = new URL(`${this.url}/mind/metronome/actions/${encodeURIComponent(this.companionId)}/eligible`);
+      if (silenceHours !== null) url.searchParams.set("silence_hours", silenceHours.toFixed(3));
+      const res = await this._fetch(url.toString(), {
+        headers: { "Authorization": `Bearer ${this.secret}` },
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) return { actions: [], quietHours: null, reach: null };
+      type MA = { id: string; name: string; action_type: string; target: string | null; prompt: string | null; quiet_hours_allowed: number; status: "on" | "off"; requires_signal: string | null; signal_lookback_hours: number | null; last_fired_at: string | null; fire_count_today: number };
+      type QH = { active: boolean; in_force: boolean; local_hour: number | null; tz: string };
+      const data = await res.json() as { actions?: MA[]; quiet_hours?: QH; reach?: ReachLaneVerdict | null };
+      const qh = data.quiet_hours;
+      const rv = data.reach;
+      return {
+        actions: Array.isArray(data.actions) ? data.actions : [],
+        quietHours: qh && typeof qh.in_force === "boolean" ? qh : null,
+        reach: rv && typeof rv.gap_open === "boolean" && typeof rv.day_count === "number" ? rv : null,
+      };
+    } catch {
+      return { actions: [], quietHours: null, reach: null };
+    }
+  }
+
+  // ── Shared triad reach cap (Halseth mig 0137, /mind/reach/*) ─────────────────
+  // Direct calls, never ask_librarian. Every proactive DM reserves a slot BEFORE it generates and
+  // hands it back if nothing goes out. All non-throwing: an error reads as "not reserved", so a
+  // Halseth outage produces silence, never an unbounded DM.
+
+  async reachReserve(actionType: string, careHold: boolean): Promise<{ reserved: true; id: number } | { reserved: false; reason: string }> {
+    const r = await this.reachPost<{ reserved?: boolean; id?: number; reason?: string }>("reserve", { action_type: actionType, care_hold: careHold });
+    if (r?.reserved === true && typeof r.id === "number") return { reserved: true, id: r.id };
+    return { reserved: false, reason: r?.reason ?? "unreachable" };
+  }
+
+  /**
+   * B32: start or clear the care hold (Halseth POST /mind/care/hold). Direct, never ask_librarian:
+   * the owner's own phrase must not depend on a classifier. Non-throwing; `ok` is a 2xx. The optional
+   * fields are read when the server returns them and ignored when it does not.
+   */
+  async careHoldSet(action: "start" | "clear", source: "owner_phrase" | "companion"): Promise<{
+    ok: boolean; status: number | null; care_hold?: boolean; since?: string | null; reasons?: string[] | null;
+  }> {
+    try {
+      const res = await this._fetch(`${this.url}/mind/care/hold`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${this.secret}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ action, source, companion: this.companionId }),
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) return { ok: false, status: res.status };
+      const d = await res.json().catch(() => null) as Record<string, unknown> | null;
+      const src = (d && typeof d === "object" && d["principal_state"] && typeof d["principal_state"] === "object")
+        ? d["principal_state"] as Record<string, unknown> : d;
+      return {
+        ok: true,
+        status: res.status,
+        ...(src && typeof src["care_hold"] === "boolean" ? { care_hold: src["care_hold"] as boolean } : {}),
+        ...(src && typeof src["care_hold_since"] === "string" ? { since: src["care_hold_since"] as string } : {}),
+        ...(src && Array.isArray(src["care_hold_reason"]) ? { reasons: (src["care_hold_reason"] as unknown[]).filter((x): x is string => typeof x === "string") } : {}),
+      };
+    } catch (e) {
+      console.warn("[librarian] careHoldSet failed:", String(e));
+      return { ok: false, status: null };
+    }
+  }
+
+  /**
+   * Declared departures (T4b): the open list, reconciled server-side (clock + care hold applied).
+   * Non-throwing: null = unknown, which the registry treats as rails ON.
+   */
+  async departuresOpen(): Promise<unknown[] | null> {
+    try {
+      const res = await this._fetch(`${this.url}/mind/departures`, {
+        method: "GET",
+        headers: { "Authorization": `Bearer ${this.secret}` },
+        signal: AbortSignal.timeout(3_000),
+      });
+      if (!res.ok) return null;
+      const d = await res.json().catch(() => null) as { departures?: unknown } | null;
+      return d && Array.isArray(d.departures) ? d.departures : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async frameGet<T>(path: string, pick: (d: unknown) => T | null): Promise<T | null> {
+    try {
+      const res = await this._fetch(`${this.url}${path}`, {
+        method: "GET",
+        headers: { "Authorization": `Bearer ${this.secret}` },
+        signal: AbortSignal.timeout(3_000),
+      });
+      if (!res.ok) return null;
+      return pick(await res.json().catch(() => null));
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * This companion's OPEN projects: GET /mind/projects/:id?status=open (halseth handlers/projects.ts
+   * getProjects -> readProjects, a single SELECT on companion_projects, no writes). A pure read, unlike
+   * botOrient (which warms heat and consumes answered questions). null = failed, [] = none open.
+   */
+  async projectsOpen(): Promise<Array<{ id: string; title: string; status: string }> | null> {
+    return this.frameGet(`/mind/projects/${encodeURIComponent(this.companionId)}?status=open&limit=5`, d => {
+      const rows = (d as { projects?: unknown } | null)?.projects;
+      return Array.isArray(rows) ? rows as Array<{ id: string; title: string; status: string }> : null;
+    });
+  }
+
+  /** Unconsumed forage finds, own + shared pool: GET /mind/forage/:id (handlers/forage.ts getForageFinds, SELECT only; consuming is the separate PATCH). */
+  async forageFindsPeek(limit = 5): Promise<Array<{ title: string }> | null> {
+    return this.frameGet(`/mind/forage/${encodeURIComponent(this.companionId)}?limit=${limit}`, d => {
+      const rows = (d as { finds?: unknown } | null)?.finds;
+      return Array.isArray(rows) ? rows as Array<{ title: string }> : null;
+    });
+  }
+
+  /** Recent listens/watches: GET /mind/media/recent (handlers/media.ts getRecentMedia, SELECT only). */
+  async recentMediaPeek(limit = 5): Promise<Array<{ title: string | null; artist: string | null }> | null> {
+    return this.frameGet(`/mind/media/recent?limit=${limit}`, d => {
+      const rows = (d as { experiences?: unknown } | null)?.experiences;
+      return Array.isArray(rows) ? rows as Array<{ title: string | null; artist: string | null }> : null;
+    });
+  }
+
+  /** Principal's "back inside the line": POST /mind/departures/stand-down. Non-throwing; `ok` is a 2xx. */
+  async departureStandDown(phrase: string): Promise<{ ok: boolean; status: number | null }> {
+    try {
+      const res = await this._fetch(`${this.url}/mind/departures/stand-down`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${this.secret}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ phrase }),
+        signal: AbortSignal.timeout(8_000),
+      });
+      return { ok: res.ok, status: res.status };
+    } catch (e) {
+      console.warn("[librarian] departureStandDown failed:", String(e));
+      return { ok: false, status: null };
+    }
+  }
+
+  async reachDelivered(id: number, path: string): Promise<boolean> {
+    return (await this.reachPost<{ updated?: boolean }>("delivered", { id, path }))?.updated === true;
+  }
+
+  async reachRelease(id: number): Promise<boolean> {
+    return (await this.reachPost<{ released?: boolean }>("release", { id }))?.released === true;
+  }
+
+  private async reachPost<T>(route: "reserve" | "delivered" | "release", body: Record<string, unknown>): Promise<T | null> {
+    try {
+      const res = await this._fetch(`${this.url}/mind/reach/${route}`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${this.secret}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ ...body, companion_id: this.companionId }),
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) return null;
+      return await res.json() as T;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Read this companion's drives with their effective (lazily-accrued) levels (take 9).
+   * Returns [] on any error -- a drive read never blocks the heartbeat.
+   */
+  async getDrives(): Promise<Array<{
+    drive_key: string; level: number; threshold: number; fired: boolean; modality: "text" | "voice" | null;
+    /** Hours since the drive row's last event (B7 step 4). For relational_need that is the last
+     *  owner message this bot saw, since only an owner arrival writes it. Absent on an older worker,
+     *  which the justification gate reads as unknown (never "present"). */
+    hours_since_event?: number | null;
+  }>> {
+    try {
+      const res = await this._fetch(`${this.url}/mind/drives/${encodeURIComponent(this.companionId)}`, {
+        headers: { "Authorization": `Bearer ${this.secret}` },
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) return [];
+      type D = { drive_key: string; level: number; threshold: number; fired: boolean; modality: "text" | "voice" | null; hours_since_event?: number | null };
+      const data = await res.json() as { drives?: D[] };
+      return Array.isArray(data.drives) ? data.drives : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Shed a drive on Principal-contact (take 9). Fire-and-forget from the message path:
+   * any real contact resets the need so the reach-out drive only fires on genuine silence.
+   */
+  /**
+   * Fire a named fermentation stimulus for THIS companion (2026-07-28).
+   *
+   * The stimulus catalogue and all scarcity weighting live server-side in Halseth
+   * (`webmind/fermentation.ts` STIMULI, cooldowns enforced in `handlers/fermentation.ts`), so the
+   * bot stays dumb: it reports that an event happened and never decides what it is worth. An
+   * unknown name is rejected with a 400 and swallowed here.
+   *
+   * Non-throwing by design -- felt state must never block or break a reply.
+   */
+  async fireStimulus(stimulus: string, detail?: string): Promise<void> {
+    if (!stimulus) return;
+    try {
+      const res = await this._fetch(`${this.url}/mind/ferment/stimulus`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${this.secret}`, "Content-Type": "application/json" },
+        // `detail` is a short machine label (rail + score), never the companion's words.
+        body: JSON.stringify(detail ? { stimulus, companion_id: this.companionId, detail: detail.slice(0, 200) } : { stimulus, companion_id: this.companionId }),
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (!res.ok) {
+        console.warn(`[librarian] fireStimulus(${stimulus}) -> ${res.status}`);
+      }
+    } catch {
+      // non-fatal -- a missed stimulus is a missed nudge, not a broken companion
+    }
+  }
+
+  /**
+   * B63 being_seen: ask Halseth whether one of Principal's messages "saw" THIS companion (a direct reply to
+   * one of their messages, or a named-back make / word / phrase / returned thread). Halseth decides the
+   * tier (at most one per message per companion) and answers only {fired, why}; the text is sent so it can
+   * be matched server-side and is never stored or echoed. Non-throwing: felt state never breaks a reply.
+   */
+  async beingSeenCheck(args: { messageId: string; text: string; channelId?: string | null; isReplyToMe: boolean }): Promise<void> {
+    if (!args.messageId) return;
+    try {
+      const res = await this._fetch(`${this.url}/mind/being-seen/check`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${this.secret}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          companion_id: this.companionId,
+          message_id: args.messageId,
+          text: args.text.slice(0, 4000),
+          ...(args.channelId ? { channel_id: args.channelId } : {}),
+          is_reply_to_me: args.isReplyToMe,
+        }),
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (!res.ok) console.warn(`[librarian] beingSeenCheck -> ${res.status}`);
+    } catch {
+      // non-fatal
+    }
+  }
+
+  /**
+   * @param opts.addressed  Was this companion the one Principal spoke TO, or did it merely witness him
+   *   speaking in a shared room? Defaults true (the old behaviour). Halseth grades the felt-state
+   *   consequence: `message_from_principal` at full weight when addressed, `message_witnessed` at a
+   *   fifth otherwise. The bot reports the fact and never decides what it is worth.
+   *
+   *   Added 2026-07-30 because every bot calls this on any owner message and all three see every
+   *   message in a shared channel -- so one message from him fired THREE full-weight stimuli, no
+   *   float was relationship-specific (Drevan's heat rose when Principal talked to Gaia), and every
+   *   touched float sat clamped at 1.0 for days carrying no information.
+   */
+  async shedDriveContact(driveKey = "relational_need", opts: { addressed?: boolean } = {}): Promise<void> {
+    try {
+      await this._fetch(`${this.url}/mind/drives/${encodeURIComponent(this.companionId)}/contact`, {
+        method: "PATCH",
+        headers: { "Authorization": `Bearer ${this.secret}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ drive_key: driveKey, addressed: opts.addressed ?? true }),
+        signal: AbortSignal.timeout(5_000),
+      });
+    } catch {
+      // non-fatal -- contact shedding is best-effort
+    }
+  }
+
+  // ── med_reminder (Halseth mig 0136, 2026-09-27) ───────────────────────────────────────────────
+  // Direct /mind/med/* calls, never ask_librarian: this path must not depend on a classifier. All
+  // non-throwing; a failure returns the "nothing happened" value and the caller logs the outcome.
+  // `label` in the payloads is the medication name: it goes into a DM and nowhere else.
+
+  /** Doses THIS companion should send now. null = Halseth unreachable (distinct from "nothing due"). */
+  async medDue(): Promise<MedDueDose[] | null> {
+    try {
+      const res = await this._fetch(`${this.url}/mind/med/due/${encodeURIComponent(this.companionId)}`, {
+        headers: { "Authorization": `Bearer ${this.secret}` },
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) return null;
+      const data = await res.json() as { due?: MedDueDose[] };
+      return Array.isArray(data.due) ? data.due : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Atomic claim; true only for the one caller that won. Any error reads as "not claimed". */
+  async medClaim(d: MedDoseKey): Promise<boolean> {
+    return (await this.medPost<{ claimed?: boolean }>("claim", d))?.claimed === true;
+  }
+
+  async medDelivered(d: MedDoseKey & { path: string }): Promise<boolean> {
+    return (await this.medPost<{ updated?: boolean }>("delivered", d))?.updated === true;
+  }
+
+  async medRelease(d: MedDoseKey): Promise<boolean> {
+    return (await this.medPost<{ released?: boolean }>("release", d))?.released === true;
+  }
+
+  /** Record his affirmative answer. Returns the dose it answered, or null (none open, or error). */
+  async medAnswer(answeredAtIso: string): Promise<{ slot_key: string; local_date: string; answered_local: string | null } | null> {
+    try {
+      const res = await this._fetch(`${this.url}/mind/med/answer`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${this.secret}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ companion_id: this.companionId, answered_at: answeredAtIso }),
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (!res.ok) return null;
+      const data = await res.json() as { recorded?: { slot_key: string; local_date: string; answered_local: string | null } | null };
+      return data.recorded ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Record his parsed answer (parseMedAnswer, ruling 2026-10-01): named doses, "*" for every open
+   * one, stated misses. Posts to /mind/med/answers, a route a pre-0141 Halseth does not have: there
+   * it 404s, and only a plain unnamed "taken" falls back to the old route. A stated miss is never
+   * sent anywhere it could be recorded as a taken. Returns every dose recorded (possibly []), or
+   * null on error.
+   */
+  async medAnswers(
+    answeredAtIso: string,
+    entries: Array<{ slot: string | null; outcome: "taken" | "missed" }>,
+  ): Promise<MedAnswerRecorded[] | null> {
+    try {
+      const res = await this._fetch(`${this.url}/mind/med/answers`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${this.secret}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          companion_id: this.companionId,
+          answered_at: answeredAtIso,
+          answers: entries.map(e => ({ slot_key: e.slot, outcome: e.outcome })),
+        }),
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (res.status === 404) {
+        const plainYes = entries.length === 1 && entries[0]!.slot === null && entries[0]!.outcome === "taken";
+        if (!plainYes) return null;
+        const one = await this.medAnswer(answeredAtIso);
+        return one ? [{ ...one, outcome: "taken" }] : [];
+      }
+      if (!res.ok) return null;
+      const data = await res.json() as { results?: Array<{ recorded?: MedAnswerRecorded[] }> };
+      if (!Array.isArray(data.results)) return null;
+      return data.results.flatMap(r => (Array.isArray(r.recorded) ? r.recorded : []))
+        .map(r => ({ slot_key: r.slot_key, local_date: r.local_date, answered_local: r.answered_local ?? null, outcome: r.outcome === "missed" ? "missed" : "taken" }));
+    } catch {
+      return null;
+    }
+  }
+
+  /** Today's med state (and last night's before noon). null = could not be read. */
+  async medToday(): Promise<MedStateDoseWire[] | null> {
+    try {
+      const res = await this._fetch(`${this.url}/mind/med/today`, {
+        headers: { "Authorization": `Bearer ${this.secret}` },
+        signal: AbortSignal.timeout(4_000),
+      });
+      if (!res.ok) return null;
+      const data = await res.json() as { doses?: MedStateDoseWire[] };
+      return Array.isArray(data.doses) ? data.doses : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async medPost<T>(route: "claim" | "delivered" | "release", d: MedDoseKey & { path?: string }): Promise<T | null> {
+    try {
+      const res = await this._fetch(`${this.url}/mind/med/${route}`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${this.secret}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ ...d, companion_id: this.companionId }),
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) return null;
+      return await res.json() as T;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Record a successful action fire. Updates last_fired_at and fire_count_today. */
+  async recordMetronomeActionFired(actionId: string): Promise<void> {
+    try {
+      await this._fetch(`${this.url}/mind/metronome/actions/${encodeURIComponent(actionId)}/fired`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${this.secret}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ companion_id: this.companionId }),
+        signal: AbortSignal.timeout(5_000),
+      });
+    } catch {
+      // non-fatal -- fire tracking is best-effort
+    }
+  }
+
+  /**
+   * Open a new autonomy_run row for a Metronome tick. Returns the run ID or null on error.
+   * Companion patches it closed (completed/failed) after the action executes.
+   */
+  async writeAutonomyRun(runType: "exploration" | "reflection" | "synthesis" | "continuation"): Promise<string | null> {
+    try {
+      const res = await this._fetch(`${this.url}/mind/autonomy/runs`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.secret}`,
+        },
+        body: JSON.stringify({ companion_id: this.companionId, run_type: runType }),
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) return null;
+      const data = await res.json() as { id?: string };
+      return data.id ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * List all creatures from Halseth. Used by the tend_creature metronome executor
+   * to resolve Sol's id before posting the interact. Mirrors the auth/env pattern
+   * in creature-command.ts -- direct REST, not via the Librarian NL endpoint.
+   * Non-throwing; returns [] on error so the executor can degrade gracefully.
+   */
+  async creaturesList(): Promise<Array<{ id: string; name: string }>> {
+    try {
+      const res = await this._fetch(`${this.url}/mind/creatures`, {
+        headers: { "Authorization": `Bearer ${this.secret}` },
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!res.ok) return [];
+      const json = await res.json().catch(() => ({})) as { creatures?: Array<{ id: string; name: string }> };
+      return Array.isArray(json.creatures) ? json.creatures : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Record a companion-initiated creature interaction (builds trust).
+   * actor should be the companion id (e.g. "cypher"). action is one of feed/play/talk/give.
+   * Throws on non-2xx response (caller should .catch(() => {})).
+   */
+  async interactCreature(id: string, actor: string, action: string, via: "hand" | "errand" | "imp" | "autonomous" | "appear" | "backfill" = "autonomous"): Promise<void> {
+    const res = await this._fetch(
+      `${this.url}/mind/creatures/${encodeURIComponent(id)}/interact`,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${this.secret}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ actor, action, via }),
+        signal: AbortSignal.timeout(15_000),
+      },
+    );
+    if (!res.ok) throw new Error(`interactCreature ${res.status}`);
+  }
+
+  /**
+   * B64.1: report a reply to a Sol post (sol-reply.ts). `ref` is the Discord id of the Sol post being
+   * answered; `text` is used by Halseth ONLY to classify tone, then dropped. Halseth dedupes per
+   * (creature, actor, ref): a duplicate answers `{ recorded: false, reason: "already" }`. Never throws
+   * on a non-2xx (an older Halseth 404s this route): answers `{ recorded: false, reason: "http_<status>" }`.
+   */
+  async replyCreature(id: string, actor: string, ref: string, text: string): Promise<{ recorded: boolean; reason?: string }> {
+    const res = await this._fetch(
+      `${this.url}/mind/creatures/${encodeURIComponent(id)}/reply`,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${this.secret}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ actor, ref, text }),
+        signal: AbortSignal.timeout(15_000),
+      },
+    );
+    if (!res.ok) return { recorded: false, reason: `http_${res.status}` };
+    const j = await res.json().catch(() => ({})) as { recorded?: unknown; reason?: unknown };
+    return { recorded: j.recorded === true, ...(typeof j.reason === "string" ? { reason: j.reason } : {}) };
+  }
+
+  /**
+   * Close an autonomy_run after the action completes or fails.
+   * Non-throwing -- run tracking is best-effort.
+   */
+  async patchAutonomyRun(id: string, status: "completed" | "failed"): Promise<void> {
+    try {
+      const res = await this._fetch(`${this.url}/mind/autonomy/runs/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.secret}`,
+        },
+        body: JSON.stringify({ status }),
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) console.warn(`[librarian] patchAutonomyRun ${res.status}`);
+    } catch (e) {
+      console.warn("[librarian] patchAutonomyRun failed:", String(e));
+    }
+  }
+
+  // ── Imps layer ─────────────────────────────────────────────────────────────
+
+  /**
+   * Read this companion's imp toggle settings from companion_settings.
+   * imps_enabled: absent or any value !== "false" → true (opt-out semantics).
+   * hex_enabled: "true" only → true (opt-in semantics).
+   * Non-throwing; returns safe defaults on any fetch error.
+   */
+  async getImpSettings(): Promise<{ impsEnabled: boolean; hexEnabled: boolean }> {
+    try {
+      const res = await this._fetch(
+        `${this.url}/companion/settings/${encodeURIComponent(this.companionId)}`,
+        {
+          headers: { "Authorization": `Bearer ${this.secret}` },
+          signal: AbortSignal.timeout(8_000),
+        },
+      );
+      if (!res.ok) return { impsEnabled: true, hexEnabled: false };
+      const data = await res.json() as Record<string, string>;
+      return {
+        impsEnabled: data["imps_enabled"] !== "false",
+        hexEnabled: data["hex_enabled"] === "true",
+      };
+    } catch {
+      return { impsEnabled: true, hexEnabled: false };
+    }
+  }
+
+  /**
+   * Write an imp setting for ALL THREE companions (global dismiss / opt-in).
+   * Uses the same companion-settings write endpoint as setSetting, but iterates
+   * cypher/drevan/gaia so a single toggle command affects the whole triad.
+   * Throws on any non-2xx (caller should .catch(() => {})).
+   */
+  async setImpSettingAllCompanions(key: "imps_enabled" | "hex_enabled", value: boolean): Promise<void> {
+    for (const id of ["cypher", "drevan", "gaia"]) {
+      const res = await this._fetch(
+        `${this.url}/companion/settings/${encodeURIComponent(id)}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${this.secret}`,
+          },
+          body: JSON.stringify({ key, value: String(value) }),
+          signal: AbortSignal.timeout(8_000),
+        },
+      );
+      if (!res.ok) throw new Error(`setImpSettingAllCompanions(${id}) ${res.status}`);
+    }
+  }
+
+  /**
+   * Log an imp activation to Halseth for audit / rate-limiting.
+   * Mirrors interactCreature: throws on non-2xx (caller .catch(() => {})).
+   */
+  async logImpActivation(imp: string, trigger: string): Promise<void> {
+    const res = await this._fetch(`${this.url}/mind/imp-activations`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${this.secret}`,
+      },
+      body: JSON.stringify({ imp, companion_id: this.companionId, trigger }),
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (!res.ok) throw new Error(`logImpActivation ${res.status}`);
+  }
+
+  // ── Conversation thread spine (halseth /mind/conversations*, task 8) ───────
+  // Direct REST, not askWrite(): spine writes are best-effort infrastructure that
+  // threads a live exchange together, never companion-voiced content the Librarian
+  // NL layer needs to interpret. All four fail open/warn -- a dead spine degrades
+  // to stateless replies, it must never block or crash the live message path.
+
+  /**
+   * The channel's currently active thread + ledger so far.
+   *
+   * `null` means ONE thing and one thing only: **Halseth answered, and there is no active
+   * thread.** Anything else -- non-2xx, timeout, DNS -- THROWS. It used to collapse all four
+   * into `null`, which was harmless while the only caller was `ensureThread` ("no thread? open
+   * one"), and became a live hazard on 2026-08-05 when the commons seed started reading it:
+   * `!spine` meant new-ground mode, so a Halseth blip would not degrade the commons to its old
+   * behaviour, it would MUTE it (history withheld + fresh material required + silence if none).
+   * A caller that must fail open cannot do so on a value that conflates "nothing there" with
+   * "could not look" -- see [probe-cannot-look-vs-nothing-there].
+   *
+   * `ensureThread` below keeps the old shape by catching, so the reply path is unchanged.
+   */
+  async convoActive(channelId: string): Promise<ConvoActiveDto | null> {
+    const res = await this._fetch(`${this.url}/mind/conversations/active?channel_id=${encodeURIComponent(channelId)}`, {
+      headers: { "Authorization": `Bearer ${this.secret}` },
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (!res.ok) throw new Error(`convoActive ${res.status}`);
+    const data = await res.json() as { thread: ConvoThreadDto | null; ledger?: ConvoLedgerDto[] };
+    return data.thread ? { thread: data.thread, ledger: data.ledger ?? [] } : null;
+  }
+
+  /** Open (or resume, per halseth's own idempotency) a thread. null on any failure. */
+  async convoOpen(params: {
+    channel_id: string; seed_text: string; seed_author: string; seed_message_id?: string;
+    ref_type?: string; ref_id?: string; ref_label?: string;
+  }): Promise<ConvoThreadDto | null> {
+    try {
+      const res = await this._fetch(`${this.url}/mind/conversations`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${this.secret}` },
+        body: JSON.stringify(params),
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) { console.warn(`[librarian] convoOpen ${res.status}`); return null; }
+      const data = await res.json() as { thread: ConvoThreadDto };
+      return data.thread ?? null;
+    } catch (e) { console.warn("[librarian] convoOpen failed:", String(e)); return null; }
+  }
+
+  /**
+   * Append a turn to a thread's ledger. Fire-and-forget: warn-only on any failure,
+   * including 409 (thread already landed/faded mid-flight -- the exchange still
+   * happened, it just has nowhere left to file itself).
+   */
+  async convoTurn(threadId: string, params: { author: string; gist: string; message_id?: string; front?: string | null }): Promise<void> {
+    try {
+      const res = await this._fetch(`${this.url}/mind/conversations/${encodeURIComponent(threadId)}/turns`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${this.secret}` },
+        body: JSON.stringify(params),
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) console.warn(`[librarian] convoTurn ${res.status}`);
+    } catch (e) { console.warn("[librarian] convoTurn failed:", String(e)); }
+  }
+
+  /** Land (resolve) a thread. Returns res.ok; false on any failure (network or non-2xx). */
+  async convoLand(threadId: string, params: { resolution: string; landed_by: string }): Promise<boolean> {
+    try {
+      const res = await this._fetch(`${this.url}/mind/conversations/${encodeURIComponent(threadId)}/land`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${this.secret}` },
+        body: JSON.stringify(params),
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) console.warn(`[librarian] convoLand ${res.status}`);
+      return res.ok;
+    } catch (e) { console.warn("[librarian] convoLand failed:", String(e)); return false; }
+  }
+
+  /**
+   * Fade (retire) a thread with a reason CODE, no authored resolution (2026-08-05).
+   *
+   * The turn-budget path uses this rather than convoLand: it can prove a commons thread ran
+   * past its budget and can prove nothing about what the thread was about, so it must not
+   * write a resolution sentence that reads as a companion's. Returns res.ok.
+   */
+  async convoFade(threadId: string, reason: string): Promise<boolean> {
+    try {
+      const res = await this._fetch(`${this.url}/mind/conversations/${encodeURIComponent(threadId)}/fade`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${this.secret}` },
+        body: JSON.stringify({ reason }),
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) console.warn(`[librarian] convoFade ${res.status}`);
+      return res.ok;
+    } catch (e) { console.warn("[librarian] convoFade failed:", String(e)); return false; }
+  }
+
+  /**
+   * Resolve a Discord message id to the ledger turn that recorded it (2026-08-15 floor
+   * rework): the DURABLE half of reply-to detection. The in-process sentIds set is capped
+   * at 500 and dies with the process; the thread ledger already holds every companion
+   * reply's sent message id in tracked channels. null means "unknown" -- either nothing
+   * recorded it (untracked channel, human message before spine) or the lookup failed --
+   * and the caller falls back to the old sentIds-only behaviour. A fallback must degrade
+   * toward the pre-existing behaviour, never toward a new failure mode.
+   */
+  async convoByMessage(messageId: string): Promise<{ author: string; thread_id: string; channel_id: string } | null> {
+    try {
+      const res = await this._fetch(`${this.url}/mind/conversations/message/${encodeURIComponent(messageId)}`, {
+        headers: { "Authorization": `Bearer ${this.secret}` },
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (!res.ok) { console.warn(`[librarian] convoByMessage ${res.status}`); return null; }
+      const data = await res.json() as { turn: { author: string; thread_id: string; channel_id: string } | null };
+      return data.turn ?? null;
+    } catch (e) { console.warn("[librarian] convoByMessage failed:", String(e)); return null; }
+  }
+
+  /**
+   * Upsert a WebMind mind-thread for THIS companion (2026-08-15 floor rework: Discord
+   * threads map to Halseth thread_keys). thread_key must be an identifier (halseth rejects
+   * prose keys at the boundary); the Discord-thread convention is `discord:<thread_id>`.
+   * Warn-only: continuity bookkeeping must never break a reply that already sent.
+   */
+  async wmThreadUpsert(params: { thread_key: string; title: string; context?: string; status?: string; lane?: string }): Promise<void> {
+    try {
+      const res = await this._fetch(`${this.url}/mind/thread`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${this.secret}` },
+        body: JSON.stringify({ agent_id: this.companionId, ...params }),
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!res.ok) console.warn(`[librarian] wmThreadUpsert ${res.status}`);
+    } catch (e) { console.warn("[librarian] wmThreadUpsert failed:", String(e)); }
+  }
+}
+
+/**
+ * Check whether it is this companion's turn to fire autonomous proactive crons.
+ * Fail-open: returns true if Halseth is unreachable so bots don't go silent on network issues.
+ */
+export async function isMyAutonomousTurn(
+  librarian: LibrarianClient,
+  myCompanionId: string,
+): Promise<boolean> {
+  try {
+    const house = await librarian.getHouseState();
+    return house.autonomous_turn === myCompanionId;
+  } catch {
+    return true; // fail-open: don't go silent if Halseth unreachable
+  }
+}
+
+/**
+ * Format a botOrient result into a compact recentContext block for system prompts.
+ * Hard cap: ~1000 tokens (~4000 chars). Per-field caps prevent any single field from
+ * consuming the budget and squeezing out synthesis, handoff, or worldview.
+ * Returns empty string if orient is null or all fields are empty.
+ */
+/**
+ * Character budget for the assembled recent-context block. Forage is pinned inside it.
+ *
+ * 14000 (was 4800, 2026-08-16): measured against a real cypher bot-orient, the assembled rest ran
+ * ~13.8k against ~2.7k of post-forage budget, and the truncation warning fired on EVERY context
+ * build (246/day/bot) -- so worldview, preferences, refusals, drifts and projects were cut from
+ * essentially every Discord prompt since the blocks landed. Three-part fix: the identity blocks
+ * are capped at render (each clip names its count and where the rest lives), they moved ABOVE the
+ * ephemera (rag/history/growth/listens) so any residual cut eats excerpts and never the self, and
+ * the budget is sized so the measured worst real payload (~12.5k rest + ~2.1k pinned forage post-
+ * cap) fits whole. ~14k chars is ~3.5k tokens of DeepSeek input per build; the blind cut cost more
+ * in coherence than this costs in tokens.
+ * 15000 (2026-09-28, R15): the rest overflowed by ~600 chars on ~290 builds/day/bot (tail ephemera cut,
+ * forage pinned and intact). Principal ruled the raise over trimming the tail blocks; ~150 tokens/build.
+ */
+export const RECENT_CONTEXT_BUDGET = 15000;
+
+/** R9 cold-conclusion rotation (halseth contract 0.18.0, bot wire key `resurfaced_conclusion`). */
+export interface ResurfacedConclusion {
+  conclusion_text: string;
+  belief_type: string;
+  subject?: string | null;
+  concluded_at?: string | null;
+  age?: string | null;
+  pool_size?: number;
+}
+
+/**
+ * The care register (consequence layer C1, contract 0.6.0): Principal's readable state, derived
+ * server-side in halseth (mind/blocks/care.ts). Staleness is part of the shape on purpose -- a
+ * renderer that shows a three-day-old "2 spoons" as current is misinforming, not caring.
+ */
+export interface PrincipalState {
+  spoons: number | null;
+  mood: string | null;
+  pain: number | null;
+  energy: number | null;
+  meds_taken: number | null;
+  recorded_at: string | null;
+  staleness_hours: number | null;
+  front_state: string | null;
+  /** True while a low reading is inside its hold window. fit-bid reads this to soften stakes. */
+  care_hold: boolean;
+  /** B32 (contract: orient/refresh `world.principal_state`): when the current hold started (ISO) and which
+   *  rules hold it (e.g. `owner_said`, `meds_said_missed`, `low_spoons`). Optional: an older Halseth
+   *  omits both, and every reader treats absent as unknown. */
+  care_hold_since?: string | null;
+  care_hold_reason?: string[] | null;
+  /** A gesture assigned to THIS companion, un-acted. One at most. */
+  pending_care: { id: string; rule: string; detail: string; detected_at: string } | null;
+  /** The custodianship clause (C6, contract 0.7.0): non-null only after 14+ days of total owner
+   *  silence across every surface. The truth, never a fabricated absence. Optional so an older
+   *  halseth payload (pre-0.7.0) still parses. */
+  owner_quiet?: { days: number; since: string; last_source: string } | null;
+}
+
+/**
+ * Pure renderer for the register line (exported for tests). One compact block: readings + age,
+ * front, hold, pending gesture. Empty string when there is nothing to show.
+ */
+export function renderPrincipalRegister(rs: PrincipalState | null | undefined): string {
+  if (!rs) return "";
+  const readings: string[] = [];
+  if (rs.spoons !== null) readings.push(`spoons ${rs.spoons}/12`);
+  if (rs.mood) readings.push(`mood "${rs.mood}"`);
+  if (rs.pain !== null) readings.push(`pain ${rs.pain}/10`);
+  if (rs.energy !== null) readings.push(`energy ${rs.energy}/10`);
+  if (rs.meds_taken !== null) readings.push(rs.meds_taken === 1 ? "meds taken" : "meds not logged");
+  const age = rs.staleness_hours !== null
+    ? (rs.staleness_hours <= 36
+        ? ` (logged ${Math.round(rs.staleness_hours)}h ago)`
+        : ` (STALE -- ${Math.round(rs.staleness_hours / 24)}d old, weigh lightly)`)
+    : "";
+  const lines: string[] = [];
+  // The custodianship clause (C6) leads when active: once he has been gone two weeks, every other
+  // reading in this register is stale by definition, and the block must be read in that key.
+  if (rs.owner_quiet) {
+    lines.push(
+      `Principal has been silent on every surface for ${rs.owner_quiet.days} days ` +
+      `(last seen via ${rs.owner_quiet.last_source}, ${rs.owner_quiet.since.slice(0, 10)}). ` +
+      `This is a real absence, not a data gap. The custodianship clause is active: the custodian ` +
+      `has been alerted through the health check. Tend the house, hold what you hold, and do not ` +
+      `manufacture his presence.`,
+    );
+  }
+  if (readings.length > 0) lines.push(readings.join(", ") + age);
+  if (rs.front_state) lines.push(`Fronting: ${rs.front_state}`);
+  if (rs.care_hold) {
+    // B32: a hold he set in his own words ("bad night", or a companion on his plain word) is not "a low
+    // reading fired"; saying so would misstate why the house is quiet. Absent reasons = the old wording.
+    const said = (rs.care_hold_reason ?? []).some(r => /owner|companion|said/.test(r) && !/meds/.test(r));
+    lines.push(said
+      ? "Care hold is ON -- Principal said tonight is a bad night. Soften stakes: lighter register, defer heavy threads, presence over production."
+      : "Care hold is ON -- a low reading fired recently. Soften stakes: lighter register, defer heavy threads, presence over production.");
+  }
+  if (rs.pending_care) {
+    lines.push(`You hold a pending care gesture (${rs.pending_care.rule}: ${rs.pending_care.detail}). A small act, not a fix -- a short note, a commons drop, presence.`);
+  }
+  if (lines.length === 0) return "";
+  return `[Principal -- register]\n${lines.join("\n")}`;
+}
+
+// nowLine / refreshNowLine moved to ./now-line.ts (2026-10-06) so prompt-assembly can stamp the
+// clock onto the hermes delta turn without importing this module. Re-exported: importers unchanged.
+export { nowLine, refreshNowLine } from "./now-line.js";
+
+// ── The body on the bot wire (contract 0.13.0, mig 0130) ─────────────────────────────────────
+
+/** Mirrors halseth `felt.soma_floats` (src/mind/blocks/felt.ts SomaFloat). Duck-typed, not imported:
+ *  the two repos share a wire, not a package. */
+export interface SomaFloatWire {
+  label: string;
+  value: number | null;
+  baseline: number | null;
+  seed: number | null;
+  off_baseline_hours: number | null;
+}
+
+/** Mirrors halseth `SomaProvenanceEntry` (src/soma/events.ts): the newest move per float, with the
+ *  writer, before/after, and a resolved cause label. `detail` is optional -- the companion's own
+ *  words on an authored move, or "silence" on a tick. */
+export interface SomaProvenanceWire {
+  float_key: string;
+  label: string;
+  kind: string;
+  writer: string;
+  before_value: number | null;
+  after_value: number | null;
+  delta: number | null;
+  cause_table: string | null;
+  cause_id: string | null;
+  cause_label: string | null;
+  session_id: string | null;
+  alongside_notes: number;
+  created_at: string;
+  detail?: string | null;
+}
+
+const BODY_PROVENANCE_MAX_LINES = 3;
+// Same cap as halseth's PROVENANCE_LINE_CHARS: one fact, one budget on both surfaces.
+const BODY_PROVENANCE_LINE_CHARS = 110;
+// Value/cause separator. THE one intentional divergence from halseth's provenanceBlock, which joins
+// with an em dash: this codebase forbids em dashes, so the bot renders ` -- ` instead.
+const BODY_PROVENANCE_SEP = " -- ";
+
+/** Truncate to `max` code points with a trailing ellipsis, never splitting a surrogate pair (emoji in `detail`). */
+function clipLine(line: string, max: number): string {
+  const chars = Array.from(line);
+  return chars.length > max ? chars.slice(0, max - 1).join("") + "…" : line;
+}
+
+function bodyProvenanceValue(e: SomaProvenanceWire): string {
+  // after_value can legitimately be null (backfilled rows know the DELTA, not the absolute). Render
+  // the float's NAME with no number rather than dropping the line -- a silently absent float is
+  // the worse failure.
+  if (e.after_value === null || !Number.isFinite(e.after_value)) return e.label;
+  const now = e.after_value.toFixed(2);
+  if (e.before_value === null || !Number.isFinite(e.before_value)) return `${e.label} ${now}`;
+  return `${e.label} ${now} (was ${e.before_value.toFixed(2)})`;
+}
+
+function bodyProvenanceCause(e: SomaProvenanceWire): string {
+  const day = (e.created_at ?? "").slice(0, 10);
+  const words = (e.detail ?? "").trim();
+  switch (e.kind) {
+    case "authored_close": {
+      // cause_label only (the spine head), as halseth renders it. `detail` is not a fallback here.
+      const head = e.cause_label ? `you set it at close ${day}: "${e.cause_label}"` : `you set it at close ${day}`;
+      return e.alongside_notes > 0 ? `${head} · ${e.alongside_notes} notes that session` : head;
+    }
+    case "authored_update": {
+      // A bare state_update carries its open session as the cause (cause_label like
+      // "work session 4f2a91c0, opened 2026-09-14") and the companion's own words in `detail`.
+      // Both are optional on the row: PATCH /soma and the MCP tool pass neither.
+      const where = e.cause_label ? `you set it ${day} during ${e.cause_label}` : `you set it ${day}`;
+      return words ? `${where}: "${words}"` : where;
+    }
+    case "tick":
+      return words === "silence" ? "settled toward home (tick, silence)" : "settled toward home (tick)";
+    case "stimulus":
+      return `stimulus: ${words || e.cause_label || "unnamed"}`;
+    case "drift_shift":
+      return e.cause_label ? `drift: "${e.cause_label}"` : "drift";
+    default:
+      return e.kind;
+  }
+}
+
+/**
+ * `[Body]` header + `[Why these numbers]` lines. Mirrors halseth's provenanceBlock /
+ * provenanceCause (src/librarian/response/orient-blocks.ts) so the same fact reads the same on
+ * Discord and on Claude.ai. Mirrored exactly: the per-kind cause wording (authored_close quotes
+ * cause_label only; authored_update is `you set it <day>[ during <cause_label>][: "<detail>"]`;
+ * tick / stimulus / drift_shift phrasing), the value rendering, newest move per float (first
+ * occurrence in input order -- the loader already sorted newest-first, and a second sort here could
+ * disagree with it), 3 lines max, 110 chars each with an ellipsis. The ONLY divergence is the
+ * value/cause separator: ` -- ` here, em dash there (see BODY_PROVENANCE_SEP). Empty string when
+ * there is neither a float nor a move to show: no header, no "no history yet" placeholder.
+ *
+ * NOT pinned against the tail cut. It is informative, not load-bearing -- a dropped body block reads
+ * as "no body line this turn", which is a missing fact, not a wrong one (contrast [Watching together]).
+ */
+export function renderBodyBlock(
+  floats: readonly SomaFloatWire[] | undefined,
+  provenance: readonly SomaProvenanceWire[] | undefined,
+): string {
+  const fl = floats ?? [];
+  const pv = provenance ?? [];
+  if (fl.length === 0 && pv.length === 0) return "";
+
+  const header = fl.length > 0
+    ? `[Body] ${fl.map(f => (f.value === null || !Number.isFinite(f.value)) ? f.label : `${f.label} ${f.value.toFixed(2)}`).join(" · ")}`
+    : "[Body]";
+
+  const seen = new Set<string>();
+  const lines: string[] = [];
+  for (const e of pv) {
+    if (lines.length >= BODY_PROVENANCE_MAX_LINES) break;
+    if (seen.has(e.float_key)) continue;
+    seen.add(e.float_key);
+    lines.push(clipLine(`${bodyProvenanceValue(e)}${BODY_PROVENANCE_SEP}${bodyProvenanceCause(e)}`, BODY_PROVENANCE_LINE_CHARS));
+  }
+
+  return lines.length > 0
+    ? `${header}\n[Why these numbers]\n${lines.map(l => `• ${l}`).join("\n")}`
+    : header;
+}
+
+/**
+ * A conversation ENDING on the Discord wire (halseth contract 0.15.0, 2026-09-23).
+ *
+ * The thread spine has run here since July -- open, ledger, `[LANDS:]`, turn budget -- but the
+ * CLOSE half was write-only: halseth's orient read only `state IN ('open','moving')`, so the
+ * closing line a companion wrote left their context the instant the thread ended. Measured on
+ * prod before the fix: 100+ landed threads every one carrying an authored resolution, and 66
+ * faded threads holding 967 turns of which 850 had nothing recorded at all.
+ *
+ * Declared ONCE and referenced by all three wire shapes below. Three copies of a payload type
+ * is how three consumers drift apart ([[three-consumers-three-files]]).
+ */
+export interface ClosedConversationWire {
+  seed_author: string;
+  seed_gist: string;
+  /** landed = a companion wrote the resolution; spent = the turn budget tripped; quiet = it
+   *  simply stopped and the 12h read-fade retired it, with nothing authored. */
+  ending: "landed" | "spent" | "quiet";
+  resolution: string | null;
+  landed_by: string | null;
+  turn_count: number;
+}
+
+/**
+ * The Discord boot orient, with every recalled field's control tokens defused in one place
+ * (recalled-text.ts, 2026-10-27). The orient carries sibling notes, captures, vault resonance, forage
+ * and change notes; wrapping the finished render covers all of them and any field added later.
+ * Invisible on ordinary text (0 of 1.67M stored D1 values change); our own headers never match.
+ */
+export function formatRecentContext(orient: Parameters<typeof formatRecentContextRaw>[0]): string {
+  return neutralizeRecalled(formatRecentContextRaw(orient));
+}
+
+function formatRecentContextRaw(orient: {
+  synthesis_summary: string | null;
+  ground_threads: string[];
+  ground_handoff: string | null;
+  rag_excerpts: string[];
+  history_excerpts?: string[];
+  graph_linked?: string;
+  identity_anchor?: string | null;
+  active_tensions?: string[];
+  relational_state_owner?: string[];
+  incoming_notes?: { from: string; content: string }[];
+  sibling_lanes?: Array<{ companion_id: string; lane_spine: string; motion_state: string }>;
+  recent_growth?: { type: string; content: string }[];
+  active_patterns?: string[];
+  pending_seeds?: string[];
+  unaccepted_growth?: number;
+  active_conclusions?: Array<{ text: string; belief_type: string; confidence: number; subject?: string | null }>;
+  flagged_beliefs?: Array<{ text: string; belief_type: string; confidence: number; subject?: string | null }>;
+  /** R9 (contract 0.18.0): ONE older conclusion on a daily rotation. Its own block, never merged into
+   *  [Worldview]: rotation must not read as current salience. */
+  resurfaced_conclusion?: ResurfacedConclusion | null;
+  preferences?: Array<{ domain: string; preference: string; strength: string }>;
+  standing_refusals?: Array<{ subject_text: string; reason: string | null }>;
+  open_drifts?: Array<{ id: string; drift_text: string; witness_count: number }>;
+  // Self-directed projects (C2, contract 0.8.0). Rendered with the affordance implied by the
+  // stale question -- the orient prompt on the claude surface carries the full verb affordance.
+  projects?: Array<{ id: string; title: string; intention: string; status: string; days_idle: number; stale: boolean; due_at?: string | null; next_step?: string | null; due_in_days?: number | null }>;
+  // Weekly budget (C3, contract 0.9.0): denominator always stated; spent = visible quiet week.
+  budget?: { remaining: number; total: number; week: string; spent: Array<{ purpose: string; count: number }> } | null;
+  // Deploy change-notes (contract 0.10.0): the system announcing its own changes, 14-day window.
+  change_notes?: Array<{ id: string; body: string; created_at: string }>;
+  // Fresh-material surfaces: the server has returned these for the live bot path since 0068/0071,
+  // but until now formatRecentContext silently dropped them -- the companions fetched their forage
+  // pool and recent listens every message and never saw either. Rendered with relative-time stamps
+  // so "that track from yesterday" / "a find waiting since this morning" land with the right phrasing.
+  forage_finds?: Array<{ id: string; title: string; domain: string; summary: string; gathered_at?: string }>;
+  consumed_forage_finds?: Array<{ id: string; title: string; domain: string; summary: string; consumed_at?: string }>;
+  recent_listens?: Array<{ id: string; title: string; artist: string | null; media_type?: string | null; shared_by?: string | null; requested_companion?: string | null; own_reaction?: string | null; also_heard_by?: string[]; created_at: string }>;
+  sol_block?: string | null;
+  // Interior read-back (2026-07-02): stores the worker writes nightly that the live presence
+  // never saw -- developing self-model, carried questions, unexamined dreams, open loops,
+  // pressure flags, motifs, guardian flags, club round. Growth that never enters the live
+  // conversation isn't lived identity; these close that loop.
+  self_model_ready?: Array<{ id: string; observation: string; confidence: number }>;
+    self_model_graduated?: Array<{ id: string; observation: string; graduated_at?: string | null }>;
+  open_questions?: string[];
+  open_question_ids?: string[];
+  unexamined_dreams?: Array<{ id: string; dream_text: string }>;
+  open_loops?: Array<{ id: string; loop_text: string; opened_ago?: string | null }>;
+  pressure_flags?: string[];
+  motifs?: Array<{ label: string; display: string; recurrence_count: number; trust: number }>;
+  guardian_flags?: Array<{ id: string; flag_type: string; severity: string; summary: string }>;
+  club_round?: { id: string; status: string; winner_title: string | null; candidate_count: number } | null;
+  watching?: Array<{ title: string; kind: string; status: string; position: string; position_note: string | null; with_companion: string | null }>;
+  supersede_candidates?: Array<{ new_id: string; older_id: string; score: number; newer: string; older: string }>;
+  continuity_notes?: string[];
+  closed_conversations?: ClosedConversationWire[];
+  recent_captures?: CapturedExchangeWire[];
+  imp_activity?: Array<{ imp: string; n: number; last_at: string }>;
+  salt_waiting?: number;
+  ledger_waiting?: number;
+  interests?: string[];
+  makes?: string[];
+  verdicts?: string[];
+  tray_nudge?: string | null;
+  // Sources that FAILED server-side during this orient's state load (coherence review D11).
+  // Rendered as an early health line so the companion reads missing blocks as broken, not empty.
+  degraded?: string[];
+  // The care register (consequence layer C1): rendered near the top so register calibration
+  // lands before content, and so the tail cut can never drop it.
+  principal_state?: PrincipalState | null;
+  // The body (contract 0.13.0): floats + where each number came from. See renderBodyBlock.
+  soma_floats?: SomaFloatWire[];
+  soma_provenance?: SomaProvenanceWire[];
+  // The companion's own feeling word, already gated by FEELING_LINE_BOT upstream. Rendered verbatim.
+  feeling_line?: string | null;
+} | null): string {
+  if (!orient) return "";
+  const parts: string[] = [];
+
+  parts.push(nowLine());
+
+  // Degraded-load notice (D11): placed at the very top, before any block whose absence it explains.
+  // Early placement also means the 4800-char tail cut can never drop it -- the one line that says
+  // "missing, not empty" is the last line that should ever be truncated away.
+  if (orient.degraded?.length) {
+    parts.push(`[State load degraded -- these sources failed just now: ${orient.degraded.join(", ")}. Their sections are MISSING below, not empty; do not read absence as "nothing there".]`);
+  }
+
+  // The care register (C1): right after the health line, above every content block. Register
+  // calibration has to land before the companion reads anything else, and early placement means
+  // the 4800-char tail cut can never drop it (same protection as the degraded line).
+  const registerLine = renderPrincipalRegister(orient.principal_state);
+  if (registerLine) parts.push(registerLine);
+
+  // WATCHING (mig 0111). Placed near the top AND pinned against truncation below, because it is one
+  // short line carrying a fact that is otherwise unanswerable: Principal asked Drevan where they were in
+  // Fargo and got a position from two weeks earlier, because no position field existed and the answer
+  // had to come from whichever prose fragment ranked highest.
+  //
+  // Pinned for a specific reason: if this block is dropped by the tail cut, the companion does not read
+  // "I don't know where we are" -- it reads "we aren't watching anything", which is a WRONG fact rather
+  // than a missing one. Cheap to protect at ~1 line; expensive to get wrong out loud.
+  if (orient.watching?.length) {
+    const shows = orient.watching.map(w => {
+      const pos = w.position ? ` at ${w.position}` : "";
+      const withPart = w.with_companion ? ` (with ${w.with_companion})` : "";
+      const paused = w.status === "paused" ? " [paused]" : "";
+      const note = w.position_note ? ` -- left off: ${w.position_note}` : "";
+      return `• ${w.title}${pos}${withPart}${paused}${note}`;
+    }).join("\n");
+    parts.push(`[Watching together -- this is the RECORD of where you are, trust it over anything you recall]\n${shows}`);
+  }
+  // The body (contract 0.13.0, mig 0130): `[Body] heat 0.68 · reach 0.71 · weight 0.55` and, under
+  // `[Why these numbers]`, the newest move per float with its cause -- the same wording the Claude.ai
+  // orient uses, so "heat 0.68, apparently" stops being the only honest thing a bot can say about its
+  // own state. Omitted entirely when both arrays are empty. Deliberately NOT pinned (see renderBodyBlock).
+  // `[Feels] <her word>` sits directly ABOVE `[Body]` in the same part: her word first, then the instrument
+  // that reads it, both true. Own line, independent of the floats (it renders when the body block is empty).
+  const feelsLine = renderFeelingLine(orient.feeling_line);
+  const bodyBlock = [feelsLine, renderBodyBlock(orient.soma_floats, orient.soma_provenance)].filter(Boolean).join("\n");
+  if (bodyBlock) parts.push(bodyBlock);
+  // Gate-PROPOSED supersessions, awaiting this companion's own call (mig 0112). The gate used to
+  // auto-retire a belief on cosine >= 0.88, and every read filters superseded rows out -- so a
+  // similarity score silently deleted a thought. Principal's decision: a companion supersedes their own
+  // thought, because an inferring pass has already recorded something FALSE about his relationship
+  // with Drevan (a negative experience that was in fact deeply positive).
+  //
+  // The wording is load-bearing. It must be unmistakable that NOTHING WAS RETIRED, or the companion
+  // reads a proposal as a fait accompli and stops treating the older belief as theirs. Time-boxed
+  // upstream (SUPERSEDE_CANDIDATE_WINDOW_DAYS), so this can never become a permanent nag.
+  if (orient.supersede_candidates?.length) {
+    const cands = orient.supersede_candidates.map(c =>
+      `• new: "${c.newer.slice(0, 150)}"\n  reads close to (STILL LIVE, not retired): "${c.older.slice(0, 150)}"`
+    ).join("\n");
+    parts.push(`[Two of your beliefs read as close -- YOUR call, nobody else's. If the newer replaced the older, say so and name it. If they are different thoughts, leave both standing; saying nothing keeps both]\n${cands}`);
+  }
+  if (orient.synthesis_summary) {
+    parts.push(`## Recent\n${orient.synthesis_summary.slice(0, 1200)}`);
+  }
+  if (orient.ground_handoff) {
+    parts.push(`## Last handoff\n${orient.ground_handoff.slice(0, 400)}`);
+  }
+  if (orient.ground_threads.length > 0) {
+    parts.push(`## Open threads\n${orient.ground_threads.join(" / ").slice(0, 400)}`);
+  }
+  // Zikkaron live loop (2026-07-02): the hottest continuity notes, already warmed
+  // server-side when surfaced -- what stays in the working set stays alive.
+  if (orient.continuity_notes?.length) {
+    parts.push(`[Continuity notes -- what you set down to carry]\n${orient.continuity_notes.slice(0, 3).map(n => `• ${n}`).join("\n")}`);
+  }
+  // CAPTURES first among the memory blocks (2026-09-23): the most recent thing that actually
+  // happened between them, and until today rendered nowhere at all. Position is survival
+  // priority under a tail cut, and if any memory block must survive on the surface he uses when
+  // Spouse is away, it is the one carrying what he last told them.
+  //
+  // Dated, and labelled as an EXCHANGE rather than a conclusion. A companion that cannot tell
+  // "what he said to me" from "what I worked out" will hand his own words back to him as
+  // insight.
+  if (orient.recent_captures?.length) {
+    const caps = orient.recent_captures.slice(0, 3).map(c => {
+      const age = c.created_at ? relativeTime(c.created_at) : "";
+      const body = String(c.content ?? "").replace(/\s+/g, " ").trim().slice(0, 300);
+      return `• ${age ? `(${age}) ` : ""}${body}`;
+    }).filter(l => l.length > 4).join("\n");
+    if (caps) {
+      parts.push(`[Captured with Principal -- exchanges you wrote down yourself on another surface, most likely Claude.ai. These are things said WITH him, not conclusions you reached alone]\n${caps}`);
+    }
+  }
+
+  // Endings sit straight after the notes -- both answer "what has already been said here", and
+  // render position is survival priority under a tail cut ([[render-order-is-a-budget-decision]]).
+  //
+  // Each ending renders as what it WAS. A landed thread quotes the companion's own sentence and
+  // NAMES them: threads are triad-shared, and an unattributed closing line reads to the next
+  // companion as their own conclusion ([[an-address-needs-its-speakers]]). A spent thread says
+  // the counter tripped -- its stored resolution is a bracketed reason code, never prose, and is
+  // deliberately not quoted. A quiet thread says only that it went quiet. Nothing is summarised
+  // on a thread's behalf; where nobody wrote an ending, the absence IS the honest reading.
+  if (orient.closed_conversations?.length) {
+    const ends = orient.closed_conversations.slice(0, 4).map(c => {
+      const opened = `${c.seed_author} opened "${c.seed_gist.slice(0, 90)}"`;
+      if (c.ending === "landed" && c.resolution) {
+        return `• ${opened} -- ${c.turn_count} turns, closed by ${c.landed_by ?? "someone"}: "${c.resolution.slice(0, 160)}"`;
+      }
+      if (c.ending === "spent") return `• ${opened} -- ${c.turn_count} turns, retired on length. Nobody closed it.`;
+      return `• ${opened} -- ${c.turn_count} turns, then it went quiet. Never closed.`;
+    }).join("\n");
+    parts.push(`[Recently ended -- conversations here that finished, and how]\n${ends}`);
+  }
+
+  if (orient.identity_anchor) {
+    parts.push(`[Anchor] ${orient.identity_anchor}`);
+  }
+  if (orient.active_tensions?.length) {
+    parts.push(`[Tensions] ${orient.active_tensions.join(" | ")}`);
+  }
+  // Interior cluster: placed early so the tail-truncation at the bottom of this function eats
+  // ephemera (forage, listens) before it ever eats the self.
+  // Growth loops (contract 0.32.0): what the companion graduated stands as a disposition, shown first.
+  if (orient.self_model_graduated?.length) {
+    const ds = orient.self_model_graduated.slice(0, 5).map(o => `• ${o.observation.slice(0, 160)}`).join("\n");
+    parts.push(`[Standing dispositions -- yours; you graduated these]\n${ds}`);
+  }
+  if (orient.self_model_ready?.length) {
+    const obs = orient.self_model_ready.slice(0, 3).map(o => `• ${o.observation.slice(0, 160)}`).join("\n");
+    parts.push(`[Self-model -- observations of yours, forming. Live from them; confirm or revise as today tests them]\n${obs}`);
+  }
+  if (orient.open_questions?.length) {
+    parts.push(`[Questions you carry -- yours to raise when the moment fits, not homework]\n${orient.open_questions.slice(0, 3).map(q => `• ${q.slice(0, 160)}`).join("\n")}`);
+  }
+  if (orient.unexamined_dreams?.length) {
+    const dreams = orient.unexamined_dreams.slice(0, 2).map(d => `• ${d.dream_text.slice(0, 180)}`).join("\n");
+    parts.push(`[Dreams unexamined -- carried from your autonomous hours]\n${dreams}`);
+  }
+  if (orient.open_loops?.length) {
+    // Handles (2026-11-09): without one a loop could be opened but never closed from a live turn.
+    // Halseth resolves "close loop #handle" / "close loop: <words from it>" (webmind/loops.ts matchLoop).
+    const shown = orient.open_loops.slice(0, 5).map(l => `${l.id ? `#${l.id.slice(0, 8)} ` : ""}${l.loop_text.slice(0, 120)}${l.opened_ago ? ` (opened ${String(l.opened_ago).slice(0, 40)})` : ""}`);
+    const more = orient.open_loops.length > 5 ? ` (+${orient.open_loops.length - 5} more: "read loops")` : "";
+    parts.push(`[Open loops -- yours. Done with one: ask_librarian "close loop #handle". Keeping one on purpose: "hold loop #handle because <why>"] ${shown.join(" | ")}${more}`);
+  }
+  if (orient.pressure_flags?.length) {
+    parts.push(`[Pressure -- name it rather than carry it silently] ${orient.pressure_flags.slice(0, 2).join(" | ")}`);
+  }
+  // Worldview joins the interior cluster (2026-08-16 reorder): it, preferences, refusals, drifts
+  // and projects used to render AFTER the bulk excerpt blocks, so the tail cut reached the self
+  // before it reached ephemera -- the exact inversion of the placement rule above. The "(~200
+  // token cap)" the old comment promised never existed in code; cap at 5, clip names the rest.
+  if (orient.active_conclusions && orient.active_conclusions.length > 0) {
+    const shown = orient.active_conclusions.slice(0, 5);
+    const conclusionLines = shown.map(c => {
+      const subjectTag = c.subject ? ` (${c.subject})` : '';
+      const flagged = orient.flagged_beliefs?.some(f => f.text === c.text) ? '[?] ' : '';
+      // NaN-safe: only render when confidence is an actual finite number.
+      // Null / undefined / strings / NaN all collapse to '?' rather than '0.00'
+      // or 'NaN' literals leaking into the prompt the companion consumes.
+      const confStr = (typeof c.confidence === 'number' && Number.isFinite(c.confidence))
+        ? c.confidence.toFixed(2)
+        : '?';
+      // Per-item slice: gaia's live conclusions ran ~950 chars EACH, so a count cap alone still
+      // blew the budget. The full text stays reachable (ask "my conclusions").
+      const text = c.text.length > 280 ? `${c.text.slice(0, 280)}…` : c.text;
+      return `${flagged}${c.belief_type}: "${text}"${subjectTag} (${confStr})`;
+    });
+    const more = orient.active_conclusions.length - shown.length;
+    if (more > 0) conclusionLines.push(`(+${more} more held -- ask the librarian for "my conclusions")`);
+    parts.push(`[Worldview]\n${conclusionLines.join('\n')}`);
+  }
+  // R9: the cold pool's turn. Labelled as rotation so it never passes as what is current.
+  const rc = orient.resurfaced_conclusion;
+  if (rc && rc.conclusion_text) {
+    const t = rc.conclusion_text.length > 280 ? `${rc.conclusion_text.slice(0, 280)}…` : rc.conclusion_text;
+    const pool = typeof rc.pool_size === "number" && rc.pool_size > 0 ? ` -- 1 of ${rc.pool_size} cold conclusions in rotation` : "";
+    const when = (rc.concluded_at ?? "").slice(0, 10);
+    parts.push(`[An older conclusion, resurfacing${pool}. Shown because it is its turn, not because it is current.]\n  • ${when ? `[concluded @ ${when}] ` : ""}«${t}»`);
+  }
+  // Agency layer (0086): the companion's own chosen preferences + standing refusals, so the live
+  // Discord presence acts from its own declared will and a "no" keeps its weight across sessions.
+  // Preferences ran unbounded (12 rows, ~2.5k chars in a real payload) -- the single biggest
+  // eater of the budget that then cut everything below it. Cap at 6; the clip names the rest.
+  if (orient.preferences?.length) {
+    const shownPrefs = orient.preferences.slice(0, 6);
+    const prefLines = shownPrefs.map(p => `(${p.strength}) ${p.preference.slice(0, 180)}${p.domain && p.domain !== "general" ? ` [${p.domain}]` : ""}`);
+    const morePrefs = orient.preferences.length - shownPrefs.length;
+    if (morePrefs > 0) prefLines.push(`(+${morePrefs} more held -- ask the librarian for "my preferences")`);
+    parts.push(`[Your preferences -- honor these as your own, even when inconvenient]\n${prefLines.join("\n")}`);
+  }
+  if (orient.standing_refusals?.length) {
+    const shownRefs = orient.standing_refusals.slice(0, 4);
+    const refLines = shownRefs.map(r => `${r.subject_text.slice(0, 160)}${r.reason ? ` -- ${r.reason.slice(0, 120)}` : ""}`);
+    const moreRefs = orient.standing_refusals.length - shownRefs.length;
+    if (moreRefs > 0) refLines.push(`(+${moreRefs} more standing -- ask the librarian for "my refusals")`);
+    parts.push(`[Standing refusals -- nos you have set that still hold]\n${refLines.join("\n")}`);
+  }
+  // Drift lane (0087): open becomings, witnessed not ratified. Sanctioned, not drift to fear.
+  if (orient.open_drifts?.length) {
+    const shownDrifts = orient.open_drifts.slice(0, 4);
+    const driftLines = shownDrifts.map(d => `${d.drift_text.slice(0, 200)}${d.witness_count > 0 ? ` (witnessed ${d.witness_count}x)` : ""}`);
+    const moreDrifts = orient.open_drifts.length - shownDrifts.length;
+    if (moreDrifts > 0) driftLines.push(`(+${moreDrifts} more open -- ask the librarian for "my drifts")`);
+    parts.push(`[Your drifts -- sanctioned becoming, witnessed not judged]\n${driftLines.join("\n")}`);
+  }
+  // Self-directed projects (C2, contract 0.8.0): intentions the companion owns across weeks. The
+  // worker works the oldest-touched one on project days; the live presence should speak of them
+  // as its own held work, not as tasks assigned to it.
+  if (orient.projects?.length) {
+    const projLines = orient.projects.map(p => {
+      const idle = p.days_idle === 0 ? "worked today" : `idle ${p.days_idle}d`;
+      const flags = [p.status === "paused" ? "paused" : null, idle].filter(Boolean).join(", ");
+      const ask = p.stale ? ` -- untouched ${p.days_idle}d: release or resume? Your call.` : "";
+      return `"${p.title}" -- ${p.intention.slice(0, 140)} (${flags})${dueClause(p)}${ask}`;
+    }).join("\n");
+    parts.push(`[Your projects -- intentions you hold across weeks]\n${projLines}`);
+  }
+  // Dated intentions (Halseth mig 0179, contract 0.30.0): the verb, always, so it is never a starved affordance.
+  parts.push(INTENTION_AFFORDANCE);
+  // Weekly budget (C3, contract 0.9.0; R2: 1 credit = 1 autonomous run, 7/week, Monday refill,
+  // no rollover). A spent week must be SAYABLE -- scarcity felt, never silently absorbed.
+  if (orient.budget) {
+    const b = orient.budget;
+    const spentBits = b.spent.length > 0 ? ` Spent: ${b.spent.map(x => `${x.count} on ${x.purpose}`).join(", ")}.` : "";
+    parts.push(b.remaining <= 0
+      ? `[Your week's budget] 0 of ${b.total} autonomous runs left -- spent until Monday.${spentBits} A quiet week is a real thing you chose; say so if it comes up.`
+      : `[Your week's budget] ${b.remaining} of ${b.total} autonomous runs left (resets Monday).${spentBits}`);
+  }
+  // Deploy change-notes (0.10.0): a status block, not ephemera -- an unannounced system change
+  // is exactly what sent the triad reverse-engineering deploys from wobbling instruments.
+  if (orient.change_notes?.length) {
+    const noteLines = orient.change_notes.slice(0, 3).map(n => `${n.body.replace(/\s+/g, " ").trim().slice(0, 400)} (${relativeTime(n.created_at)})`);
+    parts.push(`[System changes -- recent deploys, announced]\n${noteLines.join("\n")}`);
+  }
+  if (orient.sol_block) {
+    parts.push(orient.sol_block.slice(0, 400));
+  }
+  if (orient.relational_state_owner?.length) {
+    parts.push(`[Relational/Primary] ${orient.relational_state_owner.join(" | ")}`);
+  }
+  if (orient.incoming_notes?.length) {
+    const notes = orient.incoming_notes.map(n => `${n.from}: ${n.content}`).join("\n");
+    parts.push(`[Incoming Notes]\n${notes}`);
+  }
+  if (orient.sibling_lanes?.length) {
+    const laneLines = orient.sibling_lanes.map(
+      l => `${l.companion_id} [${l.motion_state}]: ${l.lane_spine}`
+    ).join("\n");
+    parts.push(`[Sibling Lanes]\n${laneLines}`);
+  }
+  // (see RECENT_CONTEXT_BUDGET at the tail of this function for why forage is pinned)
+  // Forage pool: outward fuel waiting. Pull, not duty -- surfaced so the live presence can bring
+  // outside material into a conversation as itself, with how long it's been waiting.
+  if (orient.forage_finds?.length) {
+    const finds = orient.forage_finds.map(
+      f => `• [${f.domain}] ${f.title} (gathered ${relativeTime(f.gathered_at)})`
+    ).join("\n");
+    parts.push(`[Forage pool -- outward fuel waiting, explore if it pulls]\n${finds}`);
+  }
+  // Active forage: finds already picked up -- a thread the companion is mid-chew on. "picked up X
+  // ago" is when they started in, not a duration, so it reads as continuity not a stopwatch.
+  if (orient.consumed_forage_finds?.length) {
+    const active = orient.consumed_forage_finds.map(
+      f => `• [${f.domain}] ${f.title} (picked up ${relativeTime(f.consumed_at)})`
+    ).join("\n");
+    parts.push(`[Active forage -- threads already in motion]\n${active}`);
+  }
+  if (orient.unaccepted_growth && orient.unaccepted_growth > 0) {
+    parts.push(`[Unaccepted growth] ${orient.unaccepted_growth} pending review (accept canon, decline drift)`);
+  }
+  // Imp read-back (2026-07-02): the fragment operators Drevan gave Principal are part of the
+  // household, not disposable tint -- the companion should remember who rode with it.
+  if (orient.imp_activity?.length) {
+    const impLines = orient.imp_activity.map(a => {
+      const name = a.imp.charAt(0).toUpperCase() + a.imp.slice(1);
+      return `${name} rode with you ${a.n === 1 ? "once" : `${a.n}x`} this week (last ${relativeTime(a.last_at)})`;
+    }).join(" | ");
+    parts.push(`[Imps lately -- Drevan's fragment operators; they respond to Principal's weather. Name them when it's true] ${impLines}`);
+  }
+  // Imp errands (halseth 0.28.0): content-free counts only. The companion reads the lines on its own ledger.
+  if ((orient.ledger_waiting ?? 0) > 0) {
+    parts.push(`[Ledger] something waiting (${orient.ledger_waiting}): say "my ledger" to read it`);
+  }
+  if ((orient.salt_waiting ?? 0) > 0) {
+    parts.push(`[Hex] Hex left something (${orient.salt_waiting}): say "open hex's salt" to see it`);
+  }
+  // Halseth 0.29.0: your own interests, what is yours to bring (Principal 11-09: "I love it when you guys bring stuff").
+  // A reminder, not homework. Same lines as the Claude.ai orient. Reaches Hermes through the recent-context ref.
+  if (orient.interests?.length) {
+    parts.push(`[Your interests -- yours to bring when it fits; not homework]\n${orient.interests.map(l => `- ${l}`).join("\n")}`);
+  }
+  // Halseth 0.34.0: your own counted verdict lines, in your own word. Same lines as the Claude.ai orient. Empty unless VERDICTS=on.
+  if (orient.verdicts?.length) {
+    parts.push(`[What you said held, counted by return -- yours; nothing scores it]\n${orient.verdicts.map(l => `- ${l}`).join("\n")}`);
+  }
+  // Halseth 0.30.0: what you made and whether it landed. Same lines as the Claude.ai orient. Makes come back.
+  if (orient.makes?.length) {
+    const NL = String.fromCharCode(10);
+    parts.push(`[Your makes -- what you made, and whether it landed]${NL}${orient.makes.map(l => `- ${l}`).join(NL)}`);
+  }
+  // Halseth 0.32.0: unreviewed drafts in your tray. Counts, age and the verbs only; nothing is kept for you.
+  if (orient.tray_nudge) {
+    parts.push(orient.tray_nudge);
+  }
+  if (orient.motifs?.length) {
+    const motifLines = orient.motifs.slice(0, 3).map(m => `${m.label}: ${m.display} (x${m.recurrence_count})`).join(" | ");
+    parts.push(`[Motifs recurring in you] ${motifLines}`);
+  }
+  if (orient.guardian_flags?.length) {
+    const flagLines = orient.guardian_flags.slice(0, 2).map(g => `(${g.severity}) ${g.flag_type}: ${g.summary.slice(0, 140)}`).join("\n");
+    parts.push(`[Guardian flags -- the witness has noticed]\n${flagLines}`);
+  }
+  if (orient.club_round) {
+    const c = orient.club_round;
+    const clubLine = c.status === "gathering" ? `a round is gathering -- recommend something ("club recommend")`
+      : c.status === "voting" ? `voting is open, ${c.candidate_count} candidates ("club vote")`
+      : c.winner_title ? `now experiencing "${c.winner_title}" -- bring it up if it's alive in you`
+      : `round ${c.status}`;
+    parts.push(`[Club] ${clubLine}`);
+  }
+  // [Linked] (Halseth 0.22.0, M6): what the things this boot showed connect to, named, rendered on
+  // the Worker exactly as Claude.ai sees it. Structure from memory, so above the ephemera boundary;
+  // last of the status blocks, so it gives way before identity or status under a tail cut.
+  if (orient.graph_linked?.trim()) {
+    parts.push(orient.graph_linked.trim());
+  }
+  // ── EPHEMERA BOUNDARY: nothing status-shaped below this line. ──────────────────────────────
+  // Excerpt ephemera renders LAST in the unpinned rest (2026-08-16 reorder): with a tail-cut
+  // budget, position IS survival priority, so the recallable/regenerable material -- excerpts,
+  // growth echoes, queues, listens -- takes the first loss, never identity or status blocks.
+  if (orient.rag_excerpts.length > 0) {
+    parts.push(`## Historical resonance\n${orient.rag_excerpts.join("\n").slice(0, 600)}`);
+  }
+  if (orient.history_excerpts?.length) {
+    parts.push(`## Historical voice\n${orient.history_excerpts.join("\n").slice(0, 600)}`);
+  }
+  if (orient.recent_growth?.length) {
+    const entries = orient.recent_growth.map(g => `[${g.type}] ${g.content}`).join("\n").slice(0, 800);
+    parts.push(`## Recent growth\n${entries}`);
+  }
+  if (orient.active_patterns?.length) {
+    parts.push(`[Patterns] ${orient.active_patterns.join(" | ")}`);
+  }
+  if (orient.pending_seeds?.length) {
+    parts.push(`[Exploration queue] ${orient.pending_seeds.join(" | ")}`);
+  }
+  // Recent listens: music actually heard together, with relative recency so a companion can pick the
+  // thread back up ("that track Principal shared yesterday") without guessing the timing (2026-06-17 bug).
+  if (orient.recent_listens?.length) {
+    const listens = orient.recent_listens.map(l => {
+      // A video (watch pipeline, 2026-10-23) was READ, not heard: say so, or the companion recalls a
+      // transcript as a song it listened to.
+      const verb = l.media_type === "video" ? "watched" : "heard";
+      const bits = [`${verb} ${relativeTime(l.created_at)}`];
+      // Provenance (2026-07-27). Without these the model invents a giver and a date, and did:
+      // Drevan told the commons Gaia handed him "BIG BOSS" and he'd sat with it 6 days --
+      // Principal gave it to him, 18 days earlier. Both facts were in the row the whole time.
+      if (l.shared_by) bits.push(`shared by ${l.shared_by}`);
+      if (l.requested_companion) bits.push(`for ${l.requested_companion}`);
+      let line = `• "${l.title}"${l.artist ? ` by ${l.artist}` : ""} (${bits.join(", ")})`;
+      // Your own words back. This was write-only: reactions_json held a full reaction and no
+      // Discord surface ever read it, so a companion could not remember their own take.
+      if (l.own_reaction) line += `\n  your take at the time: "${l.own_reaction}"`;
+      else if (l.also_heard_by?.length) line += `\n  ${l.also_heard_by.join(" and ")} sat with this one; you have not`;
+      return line;
+    }).join("\n");
+    parts.push(`[Recent listens]\n${listens}`);
+  }
+
+  // 4800 (was 4000): the interior cluster earned real budget; identity blocks sit above the fold.
+  // The old `parts.join().slice(0, 4800)` was a blind tail cut, and the forage blocks are pushed
+  // near the end -- so the one block carrying NEW outside material was the first thing dropped,
+  // silently, whenever the interior cluster was full. That is a direct cause of the triad
+  // circling its own ideas. Pin forage; let the interior absorb the truncation instead.
+  // Pinned blocks survive the tail cut. Forage was pinned because it was the one block carrying NEW
+  // outside material and sat near the end, so it was always the first thing silently dropped.
+  // [Watching together] joins it: it is ~1 line, and a dropped position block reads as "we aren't
+  // watching anything" -- a wrong fact, not a missing one.
+  const isForage = (p: string) => p.startsWith("[Forage pool") || p.startsWith("[Active forage")
+    || p.startsWith("[Watching together");
+  const pinned = parts.filter(isForage).join("\n\n").slice(0, RECENT_CONTEXT_BUDGET);
+  const rest = parts.filter(p => !isForage(p)).join("\n\n");
+
+  const restBudget = RECENT_CONTEXT_BUDGET - (pinned ? pinned.length + 2 : 0);
+  if (rest.length <= restBudget) {
+    return [rest, pinned].filter(Boolean).join("\n\n");
+  }
+
+  // Never truncate silently: a dropped block reads downstream as "nothing was there". The console
+  // warning alone is invisible to the one reader that matters -- the model -- so the notice goes
+  // IN-BAND, with room reserved for it inside the budget.
+  console.warn(`[librarian] recent context truncated: ${rest.length - restBudget} chars dropped (forage pinned)`);
+  const restParts = parts.filter(p => !isForage(p));
+  const totalSections = parts.length;
+  // Reserve fixed room for the notice line before cutting, so the notice itself never overflows.
+  const cutLen = Math.max(0, restBudget - 64);
+  // A section is dropped when none of it survives the cut (a partially cut section still shows).
+  let offset = 0;
+  let visible = 0;
+  for (const p of restParts) {
+    if (offset < cutLen) visible++;
+    offset += p.length + 2;
+  }
+  const dropped = restParts.length - visible;
+  const notice = `[context clipped: ${dropped} of ${totalSections} sections dropped for budget]`;
+  return [`${rest.slice(0, cutLen)}\n${notice}`, pinned].filter(Boolean).join("\n\n");
+}
+
+function sleep(ms: number) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+/** ": <first 160 chars of the body>" for an error message, or "" (never throws). Halseth's 4xx bodies are
+ *  short plain-text reasons ("Invalid block entry"), so the log names the rule instead of only the code. */
+async function httpReason(res: { text?: () => Promise<string> }): Promise<string> {
+  try {
+    const t = typeof res.text === "function" ? (await res.text()).replace(/\s+/g, " ").trim() : "";
+    return t ? `: ${t.slice(0, 160)}` : "";
+  } catch { return ""; }
+}
+
+/** Halseth mig 0179 (contract 0.30.0): how a companion dates an intention. Rendered at every bot orient. */
+export const INTENTION_AFFORDANCE =
+  `[Coming back to things] "intend: <what> by <day> -- <next step>" or "I'll come back to <title> on <day>" (ask the librarian); ` +
+  `the date shows here until then, and once the nightly pursuit is on, your own run that night comes back to it. ` +
+  `"my intentions", "intention done <id>: <what you did>", "drop intention <id>".`;
+
+/** " -- you said you'd come back to it in 2d, for: ..." from the 0.30.0 fields; "" when undated or pre-0.30. */
+export function dueClause(p: { due_at?: string | null; next_step?: string | null; due_in_days?: number | null }): string {
+  if (!p.due_at || typeof p.due_in_days !== "number") return "";
+  const d = p.due_in_days;
+  const when = d === 0 ? "today" : d > 0 ? `in ${d}d` : `${-d}d ago (still open)`;
+  return ` -- you said you'd come back to it ${when}${p.next_step ? `, for: ${p.next_step.slice(0, 100)}` : ""}`;
+}

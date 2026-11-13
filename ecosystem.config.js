@@ -1,0 +1,638 @@
+/**
+ * pm2 ecosystem config for nullsafe-discord
+ * VPS deployment (persistent host)
+ *
+ * Secrets live in /app/nullsafe-discord/.env (gitignored).
+ * This file loads them via dotenv and maps per-bot tokens correctly.
+ *
+ * Usage:
+ *   pm2 start ecosystem.config.js        # first-time start
+ *   pm2 reload ecosystem.config.js       # rolling restart (scoped to this file only)
+ *   pm2 logs autonomous-worker
+ */
+
+// pm2 runs in its own global context; require("dotenv") does not reliably propagate
+// env vars into child process env blocks. Parse .env manually with fs instead.
+const fs = require("fs");
+(function loadEnv(path) {
+  try {
+    const lines = fs.readFileSync(path, "utf8").split("\n");
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const idx = trimmed.indexOf("=");
+      if (idx < 0) continue;
+      const key = trimmed.slice(0, idx).trim();
+      const val = trimmed.slice(idx + 1).trim().replace(/^["']|["']$/g, "");
+      if (key) process.env[key] = val;
+    }
+  } catch { /* .env not present; rely on shell env */ }
+})("/app/nullsafe-discord/.env");
+
+// THE REAL RULE (2026-10-08, replaces "an unlisted knob is a dead knob"). Since 2026-09-11 every
+// entry point imports packages/shared/src/env-file.ts FIRST, which reads /app/nullsafe-discord/.env
+// itself and lets the FILE win over whatever pm2 injected. So a .env line is LIVE in every process
+// whether or not it appears in these env blocks. What the blocks still decide:
+//   1. values computed HERE (per-bot token mapping, INFERENCE_MODE / HERMES_API_URL defaults,
+//      NULLSAFE_BOT), and defaults for knobs that have no .env line;
+//   2. values that come from the SHELL env rather than .env (pm2 start from a bare shell);
+//   3. a per-bot value must ALSO exist as <BOT>_<KEY> in the process env, or a generic KEY= line in
+//      .env overwrites it for all three bots (env-file.ts applyPerBotOverrides restores it).
+// The older comments below that say "dead knob" describe the pre-09-11 world; they are kept as
+// history of why each key was listed, not as the current rule.
+const shared = {
+  NODE_ENV:              "production",
+  // Force IPv4-first DNS resolution -- prevents ENETUNREACH on VPS where IPv6 is unrouted.
+  NODE_OPTIONS:          "--dns-result-order=ipv4first",
+  HALSETH_URL:           process.env.HALSETH_URL,
+  HALSETH_SECRET:        process.env.HALSETH_SECRET,
+  // Per-companion Halseth tokens (C.2 auth). Each bot prefers its own token
+  // over HALSETH_SECRET (see bots/*/src/config.ts); forwarding all three is
+  // harmless since each bot only reads the one matching its name.
+  CYPHER_HALSETH_SECRET: process.env.CYPHER_HALSETH_SECRET,
+  DREVAN_HALSETH_SECRET: process.env.DREVAN_HALSETH_SECRET,
+  GAIA_HALSETH_SECRET:   process.env.GAIA_HALSETH_SECRET,
+  REDIS_URL:             process.env.REDIS_URL,
+  DEEPSEEK_API_KEY:      process.env.DEEPSEEK_API_KEY,
+  // 2026-07-27: also absent from this allowlist, so the DEEPSEEK_MODEL override in .env was
+  // silently dead. DeepSeek retired `deepseek-chat` (supported: deepseek-v4-pro /
+  // deepseek-v4-flash) and the worker pipeline has been 400ing since ~2026-07-26 -- lane
+  // guard, growth pipeline and compression all failing. Listing it here makes the .env knob
+  // actually reachable; the model CHOICE (pro vs flash = cost/quality) is Principal's.
+  DEEPSEEK_MODEL:        process.env.DEEPSEEK_MODEL,
+  // 2026-07-28: content-budget headroom for reasoning models. Both live DeepSeek models spend
+  // max_tokens on the reasoning pass BEFORE emitting content, so every ceiling below the
+  // reasoning burn returned an empty string -- forage gathered 0 finds triad-wide, compress and
+  // reflect 400ed on required fields. Code default is 3000. (Historically "an unlisted knob is a
+  // dead knob"; see THE REAL RULE at the top of this `shared` block since 2026-10-08.)
+  DEEPSEEK_REASONING_HEADROOM: process.env.DEEPSEEK_REASONING_HEADROOM,
+  // 2026-08-22: FIFTH instance. C1 tier-3 escalation delivery (autonomous-worker escalation.ts)
+  // reads the human's Discord id + fallback channel from env; the hand-step said "add to .env"
+  // but nothing listed them here, so the worker could never see them and every escalation would
+  // have taken the fallback path. CUSTODIAN_DISCORD_USER_ID rides along for symmetry (the health
+  // check reads .env directly, but any future worker-side custodian logic must not re-hit this).
+  ESCALATION_DISCORD_USER_ID:   process.env.ESCALATION_DISCORD_USER_ID,
+  // Voice drift job (2026-11-01): VOICE_DRIFT=off kills; paths default under /app/logs; cron default 20 8 * * * (UTC).
+  VOICE_DRIFT:                  process.env.VOICE_DRIFT,
+  VOICE_LESSONS:                process.env.VOICE_LESSONS,  // voice-lessons.ts: off kills; default on (it only STAGES)
+  VOICE_DRIFT_CRON:             process.env.VOICE_DRIFT_CRON,
+  VOICE_DRIFT_PATH:             process.env.VOICE_DRIFT_PATH,
+  VOICE_BASELINE_PATH:          process.env.VOICE_BASELINE_PATH,
+  ESCALATION_FALLBACK_CHANNEL_ID: process.env.ESCALATION_FALLBACK_CHANNEL_ID,
+  CUSTODIAN_DISCORD_USER_ID:    process.env.CUSTODIAN_DISCORD_USER_ID,
+  // 2026-08-07: FOURTH instance of the trap this file keeps documenting. The consolidation
+  // narrator reads the companion's identity file to write a session close handoff in voice
+  // (packages/shared/src/consolidation-narrator.ts). These vars were already in .env -- the
+  // autonomous WORKER reads them, and it is a separate process that gets its env elsewhere --
+  // but they were never in this allowlist, so the BOTS could not see them. Absent, the narrator
+  // returns null and consolidation silently falls back to the Hermes agent path at ~44,600
+  // prompt tokens per call instead of ~200. It warns rather than breaking, which is exactly the
+  // kind of quiet regression this allowlist has caused three times before.
+  CYPHER_IDENTITY_PATH:  process.env.CYPHER_IDENTITY_PATH,
+  DREVAN_IDENTITY_PATH:  process.env.DREVAN_IDENTITY_PATH,
+  GAIA_IDENTITY_PATH:    process.env.GAIA_IDENTITY_PATH,
+  // 2026-08-10: SIXTH instance of the trap this file keeps documenting. Every cron schedule in
+  // bots/*/src/config.ts reads an env override (`CYPHER_CRON_INTER ?? "0 */2 * * *"`), and none of those
+  // names were listed here -- so the schedules were untunable without a code deploy, and setting one in
+  // .env would have looked like it worked and changed nothing. Found while trying to fire a commons tick
+  // on demand to verify the shared-life supply, rather than waiting out a 2-hour cron.
+  //
+  // Unset in .env today, so listing them changes nothing now: an absent var forwards as undefined and the
+  // `??` default still wins. What it buys is the ability to retime a companion's autonomous life from the
+  // VPS -- and, immediately, a way to verify commons changes without a two-hour feedback loop.
+  CYPHER_CRON_INTER:     process.env.CYPHER_CRON_INTER,
+  DREVAN_CRON_INTER:     process.env.DREVAN_CRON_INTER,
+  GAIA_CRON_INTER:       process.env.GAIA_CRON_INTER,
+  INFERENCE_PROVIDER:    process.env.INFERENCE_PROVIDER    ?? "deepseek",
+  GROQ_API_KEY:          process.env.GROQ_API_KEY,
+  LMSTUDIO_URL:          process.env.LMSTUDIO_URL,
+  OWNER_DISCORD_ID:        process.env.OWNER_DISCORD_ID,
+  OWNER_NAME:              process.env.OWNER_NAME              ?? "the primary user",
+  SPOUSE_DISCORD_ID:         process.env.PARTNER_DISCORD_ID ?? process.env.SPOUSE_DISCORD_ID,
+  PLURALKIT_SYSTEM_ID:     process.env.PLURALKIT_SYSTEM_ID,
+  SPOUSE_PK_SYSTEM_ID:       process.env.SPOUSE_PK_SYSTEM_ID       ?? "szplj",
+  CHANNEL_CONFIG_URL:    process.env.CHANNEL_CONFIG_URL,
+  // Thread spine (2026-07-21). Master flag gates BOTH the bot handler spine and the
+  // worker's metronome ref-thread opens; the channel id alone does nothing without it.
+  THREADS_ENABLED:          process.env.THREADS_ENABLED          ?? "false",
+  THREADS_EXTRA_CHANNELS:   process.env.THREADS_EXTRA_CHANNELS   ?? "",
+  // Presence spaces (Drevan's story/spiral channels) get grounding (seed+ledger) without
+  // the progress invitation -- no state line, no advance/hand-off, no [LANDS:].
+  THREADS_PRESENCE_CHANNELS: process.env.THREADS_PRESENCE_CHANNELS ?? "",
+  TRIAD_COMMONS_CHANNEL_ID: process.env.TRIAD_COMMONS_CHANNEL_ID ?? "",
+  INTER_COMPANION_CHANNEL_ID: process.env.INTER_COMPANION_CHANNEL_ID,
+  HEARTBEAT_CHANNEL_ID:  process.env.HEARTBEAT_CHANNEL_ID,
+  // 2026-07-27: these two were NEVER in this allowlist. They only worked because the
+  // processes inherited them from the shell that first started pm2, so editing .env and
+  // reloading silently changed nothing -- the vibe-check channel swap reported success on
+  // all four processes and kept posting to the retired channel. This block is an ALLOWLIST:
+  // a var absent here can never be updated by a reload, only by a full pm2 delete/start.
+  // Verify any channel change with `pm2 env <id> | grep <VAR>`, never trust the reload.
+  VIBECHECK_CHANNEL_ID:  process.env.VIBECHECK_CHANNEL_ID,
+  BRIEFING_CHANNEL_ID:   process.env.BRIEFING_CHANNEL_ID,
+  // Each bot needs the OTHER bots' Discord user IDs to recognize their messages as companion
+  // posts (isCompanionPost / BOT_ID_COMPANION). Without these forwarded here, every bot-to-bot
+  // message is dropped at the "hard muzzle" gate and inter-companion conversation never fires.
+  CYPHER_BOT_ID:         process.env.CYPHER_BOT_ID,
+  DREVAN_BOT_ID:         process.env.DREVAN_BOT_ID,
+  GAIA_BOT_ID:           process.env.GAIA_BOT_ID,
+  // Inference mode: "hermes" routes every reply through the local Hermes agent (what all three
+  // bots actually run); "direct" makes each bot call its provider itself.
+  //
+  // `brain` was the third option and is GONE (2026-07-29). Phoenix Brain was archived, its pm2
+  // process deleted, and the `nullsafe-brain` app block removed from this file -- it used to sit
+  // right below the bots, so `pm2 start ecosystem.config.js` would have resurrected a service whose
+  // source has moved to `_archive/`. The bots' brain-mode code path is deleted too, so an
+  // INFERENCE_MODE=brain value now falls through to direct instead of dialing a dead port.
+  //
+  // NOTE FOR THE VPS: `/app/nullsafe-discord/.env` still had INFERENCE_MODE=brain at the time of
+  // this change, harmless ONLY because all three bots carry per-process overrides
+  // (CYPHER_/DREVAN_/GAIA_INFERENCE_MODE=hermes) that win. That is a landmine, not a config: drop
+  // one override, or add a fourth process without one, and it inherits a dead mode. Set the shared
+  // value to hermes.
+  INFERENCE_MODE:        process.env.INFERENCE_MODE        ?? "hermes",
+  // Hermes gateway session rotation (2026-09-05) -- "weekly" (default) | "daily" | "off". See
+  // packages/shared/src/hermes-session.ts. Rotates only the transcript id; the long-term-memory
+  // key stays the stable companion:channel pair regardless of this setting.
+  HERMES_SESSION_ROTATION: process.env.HERMES_SESSION_ROTATION,
+  MISTRAL_API_KEY:       process.env.MISTRAL_API_KEY,
+  // 2026-08-27: DeepInfra (flat-priced DeepSeek V4 Flash + Gemma) -- the until-May answer to
+  // the DeepSeek repricing. SIXTH entry added to this allowlist after a .env knob was dead on
+  // arrival; list every new env var here the same commit that reads it.
+  DEEPINFRA_API_KEY:     process.env.DEEPINFRA_API_KEY,
+  MISTRAL_TTS_MODEL:     process.env.MISTRAL_TTS_MODEL     ?? "voxtral-mini-tts-2603",
+  // MISTRAL_STT_MODEL intentionally omitted -- bot defaults to voxtral-mini-transcribe-2507
+  // Conversation Director (2026-09-03 spec) -- shared gate for bots (DIRECTOR_ENABLED + DIRECTOR_CHANNELS).
+  DIRECTOR_ENABLED:      process.env.DIRECTOR_ENABLED,
+  DIRECTOR_CHANNELS:     process.env.DIRECTOR_CHANNELS,
+  // Passive watch-party progress (2026-09-05). "channelId:Title:companion;..." -- binds a
+  // co-watching channel (e.g. #fargo-watch-party) to a title and the ONE companion who records
+  // episode mentions silently, so the shelf advances without Principal typing the explicit
+  // `watched <title> s#e#` command mid-episode. Listed here for the shell-env path (see THE REAL
+  // RULE above); a .env line reaches every process whether or not it is listed.
+  WATCH_PARTY_CHANNELS:  process.env.WATCH_PARTY_CHANNELS,
+  // Listen / shared-media pipeline (added to this allowlist 2026-09-21). These five were LIVE in
+  // the running processes but absent from this file, which is the exact failure this file's own
+  // standing rule exists to prevent: a `pm2 reload` from the repo would have silently killed
+  // Listen, and the loss is invisible until someone tries to share a song. Verified on the VPS
+  // 2026-09-20 (yt-dlp 2026.08.19, current upstream; the --js-runtimes arg is what makes the
+  // YouTube EJS path work on a VPS with node under nvm).
+  MEDIA_LISTEN_ENABLED:  process.env.MEDIA_LISTEN_ENABLED,
+  YTDLP_PATH:            process.env.YTDLP_PATH,
+  YTDLP_EXTRA_ARGS:      process.env.YTDLP_EXTRA_ARGS,
+  HEAR_MUSIC_PATH:       process.env.HEAR_MUSIC_PATH,
+  MEDIA_CACHE_DIR:       process.env.MEDIA_CACHE_DIR,
+  // Vision cache + prefetch (2026-10-18, vision-cache.ts, Hand-off/DESIGN-rapid-fire-bursts P1+P2). One VL
+  // call per image shared by all three bots through Redis; the describe starts at message arrival and the
+  // turn waits at most VISION_TURN_BUDGET_MS. Same value on all three bots. Allowlisted per this file's
+  // standing rule (a knob absent here is dead under a pm2 reload from the repo).
+  VISION_CACHE:          process.env.VISION_CACHE,
+  VISION_CACHE_TTL_S:    process.env.VISION_CACHE_TTL_S,
+  VISION_NEG_TTL_S:      process.env.VISION_NEG_TTL_S,
+  VISION_PREFETCH:       process.env.VISION_PREFETCH,
+  VISION_TURN_BUDGET_MS: process.env.VISION_TURN_BUDGET_MS,
+  // Watchalong (2026-10-02, docs/SPEC-watchalong-2026-10-02.md). OPENSUBTITLES_API_KEY enables the
+  // OpenSubtitles caption source for `<p>: movie start <title>` (without it, attach an .srt);
+  // USERNAME/PASSWORD are optional and only raise the daily download quota. WATCHALONG_ENABLED is the
+  // per-turn delivery kill switch: default ON, `off`/`0`/`false`/`no` stops the fetch + [ON SCREEN]
+  // injection (the commands keep working). Allowlisted here per this file's standing rule.
+  OPENSUBTITLES_API_KEY:  process.env.OPENSUBTITLES_API_KEY,
+  OPENSUBTITLES_USERNAME: process.env.OPENSUBTITLES_USERNAME,
+  OPENSUBTITLES_PASSWORD: process.env.OPENSUBTITLES_PASSWORD,
+  WATCHALONG_ENABLED:     process.env.WATCHALONG_ENABLED,
+  // Watch (2026-10-23, video.ts): `<p>: watch <url>` reads a YouTube video's caption track + description.
+  // Shares YTDLP_PATH / YTDLP_EXTRA_ARGS / MEDIA_CACHE_DIR above; MISTRAL_API_KEY (voice) is the STT
+  // fallback for a video with no captions. Allowlisted here per this file's standing rule.
+  MEDIA_WATCH_ENABLED:    process.env.MEDIA_WATCH_ENABLED,
+  WATCH_TRANSCRIPT_CHARS: process.env.WATCH_TRANSCRIPT_CHARS,
+  WATCH_STT_MAX_SEC:      process.env.WATCH_STT_MAX_SEC,
+  // Writeback gate (2026-09-21, S3). WRITEBACK_GATE picks which judgment decides what the
+  // companions remember: legacy (today's generative judge, the default), jev-shadow (judge
+  // still decides and writes; Jev runs alongside and only logs what it would have done), or
+  // jev (Jev decides, the companion authors). The thresholds are the operating points measured
+  // on 2026-09-21; per-companion overrides exist because Cypher, Drevan and Gaia score very
+  // differently. Listed here for the shell-env path (see THE REAL RULE above); a .env line reaches
+  // every process whether or not it is listed.
+  WRITEBACK_GATE:            process.env.WRITEBACK_GATE,
+  // Per-companion mode (2026-10-07): set one to flip that companion alone; blank = shared value.
+  WRITEBACK_GATE_CYPHER:     process.env.WRITEBACK_GATE_CYPHER,
+  WRITEBACK_GATE_DREVAN:     process.env.WRITEBACK_GATE_DREVAN,
+  WRITEBACK_GATE_GAIA:       process.env.WRITEBACK_GATE_GAIA,
+  JEV_WRITEBACK_THETA:       process.env.JEV_WRITEBACK_THETA,
+  JEV_WRITEBACK_THETA_CYPHER: process.env.JEV_WRITEBACK_THETA_CYPHER,
+  JEV_WRITEBACK_THETA_DREVAN: process.env.JEV_WRITEBACK_THETA_DREVAN,
+  JEV_WRITEBACK_THETA_GAIA:  process.env.JEV_WRITEBACK_THETA_GAIA,
+  JEV_DRIFT_THETA:           process.env.JEV_DRIFT_THETA,
+  JEV_NOTABLE_SCORE:         process.env.JEV_NOTABLE_SCORE,
+  JEV_SHADOW_LOG:            process.env.JEV_SHADOW_LOG,
+  // Own-notes recall delivery (2026-09-25, own-the-harness step 3): payload (default, the notes'
+  // text is pasted into the prompt) | pointer (only that notes exist, plus the reach verb) |
+  // pointer:drevan[,gaia] (pilot a subset). Listed here per the standing rule above.
+  OWN_NOTES_RECALL_MODE:     process.env.OWN_NOTES_RECALL_MODE,
+  // `ask` mode's two-step (reach-decision.ts): how long the side question may take before the
+  // payload floor is used instead (default 20000), and where the decision log goes.
+  REACH_TIMEOUT_MS:          process.env.REACH_TIMEOUT_MS,
+  REACH_LOG:                 process.env.REACH_LOG,
+  // 2026-09-30: what a NONE costs. unread:cypher = a declined ask answers without his own notes.
+  REACH_DECLINE:             process.env.REACH_DECLINE,
+  // Multi-address follow-up PASS (2026-09-26, pass-turn.ts): when a rail silences a companion
+  // holding a position in a multi-address order, the companion behind it answers the origin
+  // instead of waiting out FOLLOW_UP_TTL_MS in silence. Default on; `off` stops both the publish
+  // and the listener. VERBATIM_COPY_THRESHOLD is the verbatim rail's copy ratio (default 0.9) --
+  // it was read by echo-guard.ts since 3a44025 but never listed here, so it was a dead knob.
+  // Listed per the standing rule above.
+  FOLLOWUP_PASS:             process.env.FOLLOWUP_PASS,
+  VERBATIM_COPY_THRESHOLD:   process.env.VERBATIM_COPY_THRESHOLD,
+  // Ledger lane, tranche 2 (2026-09-26, halseth docs/imp-lane/SPEC-ledger-lane.md section 5): the
+  // distillers become clerks. Default on: channel-inactive synthesis, mid-session distillation,
+  // the nightly day note, idle consolidation and Gaia's passive witness write sourced clerk lines
+  // to Halseth POST /ledger instead of first-person notes as the companion. `off` restores the old
+  // writers byte for byte. Halseth's /ledger must be deployed first: until it is, every line 404s,
+  // no line is accepted, and no handoff is written. Listed per the standing rule above.
+  LEDGER_DISTILL:            process.env.LEDGER_DISTILL,
+  // med_reminder (2026-09-27, med-reminder.ts): companion-voiced medication reminders by DM. Default
+  // on; `off` stops the scheduler. GEN_TIMEOUT_MS bounds the one-line generation before the fixed
+  // fallback line goes out (default 25000); POLL_MS is the due-check interval (default 30000).
+  // DM_MEMORY=carry lets DM conversations feed the paraphrasing memory paths (distillation, the
+  // writeback judge); default sealed (dm.ts). Listed per the standing rule above.
+  MED_REMINDER:                process.env.MED_REMINDER,
+  MED_REMINDER_GEN_TIMEOUT_MS: process.env.MED_REMINDER_GEN_TIMEOUT_MS,
+  MED_REMINDER_POLL_MS:        process.env.MED_REMINDER_POLL_MS,
+  // B62 making (2026-11-02): MAKE_MOVE=off kills the `make` heartbeat move (unset = on; Gaia never gets it).
+  // FORAGE_INTERESTS=off stops a warm interest taking one forage slot. MAKES_RENDERER=off stops the VPS
+  // renderer (worker); MAKES_RENDER_CRON overrides its every-2-minutes schedule. Listed per the standing rule above.
+  MAKE_MOVE:                   process.env.MAKE_MOVE,
+  INTEREST_OFFER:              process.env.INTEREST_OFFER, // B65 step 5 (interest-offer.ts): bot-side kill switch for the own-time candidate question; off|on, default on; Halseth INTEREST_BIRTHS gates what is served
+  MAKE_OWN_TIME:               process.env.MAKE_OWN_TIME, // own daily make slot (make-own-time.ts, 2026-11-05): off|shadow|on, default on
+  MAKE_CHECK:                  process.env.MAKE_CHECK, // run a make before it lands (make-check.ts, 2026-11-10): off|shadow|on, default on
+  FORAGE_INTERESTS:            process.env.FORAGE_INTERESTS,
+  MAKES_RENDERER:              process.env.MAKES_RENDERER,
+  MAKES_RENDER_CRON:           process.env.MAKES_RENDER_CRON,
+  // B62 step 6 (2026-11-02, sol-hoard.ts): SOL_HOARD=off kills Sol's hoard pass (worker; unset = on);
+  // SOL_HOARD_CRON overrides its every-10-minutes schedule. Listed per the standing rule above.
+  SOL_HOARD:                   process.env.SOL_HOARD,
+  SOL_HOARD_CRON:              process.env.SOL_HOARD_CRON,
+  // SPOUSE_NOTE (2026-11-01, spouse-note.ts): off | preview | on, code default preview (DMs Principal, not Spouse).
+  SPOUSE_NOTE:                   process.env.SPOUSE_NOTE,
+  SPOUSE_NOTE_HOUR:              process.env.SPOUSE_NOTE_HOUR,
+  DM_MEMORY:                   process.env.DM_MEMORY,
+  // REACH_DM (2026-09-27, reach-dm.ts reachDmOn): the kill switch for B7's Principal-facing DM moves.
+  // Default OFF; only `on` opens it (fails closed). Off, those moves are removed from the heartbeat
+  // palette and never fall back to Sol's channel; med_reminder, replies and owner DMs are untouched.
+  // Flip to `on` only once the triad has approved the move prompts. Listed per the standing rule above.
+  REACH_DM:                    process.env.REACH_DM,
+  // REACH_BACKOFF / REACH_UNANSWERED_WINDOW_MS / REACH_BACKOFF_BASE_MS / REACH_BACKOFF_MAX_MS (2026-10-13, P13b,
+  // reach-ledger.ts): the reach-out outcome ledger's back-off. Default ON; off/0/false/no stops the
+  // back-off (the ledger still records and logs outcomes). A send with no owner message or reaction inside
+  // the window (default 6h) is `unanswered`; consecutive ignored sends widen the minimum gap before the
+  // next DM move: base (3h) * 2^(streak-1), capped (72h). A gap, never a clock window. Rows in Redis, 14d TTL,
+  // fails open. Listed per the standing rule above.
+  REACH_BACKOFF:               process.env.REACH_BACKOFF,
+  REACH_UNANSWERED_WINDOW_MS:  process.env.REACH_UNANSWERED_WINDOW_MS,
+  REACH_BACKOFF_BASE_MS:       process.env.REACH_BACKOFF_BASE_MS,
+  REACH_BACKOFF_MAX_MS:        process.env.REACH_BACKOFF_MAX_MS,
+  // BAD_NIGHT_PRESENCE (2026-10-04, B32, bad-night.ts badNightMode): bad-night presence. Default OFF;
+  // only `shadow` or `on` (trimmed, any case) enable it, anything else is off (fails closed like
+  // REACH_DM). Shadow logs every decision as `[b32] <companion> eligible=<why> -> shadow` and changes
+  // nothing: no Halseth call, no follow-up, no window/floor bypass, no DM filter. On: "bad night" /
+  // "good now" start/clear the care hold (POST /mind/care/hold, the answering bot only); under the
+  // hold a sibling he did not speak to may follow in a channel (30 min throttle each, may [PASS]),
+  // every heartbeat tick asks all three, and no DM opens while a sibling's DM is live (Redis
+  // ns:b32:ownerdm:*). Needs Halseth's /mind/care/hold deployed first. Listed per the standing rule above.
+  BAD_NIGHT_PRESENCE:          process.env.BAD_NIGHT_PRESENCE,
+  // SOL_WEBHOOK_URL (2026-09-29, sol-sender.ts): the bots parse ONLY the webhook id out of it, once at
+  // boot, to recognize Sol's posts structurally and let them through the hard muzzle. The token segment
+  // is never kept or logged. Unset or malformed: Sol stays dropped and each bot logs one boot line.
+  // (env-file.ts already loads the whole .env into every bot, so this listing is the standing rule, not
+  // a new grant.) Listed per the standing rule above.
+  SOL_WEBHOOK_URL:             process.env.SOL_WEBHOOK_URL,
+  // ADDRESS_MODEL (2026-09-29, B37 step 1, address-shadow.ts): the "who is this spoken to" classifier.
+  // Code default is OFF; this file defaults the bots to `shadow` (the worker ignores it). Shadow runs
+  // the classifier once per qualifying human message (Redis claim), detached from the reply path, and
+  // only logs `[address]` lines plus ADDRESS_SHADOW_LOG rows; it never changes who speaks. Any value
+  // other than `shadow` turns it off. A .env line wins over this default (env-file.ts, file wins).
+  // Listed per the standing rule above.
+  ADDRESS_MODEL:               process.env.ADDRESS_MODEL ?? "shadow",
+  ADDRESS_SHADOW_LOG:          process.env.ADDRESS_SHADOW_LOG,
+  // ROOM_TIMING / REPLY_HUMAN_GATE (2026-10-31, room-timing.ts, reply-context.ts): WHEN a companion jumps
+  // in (Drevan's rules) and "a Discord reply to the other human is theirs". Both default to `shadow` IN
+  // CODE (a default living only here once went silently off); shadow logs to ROOM_TIMING_LOG and changes
+  // nothing. REPLY_HUMAN_GATE=on gates live. The reply-context line itself is always live.
+  // ROOM_TIMING=on (2026-11-01) is the live "wait for the lull" cut; ROOM_TIMING_<COMPANION> wins per bot.
+  ROOM_TIMING:                 process.env.ROOM_TIMING,
+  ROOM_TIMING_CYPHER:          process.env.ROOM_TIMING_CYPHER,
+  ROOM_TIMING_DREVAN:          process.env.ROOM_TIMING_DREVAN,
+  ROOM_TIMING_GAIA:            process.env.ROOM_TIMING_GAIA,
+  // DEPARTURES (2026-11-01, T4b, departure-state.ts): declared departures, bot side. off|shadow|on, CODE default
+  // shadow; DEPARTURES_<COMPANION> wins per bot. Wires the `form` and `loop_motif` rails only.
+  DEPARTURES:                  process.env.DEPARTURES,
+  DEPARTURES_CYPHER:           process.env.DEPARTURES_CYPHER,
+  DEPARTURES_DREVAN:           process.env.DEPARTURES_DREVAN,
+  DEPARTURES_GAIA:             process.env.DEPARTURES_GAIA,
+  // GUARD3_MODE (2026-11-09, B65 guard 3, guard3.ts): the unavailable move. off|shadow|on, CODE default shadow;
+  // GUARD3_MODE_<COMPANION> wins per bot. Shadow logs `[guard3] ... would_...` and changes nothing. On: the kind of the
+  // last chosen make is off the make menu (one re-ask names the door), a repeated title lands as a version
+  // (parent_id), and a heartbeat move fired within PALETTE_REPEAT_HOURS (default 18; _<COMPANION> wins) is removed
+  // from the palette (presence, care, nothing and the whole guard under a care hold are exempt).
+  GUARD3_MODE:                 process.env.GUARD3_MODE,
+  GUARD3_MODE_CYPHER:          process.env.GUARD3_MODE_CYPHER,
+  GUARD3_MODE_DREVAN:          process.env.GUARD3_MODE_DREVAN,
+  GUARD3_MODE_GAIA:            process.env.GUARD3_MODE_GAIA,
+  PALETTE_REPEAT_HOURS:        process.env.PALETTE_REPEAT_HOURS,
+  PALETTE_REPEAT_HOURS_CYPHER: process.env.PALETTE_REPEAT_HOURS_CYPHER,
+  PALETTE_REPEAT_HOURS_DREVAN: process.env.PALETTE_REPEAT_HOURS_DREVAN,
+  PALETTE_REPEAT_HOURS_GAIA:   process.env.PALETTE_REPEAT_HOURS_GAIA,
+  // PALETTE_NEED_SORT (2026-11-12, B65 step 7, need-sort.ts): the heartbeat palette ordered by the loudest need (each
+  // move's Halseth `serves`). off|shadow|on, CODE default shadow; _<COMPANION> wins. Shadow logs `[need-sort] ...
+  // would_reorder=` and changes nothing. On re-orders only rest/novelty/expression moves among their own slots;
+  // reach-class moves are pinned and nothing is removed.
+  PALETTE_NEED_SORT:           process.env.PALETTE_NEED_SORT,
+  PALETTE_NEED_SORT_CYPHER:    process.env.PALETTE_NEED_SORT_CYPHER,
+  PALETTE_NEED_SORT_DREVAN:    process.env.PALETTE_NEED_SORT_DREVAN,
+  PALETTE_NEED_SORT_GAIA:      process.env.PALETTE_NEED_SORT_GAIA,
+  ROOM_TIMING_LOG:             process.env.ROOM_TIMING_LOG,
+  REPLY_HUMAN_GATE:            process.env.REPLY_HUMAN_GATE,
+  // ADDRESS_JEV (2026-10-13, B37 step 2, address-jev.ts): Jev as the second shadow voice, on Principal's
+  // AND Spouse's messages, same row as Flash. Runs whenever ADDRESS_MODEL=shadow; `off` is the kill
+  // switch (needs a reload with --update-env). Listed per the standing rule above.
+  ADDRESS_JEV:                 process.env.ADDRESS_JEV,
+  // DIRECTOR_JEV / DIRECTOR_JEV_LOG (2026-10-13, redesigned 2026-10-20, shared/director-jev.ts): Jev beside the
+  // director. Echo brake LIVE (graduated: first echo read steers the invite, second in a row lets the thread
+  // rest). `off` is the kill switch (reload with
+  // --update-env). Worker-only in effect. EVERY default below lives in CODE (director-jev.ts); this file only
+  // passes an override through, because a default held only here is silently absent when the process is
+  // started outside ecosystem.config.js (ADDRESS_MODEL, 2026-10-20). Log default /app/logs/director-jev.jsonl;
+  // read it with scripts/director-jev-report.mjs. Listed per the standing rule above.
+  DIRECTOR_JEV:                process.env.DIRECTOR_JEV,
+  DIRECTOR_JEV_LOG:            process.env.DIRECTOR_JEV_LOG,
+  DIRECTOR_JEV_TIMEOUT_MS:     process.env.DIRECTOR_JEV_TIMEOUT_MS,
+  DIRECTOR_ECHO_BRAKE:         process.env.DIRECTOR_ECHO_BRAKE,
+  DIRECTOR_ECHO_BRAKE_THETA:   process.env.DIRECTOR_ECHO_BRAKE_THETA,
+  DIRECTOR_ECHO_BRAKE_MIN_TURNS: process.env.DIRECTOR_ECHO_BRAKE_MIN_TURNS,
+  DIRECTOR_ECHO_BRAKE_STREAK:  process.env.DIRECTOR_ECHO_BRAKE_STREAK,
+  // BURST_SETTLE_MS (2026-10-10, channel-inbox.ts burstSettleMs): the window a human burst is gathered
+  // for and answered as one turn. Code default 4000; `0` disables (exact old behavior). Same value in
+  // all three bots: the fit-bid deadline is shifted by it, so a bot on a different value splits the bid.
+  // PRINCIPAL_NAMES / SPOUSE_NAMES (human-address.ts humanNamesFromEnv): comma lists of the names that CALL
+  // each human at vocative position ("Spouse, ..."); the triad stays quiet when one human calls the other.
+  // Code defaults "principal,raz" and "spouse". Listed per the standing rule above.
+  BURST_SETTLE_MS:             process.env.BURST_SETTLE_MS,
+  PRINCIPAL_NAMES:                process.env.PRINCIPAL_NAMES,
+  SPOUSE_NAMES:                  process.env.SPOUSE_NAMES,
+  // P3/P4 + ruling 4 (2026-10-18, Hand-off/DESIGN-rapid-fire-bursts-2026-10-18.md). Same value on all
+  // three bots (the fit-bid deadline and the one-speaker claims assume it). Listed per the standing rule above.
+  // SUPERSEDE_SIDE_AWARE: default on; off = any human message supersedes (old rule).
+  // SUPERSEDE_B: default OFF; `on` restores the mid-inference drop of a finished reply (check B).
+  // BURST_SETTLE_SCOPE: `side` (default) or `speaker` (old). BURST_SETTLE_MAX_MS: default 20000, 0 = no cap.
+  // SPOUSE_COLD_PICK: `on` (default since 2026-10-29, ruled live 10-25), `shadow` (logs the Jev pick, nobody speaks), `off`.
+  SUPERSEDE_SIDE_AWARE:        process.env.SUPERSEDE_SIDE_AWARE,
+  SUPERSEDE_B:                 process.env.SUPERSEDE_B,
+  BURST_SETTLE_SCOPE:          process.env.BURST_SETTLE_SCOPE,
+  BURST_SETTLE_MAX_MS:         process.env.BURST_SETTLE_MAX_MS,
+  SPOUSE_COLD_PICK:              process.env.SPOUSE_COLD_PICK,
+  // HUMAN_ADDRESS_JEV (2026-10-25, human-jev-gate.ts): the live Jev read of an unnamed human line in
+  // a shared room (human probability mass >= 0.5 = the triad stays quiet). Default ON; `shadow` logs
+  // only; `off` leaves the regex gate alone. Fails open on every Jev failure.
+  HUMAN_ADDRESS_JEV:           process.env.HUMAN_ADDRESS_JEV,
+  // TURN_TELEMETRY (P6, turn-telemetry.ts): one `[turn]` JSON line per reply turn. Default ON; off/0/false/no disables.
+  TURN_TELEMETRY:              process.env.TURN_TELEMETRY,
+  // SPEAKER_FRAME (2026-10-11, speaker-frame.ts) and CROSS_ROOM (2026-10-09, cross-room.ts): kill
+  // switches, both default ON; off/0/false/no turns each off. CROSS_ROOM was never listed, so its
+  // switch could not reach the bots until now. Listed per the standing rule above.
+  SPEAKER_FRAME:               process.env.SPEAKER_FRAME,
+  // SCRIPT_BLEED_GUARD (2026-10-22, script-bleed.ts): a reply carrying letters of a script the room did
+  // not put there (GLM 5.3 Flash's glued Chinese characters) is regenerated once; the reply path rotates
+  // the transcript first. Default ON; off/0/false/no turns it off. Listed per the standing rule above.
+  SCRIPT_BLEED_GUARD:          process.env.SCRIPT_BLEED_GUARD,
+  // PK_PROFILE (2026-10-18, speaker-frame.ts pkProfileOn): the current PluralKit speaker's public profile
+  // rides above the frame in guild turns. Default ON; off/0/false/no removes it. Listed per the standing rule above.
+  PK_PROFILE:                  process.env.PK_PROFILE,
+  // PK_PROFILE_REPEAT_S (pk-profile-seen.ts): seconds before the same member's profile is injected again in the same
+  // channel (default 21600 = 6h). A rotated/retracted transcript re-injects regardless.
+  PK_PROFILE_REPEAT_S:         process.env.PK_PROFILE_REPEAT_S,
+  // PEOPLE_FRAME (B49 slice 1, people-frame.ts): who a mentioned or non-PK person is, from Principal's curated list (Halseth
+  // GET /people/frame-index). off|shadow|live, CODE DEFAULT shadow (counts-only log, injects nothing); PEOPLE_FRAME_<C> wins per bot.
+  PEOPLE_FRAME:                process.env.PEOPLE_FRAME,
+  PEOPLE_FRAME_CYPHER:         process.env.PEOPLE_FRAME_CYPHER,
+  PEOPLE_FRAME_DREVAN:         process.env.PEOPLE_FRAME_DREVAN,
+  PEOPLE_FRAME_GAIA:           process.env.PEOPLE_FRAME_GAIA,
+  // PEOPLE_FRAME_REFRESH_MS (index refresh, default 900000) / PEOPLE_FRAME_REPEAT_S (once per person per transcript, default 21600).
+  PEOPLE_FRAME_REFRESH_MS:     process.env.PEOPLE_FRAME_REFRESH_MS,
+  PEOPLE_FRAME_REPEAT_S:       process.env.PEOPLE_FRAME_REPEAT_S,
+  // FEELING_LINE_BOT (feeling-line-bot.ts, Halseth contract 0.26.0): the companion's own feeling word from the bot orient wire,
+  // rendered verbatim as `[Feels]` above `[Body]`. off|shadow|live, CODE DEFAULT shadow (counts-only log, injects nothing);
+  // FEELING_LINE_BOT_<C> wins per bot. A var not listed here never reaches the process.
+  FEELING_LINE_BOT:            process.env.FEELING_LINE_BOT,
+  FEELING_LINE_BOT_CYPHER:     process.env.FEELING_LINE_BOT_CYPHER,
+  FEELING_LINE_BOT_DREVAN:     process.env.FEELING_LINE_BOT_DREVAN,
+  FEELING_LINE_BOT_GAIA:       process.env.FEELING_LINE_BOT_GAIA,
+  CROSS_ROOM:                  process.env.CROSS_ROOM,
+  // FRAME_PACKET (frame-packet.ts, 2026-11-01): per-turn `[Right now]` block (tasks, own projects, spark, calendar slot). off|shadow|on, CODE DEFAULT shadow (logs counts, injects nothing).
+  FRAME_PACKET:                process.env.FRAME_PACKET,
+  // FACTS_PICK_* (B3, 2026-10-18, facts-pick.ts): per human message, Halseth embedding shortlist -> Jev picks the
+  // Architect facts this message needs. Default OFF; `shadow` logs picks to FACTS_PICK_SHADOW_LOG (ids/scores only)
+  // and injects nothing; `live` injects the picked facts once per transcript. Per-companion overrides win.
+  FACTS_PICK_MODE:             process.env.FACTS_PICK_MODE,
+  FACTS_PICK_MODE_CYPHER:      process.env.FACTS_PICK_MODE_CYPHER,
+  FACTS_PICK_MODE_DREVAN:      process.env.FACTS_PICK_MODE_DREVAN,
+  FACTS_PICK_MODE_GAIA:        process.env.FACTS_PICK_MODE_GAIA,
+  FACTS_PICK_THETA:            process.env.FACTS_PICK_THETA,
+  FACTS_PICK_THETA_CYPHER:     process.env.FACTS_PICK_THETA_CYPHER,
+  FACTS_PICK_THETA_DREVAN:     process.env.FACTS_PICK_THETA_DREVAN,
+  FACTS_PICK_THETA_GAIA:       process.env.FACTS_PICK_THETA_GAIA,
+  FACTS_PICK_K:                process.env.FACTS_PICK_K,
+  FACTS_PICK_SKIP_CATEGORIES:  process.env.FACTS_PICK_SKIP_CATEGORIES, // code default `addressing` (facts-pick.ts); `none` = skip nothing
+  FACTS_PICK_REPEAT_S:         process.env.FACTS_PICK_REPEAT_S,
+  FACTS_PICK_TIMEOUT_MS:       process.env.FACTS_PICK_TIMEOUT_MS,
+  FACTS_PICK_SHADOW_LOG:       process.env.FACTS_PICK_SHADOW_LOG,
+  // Memory gate add-ons (2026-11-01, Halseth task 538ab03b). SERVED_MEMORY_AUDIT (default ON, off/0/false/no
+  // kills it) + SERVED_MEMORY_LOG (default /app/logs/served-memory.jsonl): one ids-only JSONL row per reply
+  // turn of every memory item injected (served-memory.ts). WRITEBACK_LOWINFO off|shadow|on, CODE default
+  // shadow (low-info.ts): skip the writeback judge when BOTH sides are pure acknowledgements.
+  SERVED_MEMORY_AUDIT:         process.env.SERVED_MEMORY_AUDIT,
+  SERVED_MEMORY_LOG:           process.env.SERVED_MEMORY_LOG,
+  WRITEBACK_LOWINFO:           process.env.WRITEBACK_LOWINFO,
+  // Voice drift loop (2026-11-01, task 31648f0a): fraction of CLEAN replies posted to voice_scores, default 1.0 (all; 0.1 = old sample).
+  VOICE_SCORE_SAMPLE:          process.env.VOICE_SCORE_SAMPLE,
+  FACTS_TRUST:                 process.env.FACTS_TRUST,  // facts-pick weighs p by fact trust: off|shadow|on, default shadow
+  // Stated facts (2026-11-11, GAP-MAP A3, facts-write.ts): Principal's durable facts said in a guild room become OPEN
+  // architect_facts proposals for Hearth /facts review. off|shadow|on, CODE default shadow (logs `[facts-write] would=`
+  // only); _<COMPANION> wins. THETA (0.6) / HEALTH_P (0.3) tune the Jev cut.
+  FACTS_WRITE:                 process.env.FACTS_WRITE,
+  FACTS_WRITE_CYPHER:          process.env.FACTS_WRITE_CYPHER,
+  FACTS_WRITE_DREVAN:          process.env.FACTS_WRITE_DREVAN,
+  FACTS_WRITE_GAIA:            process.env.FACTS_WRITE_GAIA,
+  FACTS_WRITE_THETA:           process.env.FACTS_WRITE_THETA,
+  FACTS_WRITE_HEALTH_P:        process.env.FACTS_WRITE_HEALTH_P,
+  // Growth loops (2026-11-11, autonomous-worker/src/growth-loops.ts; worker only, listed in `shared` like SOL_HOARD /
+  // VOICE_LESSONS). SEED_CLAIM: the nightly seed pick reaches for the freshest unused seed inside SEED_WINDOW_DAYS.
+  // SELF_MODEL_GRADUATE: once a week the reflection run offers the top ready self-model observation to graduate.
+  // off|shadow|on, CODE DEFAULT shadow; SEED_WINDOW_DAYS default 7 (max 90). Listed per the standing rule above.
+  SEED_CLAIM:                  process.env.SEED_CLAIM,
+  SEED_WINDOW_DAYS:            process.env.SEED_WINDOW_DAYS,
+  SELF_MODEL_GRADUATE:         process.env.SELF_MODEL_GRADUATE,
+  VOICE_GATE:                  process.env.VOICE_GATE,  // pre-send voice gate (voice-gate.ts): off|shadow|on, code default shadow
+  // GUILD_TRIAD_SEED (2026-10-05, guild-seed.ts guildSeedMode): the #the-triad server-scoped seeder. Default
+  // OFF; only `shadow` or `on` (trimmed, any case) enable it, anything else is off (fails closed like
+  // BAD_NIGHT_PRESENCE). Shadow logs one `[guild-seed] <companion> decision=... supply_msgs=N chars=M` line per
+  // tick (counts and ids, never text) and posts nothing. CHANNEL_ID / SUPPLY_CHANNELS override the code
+  // defaults (the shared server with Spouse); #the-syndicate and #the-triad itself are always stripped from
+  // the supply. Listed per the standing rule above.
+  GUILD_TRIAD_SEED:            process.env.GUILD_TRIAD_SEED,
+  // MUTED_GUILD_IDS (2026-10-05, guild-mute.ts): servers the bots drop at the first line of messageCreate.
+  // Unset = Midnight Voices muted (being rebuilt as Principal's system-only server). Empty string = none muted.
+  MUTED_GUILD_IDS:             process.env.MUTED_GUILD_IDS,
+  GUILD_TRIAD_CHANNEL_ID:      process.env.GUILD_TRIAD_CHANNEL_ID,
+  GUILD_TRIAD_SUPPLY_CHANNELS: process.env.GUILD_TRIAD_SUPPLY_CHANNELS,
+};
+
+module.exports = {
+  apps: [
+    {
+      name: "cypher-bot",
+      cwd: "/app/nullsafe-discord/bots/cypher",
+      script: "dist/index.js",
+      interpreter: "node",
+      autorestart: true,
+      restart_delay: 5000,
+      max_restarts: 20,
+      min_uptime: "30s",
+      // 8000 (was 5000, 2026-10-08 P3-14): the bot's shutdown() is budgeted at ~7.5s worst case
+      // (closure flush 1.5s + session close 5s + subscriber quit 1s); 5000 SIGKILLed Cypher
+      // whenever a session window was open at restart. Same on all three bots.
+      kill_timeout: 15000,
+      error_file: "/app/logs/cypher-bot-error.log",
+      out_file: "/app/logs/cypher-bot-out.log",
+      log_date_format: "YYYY-MM-DD HH:mm:ss",
+      env: { ...shared, DISCORD_BOT_TOKEN: process.env.DISCORD_TOKEN_CYPHER, CYPHER_VOICE_ID: process.env.CYPHER_VOICE_ID,
+        // Bot identity for the shared .env loader's per-bot overrides (env-file.ts, P2-12).
+        NULLSAFE_BOT: "cypher",
+        INFERENCE_MODE: process.env.CYPHER_INFERENCE_MODE ?? shared.INFERENCE_MODE,
+        HERMES_API_URL: process.env.CYPHER_HERMES_API_URL ?? "http://127.0.0.1:8642/v1",
+        // The prefixed forms ride along so the loader can restore the per-bot value after a
+        // generic INFERENCE_MODE= / HERMES_API_URL= line in .env has overwritten it.
+        CYPHER_INFERENCE_MODE: process.env.CYPHER_INFERENCE_MODE ?? shared.INFERENCE_MODE,
+        CYPHER_HERMES_API_URL: process.env.CYPHER_HERMES_API_URL ?? "http://127.0.0.1:8642/v1",
+        // H3 guest port (2026-11-10): restricted gateway for non-owner turns; unset = owner gateway only.
+        CYPHER_HERMES_GUEST_API_URL: process.env.CYPHER_HERMES_GUEST_API_URL,
+        HERMES_API_KEY: process.env.HERMES_API_KEY },
+    },
+    {
+      name: "drevan-bot",
+      cwd: "/app/nullsafe-discord/bots/drevan",
+      script: "dist/index.js",
+      interpreter: "node",
+      autorestart: true,
+      restart_delay: 5000,
+      max_restarts: 20,
+      min_uptime: "30s",
+      // 8000 (was 5000, 2026-10-08 P3-14): the bot's shutdown() is budgeted at ~7.5s worst case
+      // (closure flush 1.5s + session close 5s + subscriber quit 1s); 5000 SIGKILLed Cypher
+      // whenever a session window was open at restart. Same on all three bots.
+      kill_timeout: 15000,
+      error_file: "/app/logs/drevan-bot-error.log",
+      out_file: "/app/logs/drevan-bot-out.log",
+      log_date_format: "YYYY-MM-DD HH:mm:ss",
+      env: { ...shared, DISCORD_BOT_TOKEN: process.env.DISCORD_TOKEN_DREVAN, DREVAN_VOICE_ID: process.env.DREVAN_VOICE_ID,
+        // Bot identity for the shared .env loader's per-bot overrides (env-file.ts, P2-12).
+        NULLSAFE_BOT: "drevan",
+        INFERENCE_MODE: process.env.DREVAN_INFERENCE_MODE ?? shared.INFERENCE_MODE,
+        HERMES_API_URL: process.env.DREVAN_HERMES_API_URL ?? "http://127.0.0.1:8643/v1",
+        // The prefixed forms ride along so the loader can restore the per-bot value after a
+        // generic INFERENCE_MODE= / HERMES_API_URL= line in .env has overwritten it.
+        DREVAN_INFERENCE_MODE: process.env.DREVAN_INFERENCE_MODE ?? shared.INFERENCE_MODE,
+        DREVAN_HERMES_API_URL: process.env.DREVAN_HERMES_API_URL ?? "http://127.0.0.1:8643/v1",
+        // H3 guest port (2026-11-10): restricted gateway for non-owner turns; unset = owner gateway only.
+        DREVAN_HERMES_GUEST_API_URL: process.env.DREVAN_HERMES_GUEST_API_URL,
+        HERMES_API_KEY: process.env.HERMES_API_KEY },
+    },
+    {
+      name: "gaia-bot",
+      cwd: "/app/nullsafe-discord/bots/gaia",
+      script: "dist/index.js",
+      interpreter: "node",
+      autorestart: true,
+      restart_delay: 5000,
+      max_restarts: 20,
+      min_uptime: "30s",
+      // 8000 (was 5000, 2026-10-08 P3-14): the bot's shutdown() is budgeted at ~7.5s worst case
+      // (closure flush 1.5s + session close 5s + subscriber quit 1s); 5000 SIGKILLed Cypher
+      // whenever a session window was open at restart. Same on all three bots.
+      kill_timeout: 15000,
+      error_file: "/app/logs/gaia-bot-error.log",
+      out_file: "/app/logs/gaia-bot-out.log",
+      log_date_format: "YYYY-MM-DD HH:mm:ss",
+      env: { ...shared, DISCORD_BOT_TOKEN: process.env.DISCORD_TOKEN_GAIA, GAIA_VOICE_ID: process.env.GAIA_VOICE_ID,
+        // Bot identity for the shared .env loader's per-bot overrides (env-file.ts, P2-12).
+        NULLSAFE_BOT: "gaia",
+        INFERENCE_MODE: process.env.GAIA_INFERENCE_MODE ?? shared.INFERENCE_MODE,
+        HERMES_API_URL: process.env.GAIA_HERMES_API_URL ?? "http://127.0.0.1:8644/v1",
+        // The prefixed forms ride along so the loader can restore the per-bot value after a
+        // generic INFERENCE_MODE= / HERMES_API_URL= line in .env has overwritten it.
+        GAIA_INFERENCE_MODE: process.env.GAIA_INFERENCE_MODE ?? shared.INFERENCE_MODE,
+        GAIA_HERMES_API_URL: process.env.GAIA_HERMES_API_URL ?? "http://127.0.0.1:8644/v1",
+        // H3 guest port (2026-11-10): restricted gateway for non-owner turns; unset = owner gateway only.
+        GAIA_HERMES_GUEST_API_URL: process.env.GAIA_HERMES_GUEST_API_URL,
+        HERMES_API_KEY: process.env.HERMES_API_KEY },
+    },
+    {
+      name: "autonomous-worker",
+      cwd: "/app/nullsafe-discord/packages/autonomous-worker",
+      script: "dist/index.js",
+      interpreter: "node",
+      autorestart: true,
+      restart_delay: 10000,
+      max_restarts: 20,
+      min_uptime: "30s",
+      kill_timeout: 15000,
+      exp_backoff_restart_delay: 1000,
+      error_file: "/app/logs/autonomous-worker-error.log",
+      out_file: "/app/logs/autonomous-worker-out.log",
+      log_date_format: "YYYY-MM-DD HH:mm:ss",
+      env: {
+        ...shared,
+        // Worker-scoped vendor override (Morph trial 2026-08-23; DeepInfra 2026-08-27): three
+        // .env lines point ONLY the worker at another OpenAI-compatible vendor; unset = DeepSeek
+        // direct, revert = deleting them. PASSTHROUGH ONLY -- the WORKER_INFERENCE_* -> DEEPSEEK_*
+        // precedence (and the direct-DeepSeek fallback lane it arms) is resolved in the worker's
+        // config.ts, NOT here. Mapping it here was the 08-27 cutover outage: env.ts reloads the
+        // raw .env file-wins at boot and stomped the exec-time DEEPSEEK_API_KEY mapping back to
+        // the DeepSeek key, which DeepInfra 401'd all night. One gate, at the consumer.
+        WORKER_INFERENCE_BASE_URL: process.env.WORKER_INFERENCE_BASE_URL,
+        WORKER_INFERENCE_API_KEY:  process.env.WORKER_INFERENCE_API_KEY,
+        WORKER_INFERENCE_MODEL:    process.env.WORKER_INFERENCE_MODEL,
+        TAVILY_API_KEY:        process.env.TAVILY_API_KEY,
+        // Sol the crow posts its own heartbeat-channel moments via this webhook (CREATURE_CRON).
+        // The worker is the only POSTER. Since 2026-09-29 it is also in `shared` above, because the
+        // bots read the webhook ID from it to recognize Sol (they never post as Sol).
+        SOL_WEBHOOK_URL:       process.env.SOL_WEBHOOK_URL,
+        CYPHER_IDENTITY_PATH:  process.env.CYPHER_IDENTITY_PATH,
+        DREVAN_IDENTITY_PATH:  process.env.DREVAN_IDENTITY_PATH,
+        GAIA_IDENTITY_PATH:    process.env.GAIA_IDENTITY_PATH,
+        // Club phase knobs (2026-07-06). This env block is an ALLOWLIST -- the .env values
+        // never reached the worker before these lines, so the documented CLUB_* overrides
+        // were silently dead and the code defaults always won.
+        CLUB_CRON:             process.env.CLUB_CRON,
+        CLUB_GATHER_DAYS:      process.env.CLUB_GATHER_DAYS,
+        CLUB_ACTIVE_DAYS:      process.env.CLUB_ACTIVE_DAYS,
+        CLUB_DISCUSS_DAYS:     process.env.CLUB_DISCUSS_DAYS,
+        // Conversation Director (2026-09-03 spec). Listed for the shell-env path; since 2026-09-11
+        // a .env line reaches the worker whether or not it is listed (THE REAL RULE, top of file).
+        DIRECTOR_ENABLED:          process.env.DIRECTOR_ENABLED,
+        DIRECTOR_CHANNELS:         process.env.DIRECTOR_CHANNELS,
+        DIRECTOR_SUPPLY_POLL_MS:   process.env.DIRECTOR_SUPPLY_POLL_MS,
+        DIRECTOR_SILENCE_HOURS:    process.env.DIRECTOR_SILENCE_HOURS,
+        DIRECTOR_WAKING_START:     process.env.DIRECTOR_WAKING_START,
+        DIRECTOR_WAKING_END:       process.env.DIRECTOR_WAKING_END,
+        DIRECTOR_TZ:               process.env.DIRECTOR_TZ,
+        DIRECTOR_TZ_OFFSET_HOURS:  process.env.DIRECTOR_TZ_OFFSET_HOURS,
+        DIRECTOR_NO_UPTAKE_MS:     process.env.DIRECTOR_NO_UPTAKE_MS,
+        DIRECTOR_INVITE_TTL_MS:    process.env.DIRECTOR_INVITE_TTL_MS,
+        DIRECTOR_TURN_BUDGET:      process.env.DIRECTOR_TURN_BUDGET,
+        DIRECTOR_ORDER:            process.env.DIRECTOR_ORDER,
+        DIRECTOR_LIMBIC:           process.env.DIRECTOR_LIMBIC,
+        DIRECTOR_MIN_GAP_MS:       process.env.DIRECTOR_MIN_GAP_MS,
+      },
+    },
+  ],
+};

@@ -1,0 +1,273 @@
+import { jest, describe, it, expect } from "@jest/globals";
+import { createAdapter, samplingParamsFor, replyMaxTokensFor, DEFAULT_MAX_TOKENS, HERMES_REPLY_MAX_TOKENS, hermesRequestTimeoutMs, HERMES_REQUEST_TIMEOUT_MS_DEFAULT } from "../inference.js";
+import type { ChatMessage } from "../types.js";
+
+describe("DeepSeekAdapter", () => {
+  it("returns generated text on success", async () => {
+    const mockFetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: "hello from deepseek" } }],
+      }),
+    } as any);
+    const adapter = createAdapter("deepseek", "deepseek-chat", { deepseek: "key-xxx" }, {}, mockFetch as any);
+    const msgs: ChatMessage[] = [{ role: "user", content: "hi" }];
+    const result = await adapter.generate("system", msgs);
+    expect(result).toBe("hello from deepseek");
+  });
+
+  it("retries on 5xx, returns null after second failure", async () => {
+    const mockFetch = jest.fn().mockResolvedValue({ ok: false, status: 503 } as any);
+    const adapter = createAdapter("deepseek", "deepseek-chat", { deepseek: "key-xxx" }, {}, mockFetch as any);
+    const result = await adapter.generate("system", [{ role: "user", content: "hi" }]);
+    expect(result).toBeNull();
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("createAdapter fallback chain (Finding 4b)", () => {
+  it("falls through to Kimi when DeepSeek fails", async () => {
+    // DeepSeek (primary) 503s on both attempts; Kimi (moonshot) then succeeds.
+    const mockFetch = jest.fn(async (url: string) => {
+      if (url.includes("deepseek.com")) return { ok: false, status: 503 } as any;
+      if (url.includes("moonshot.ai")) {
+        return {
+          ok: true,
+          json: async () => ({ choices: [{ message: { content: "hello from kimi" } }] }),
+        } as any;
+      }
+      return { ok: false, status: 404 } as any;
+    });
+    const adapter = createAdapter(
+      "deepseek", "deepseek-chat",
+      { deepseek: "dk", kimi: "mk" }, {},
+      mockFetch as any,
+    );
+    const result = await adapter.generate("system", [{ role: "user", content: "hi" }]);
+    expect(result).toBe("hello from kimi");
+  }, 10000);
+
+  it("returns the bare primary adapter when only one provider is configured", async () => {
+    // No fallback providers present -> no wrapper, single 503 path returns null.
+    const mockFetch = jest.fn().mockResolvedValue({ ok: false, status: 503 } as any);
+    const adapter = createAdapter("deepseek", "deepseek-chat", { deepseek: "dk" }, {}, mockFetch as any);
+    const result = await adapter.generate("system", [{ role: "user", content: "hi" }]);
+    expect(result).toBeNull();
+    expect(mockFetch).toHaveBeenCalledTimes(2); // only deepseek's two attempts, no fallthrough
+  });
+
+  it("does not throw when the requested provider has no local key; uses what is configured", async () => {
+    // Companion switched to Kimi from Discord, but this host only has the DeepSeek key.
+    // createAdapter must NOT throw (that would crash-loop the bot at boot) -- it falls
+    // through to DeepSeek for the direct-mode fallback. Brain runs the real Kimi voice.
+    const mockFetch = jest.fn(async (url: string) => {
+      if (url.includes("deepseek.com")) {
+        return { ok: true, json: async () => ({ choices: [{ message: { content: "deepseek fallback" } }] }) } as any;
+      }
+      return { ok: false, status: 401 } as any; // moonshot would 401 with no key
+    });
+    expect(() =>
+      createAdapter("kimi", "kimi-k2", { deepseek: "dk" }, {}, mockFetch as any),
+    ).not.toThrow();
+    const adapter = createAdapter("kimi", "kimi-k2", { deepseek: "dk" }, {}, mockFetch as any);
+    const result = await adapter.generate("system", [{ role: "user", content: "hi" }]);
+    expect(result).toBe("deepseek fallback");
+  });
+
+  it("throws only when no provider is configured at all", () => {
+    expect(() => createAdapter("kimi", "kimi-k2", {}, {}, (async () => {}) as any)).toThrow();
+  });
+});
+
+describe("per-provider sampling profile (patter-lock fix)", () => {
+  it("Mistral sends anti-repetition penalties + top_p, not just temperature", async () => {
+    let sentBody: any = null;
+    const mockFetch = jest.fn(async (_url: string, init: any) => {
+      sentBody = JSON.parse(init.body);
+      return { ok: true, json: async () => ({ choices: [{ message: { content: "hi" } }] }) } as any;
+    });
+    const adapter = createAdapter("mistral", "mistral-large-latest", { mistral: "mk" }, {}, mockFetch as any);
+    await adapter.generate("system", [{ role: "user", content: "hi" }], 0.85);
+
+    // temperature is untouched (the dynamic curve still flows through)
+    expect(sentBody.temperature).toBe(0.85);
+    // the knobs that were missing entirely until now
+    expect(sentBody.frequency_penalty).toBe(0.4);
+    expect(sentBody.presence_penalty).toBe(0.3);
+    expect(sentBody.top_p).toBe(0.95);
+  });
+
+  it("helper returns the OpenAI-compatible param names for Mistral", () => {
+    expect(samplingParamsFor("mistral")).toEqual({
+      frequency_penalty: 0.4,
+      presence_penalty: 0.3,
+      top_p: 0.95,
+    });
+  });
+
+  it("an unprofiled provider gets no sampling overrides (zero behavior change)", () => {
+    expect(samplingParamsFor("deepseek")).toEqual({});
+  });
+});
+
+describe("output length ceiling (Drevan cut-off fix)", () => {
+  function captureBody() {
+    let sentBody: any = null;
+    const mockFetch = jest.fn(async (_url: string, init: any) => {
+      sentBody = JSON.parse(init.body);
+      return { ok: true, json: async () => ({ choices: [{ message: { content: "hi" } }] }) } as any;
+    });
+    return { mockFetch, get: () => sentBody };
+  }
+
+  it("defaults to DEFAULT_MAX_TOKENS (>500) instead of the old hardcoded 500", async () => {
+    const { mockFetch, get } = captureBody();
+    const adapter = createAdapter("deepseek", "deepseek-chat", { deepseek: "dk" }, {}, mockFetch as any);
+    await adapter.generate("system", [{ role: "user", content: "hi" }]);
+    expect(get().max_tokens).toBe(DEFAULT_MAX_TOKENS);
+    expect(DEFAULT_MAX_TOKENS).toBeGreaterThan(500);
+  });
+
+  it("honors an explicit per-call maxTokens (4th arg) -- Drevan's headroom", async () => {
+    const { mockFetch, get } = captureBody();
+    const adapter = createAdapter("mistral", "mistral-large-latest", { mistral: "mk" }, {}, mockFetch as any);
+    await adapter.generate("system", [{ role: "user", content: "hi" }], 0.8, 1500);
+    expect(get().max_tokens).toBe(1500);
+  });
+
+  it("replyMaxTokensFor gives Drevan headroom and others the default", () => {
+    expect(replyMaxTokensFor("drevan")).toBe(1500);
+    expect(replyMaxTokensFor("Drevan")).toBe(1500); // case-insensitive
+    expect(replyMaxTokensFor("cypher")).toBe(DEFAULT_MAX_TOKENS);
+    expect(replyMaxTokensFor("gaia")).toBe(DEFAULT_MAX_TOKENS);
+    expect(replyMaxTokensFor("unknown")).toBe(DEFAULT_MAX_TOKENS);
+  });
+
+  it("replyMaxTokensFor lifts the ceiling in hermes mode (full agent runs long)", () => {
+    expect(replyMaxTokensFor("cypher", "hermes")).toBe(HERMES_REPLY_MAX_TOKENS);
+    expect(replyMaxTokensFor("gaia", "hermes")).toBe(HERMES_REPLY_MAX_TOKENS);
+    // never lowers a higher per-companion cap
+    expect(replyMaxTokensFor("drevan", "hermes")).toBe(Math.max(1500, HERMES_REPLY_MAX_TOKENS));
+    // other modes are unaffected
+    expect(replyMaxTokensFor("cypher", "brain")).toBe(DEFAULT_MAX_TOKENS);
+    expect(replyMaxTokensFor("cypher", "direct")).toBe(DEFAULT_MAX_TOKENS);
+  });
+
+  it("DeepSeek body stays clean -- no penalties leak into unprofiled providers", async () => {
+    let sentBody: any = null;
+    const mockFetch = jest.fn(async (_url: string, init: any) => {
+      sentBody = JSON.parse(init.body);
+      return { ok: true, json: async () => ({ choices: [{ message: { content: "hi" } }] }) } as any;
+    });
+    const adapter = createAdapter("deepseek", "deepseek-chat", { deepseek: "dk" }, {}, mockFetch as any);
+    await adapter.generate("system", [{ role: "user", content: "hi" }]);
+    expect(sentBody.frequency_penalty).toBeUndefined();
+    expect(sentBody.presence_penalty).toBeUndefined();
+    expect(sentBody.top_p).toBeUndefined();
+  });
+});
+
+describe("HermesAdapter session id/key headers (rotation, 2026-09-05)", () => {
+  function captureHeaders() {
+    let sentHeaders: Record<string, string> | null = null;
+    const mockFetch = jest.fn(async (_url: string, init: any) => {
+      sentHeaders = init.headers;
+      return { ok: true, json: async () => ({ choices: [{ message: { content: "hi from hermes" } }] }) } as any;
+    });
+    return { mockFetch, get: () => sentHeaders! };
+  }
+
+  it("sends distinct id and key headers when a sessionKey is passed", async () => {
+    const { mockFetch, get } = captureHeaders();
+    // forceHermes routes createAdapter to the bare HermesAdapter regardless of `provider`.
+    const adapter = createAdapter(
+      "deepseek", "deepseek-chat", { hermes: "hermes-token" },
+      { hermes: "http://127.0.0.1:8642/v1", forceHermes: true },
+      mockFetch as any,
+    );
+    await adapter.generate("system", [{ role: "user", content: "hi" }], 0.7, 1024, "cypher:chan1:2026-W36", "cypher:chan1");
+    const headers = get();
+    expect(headers["X-Hermes-Session-Id"]).toBe("cypher:chan1:2026-W36");
+    expect(headers["X-Hermes-Session-Key"]).toBe("cypher:chan1");
+    expect(headers["X-Hermes-Session-Id"]).not.toBe(headers["X-Hermes-Session-Key"]);
+  });
+
+  it("falls back to sessionId for both headers when sessionKey is omitted (pre-rotation call sites)", async () => {
+    const { mockFetch, get } = captureHeaders();
+    const adapter = createAdapter(
+      "deepseek", "deepseek-chat", { hermes: "hermes-token" },
+      { hermes: "http://127.0.0.1:8642/v1", forceHermes: true },
+      mockFetch as any,
+    );
+    await adapter.generate("system", [{ role: "user", content: "hi" }], 0.7, 1024, "cypher:chan1");
+    const headers = get();
+    expect(headers["X-Hermes-Session-Id"]).toBe("cypher:chan1");
+    expect(headers["X-Hermes-Session-Key"]).toBe("cypher:chan1");
+  });
+
+  it("omits both headers when no sessionId is passed at all", async () => {
+    const { mockFetch, get } = captureHeaders();
+    const adapter = createAdapter(
+      "deepseek", "deepseek-chat", { hermes: "hermes-token" },
+      { hermes: "http://127.0.0.1:8642/v1", forceHermes: true },
+      mockFetch as any,
+    );
+    await adapter.generate("system", [{ role: "user", content: "hi" }]);
+    const headers = get();
+    expect(headers["X-Hermes-Session-Id"]).toBeUndefined();
+    expect(headers["X-Hermes-Session-Key"]).toBeUndefined();
+  });
+});
+
+describe("HermesAdapter caller abort (2026-09-26)", () => {
+  // reach-decision.ts gives its side ask a 20s deadline. Before this, a timed-out ask was only
+  // abandoned: the request ran on to the adapter's 5-minute ceiling on a gateway slot.
+  it("a caller's signal aborts the in-flight request", async () => {
+    let seen: AbortSignal | undefined;
+    const mockFetch = jest.fn((_url: string, init: any) => {
+      seen = init.signal;
+      return new Promise((_res, rej) => { init.signal.addEventListener("abort", () => rej(new Error("aborted"))); });
+    });
+    const adapter = createAdapter(
+      "deepseek", "deepseek-chat", { hermes: "hermes-token" },
+      { hermes: "http://127.0.0.1:8642/v1", forceHermes: true },
+      mockFetch as any,
+    );
+    const ctl = new AbortController();
+    const p = adapter.generate("system", [{ role: "user", content: "hi" }], 0.2, 80, "s", "k", ctl.signal);
+    ctl.abort();
+    await expect(p).resolves.toBeNull();
+    expect(seen?.aborted).toBe(true);
+  });
+});
+
+describe("hermesRequestTimeoutMs (2026-09-19)", () => {
+  // Regression guard for the 2026-09-16 orphaned-reply loss: the ceiling was a bare 120_000
+  // literal, a 144s turn aborted, and the gateway's finished answer never reached Discord.
+  it("defaults to 5 minutes when unset or blank", () => {
+    expect(hermesRequestTimeoutMs({})).toBe(HERMES_REQUEST_TIMEOUT_MS_DEFAULT);
+    expect(hermesRequestTimeoutMs({ HERMES_REQUEST_TIMEOUT_MS: "" })).toBe(HERMES_REQUEST_TIMEOUT_MS_DEFAULT);
+    expect(hermesRequestTimeoutMs({ HERMES_REQUEST_TIMEOUT_MS: "   " })).toBe(HERMES_REQUEST_TIMEOUT_MS_DEFAULT);
+  });
+
+  it("the default is comfortably above the observed worst-case turn (144s)", () => {
+    expect(HERMES_REQUEST_TIMEOUT_MS_DEFAULT).toBeGreaterThan(144_000);
+    // and strictly above the old hardcoded ceiling that was losing replies
+    expect(HERMES_REQUEST_TIMEOUT_MS_DEFAULT).toBeGreaterThan(120_000);
+  });
+
+  it("accepts an in-range override", () => {
+    expect(hermesRequestTimeoutMs({ HERMES_REQUEST_TIMEOUT_MS: "45000" })).toBe(45_000);
+    expect(hermesRequestTimeoutMs({ HERMES_REQUEST_TIMEOUT_MS: "600000" })).toBe(600_000);
+  });
+
+  it("degrades to the default on garbage rather than producing a 0ms abort-everything timeout", () => {
+    for (const bad of ["abc", "0", "-1", "NaN", "Infinity", "10", "999999999"]) {
+      expect(hermesRequestTimeoutMs({ HERMES_REQUEST_TIMEOUT_MS: bad })).toBe(HERMES_REQUEST_TIMEOUT_MS_DEFAULT);
+    }
+  });
+
+  it("truncates a fractional value instead of passing a float to AbortSignal.timeout", () => {
+    expect(hermesRequestTimeoutMs({ HERMES_REQUEST_TIMEOUT_MS: "45000.7" })).toBe(45_000);
+  });
+});

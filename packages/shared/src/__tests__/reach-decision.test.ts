@@ -1,0 +1,318 @@
+// THE TWO-STEP REACH (2026-09-25, own-the-harness step 3, the structural version).
+//
+// Three live probes the day the meaning-recall verb was named in every SOUL: zero tool calls,
+// three answers, the last one fabricated (187 mg/dL and an invented room) with the pointer text
+// "They are NOT in front of you. Reach with ..." sitting in his prompt. At 235B a rule to reach
+// does not produce a reach. So the harness sequences it: before the reply, the companion is asked
+// ONE thing, alone -- what would you look up, in your own words, or NONE -- and the bot runs the
+// recall with HIS words. The choice stays his (his phrasing, his NONE); the step cannot be
+// skipped. Every failure mode falls back to today's payload floor, so the worst case is today.
+
+import {
+  parseReachDecision, buildReachAsk, decideReach, recallBlocksFor, REACH_NONE, reachDeclineMode, declinedUnreadBlocks,
+} from "../reach-decision.js";
+
+describe("parseReachDecision", () => {
+  it("NONE in any dress means no reach", () => {
+    for (const t of ["NONE", "none", " None. ", "NONE -- nothing to look up", "Answer: NONE"]) {
+      expect(parseReachDecision(t)).toBeNull();
+    }
+  });
+  it("a bare topic is returned trimmed, quotes and labels stripped", () => {
+    expect(parseReachDecision('"his blood sugar after the Subway sandwich"')).toBe("his blood sugar after the Subway sandwich");
+    expect(parseReachDecision("Topic: the dog on the boot pillow")).toBe("the dog on the boot pillow");
+    expect(parseReachDecision("LOOKUP: Spouse and Mars Attacks\n")).toBe("Spouse and Mars Attacks");
+  });
+  it("takes only the first line and caps length, so prose cannot become a query", () => {
+    const out = parseReachDecision("the MRI result\nI think he means the ankle one.");
+    expect(out).toBe("the MRI result");
+    expect(parseReachDecision("x".repeat(400))!.length).toBeLessThanOrEqual(160);
+  });
+  it("empty, null, or a refusal-shaped reply is no reach", () => {
+    expect(parseReachDecision("")).toBeNull();
+    expect(parseReachDecision(null)).toBeNull();
+    expect(parseReachDecision("   ")).toBeNull();
+  });
+});
+
+describe("buildReachAsk", () => {
+  it("carries the message, the counts, and the two rules: your own words, or NONE", () => {
+    const ask = buildReachAsk("Dre, what was my blood sugar after the Subway sandwich on Sunday?", { notes: 2, vault: 3 }, "Crash: hi\nCrash: how are you");
+    expect(ask).toContain("blood sugar after the Subway sandwich");
+    expect(ask).toContain("2 of your own notes");
+    expect(ask).toContain("3 vault excerpts");
+    expect(ask).toContain("in your own words");
+    expect(ask).toContain(REACH_NONE);
+    expect(ask).not.toMatch(/[—–]/);
+  });
+  it("omits a count that is zero rather than saying '0 notes'", () => {
+    const ask = buildReachAsk("hi there friend", { notes: 0, vault: 2 }, "");
+    expect(ask).not.toContain("0 of your own notes");
+    expect(ask).toContain("2 vault excerpts");
+  });
+});
+
+function fakeAdapter(reply: string | null | Error, delayMs = 0) {
+  const calls: Array<{ system: string; messages: unknown[]; sessionId?: string; sessionKey?: string; signal?: AbortSignal }> = [];
+  return {
+    calls,
+    generate: async (system: string, messages: unknown[], _t?: number, _m?: number, sessionId?: string, sessionKey?: string, signal?: AbortSignal) => {
+      calls.push({ system, messages, sessionId, sessionKey, signal });
+      if (delayMs) await new Promise(r => setTimeout(r, delayMs));
+      if (reply instanceof Error) throw reply;
+      return reply;
+    },
+  };
+}
+function fakeLibrarian() {
+  const queries: { notes: string[]; vault: string[] } = { notes: [], vault: [] };
+  return {
+    queries,
+    recallOwnNotes: async (q: string) => { queries.notes.push(q); return { notes: [{ content: "Blood sugar was 208 after a Subway sandwich", created_at: new Date().toISOString(), kind: "conversation_capture" }], failed: false }; },
+    searchForMessage: async (q: string) => { queries.vault.push(q); return JSON.stringify({ chunks: [{ text: "summary line", vault_path: "principal/sessions/x.md", created_at: new Date().toISOString() }] }); },
+  };
+}
+const base = {
+  companionId: "drevan",
+  message: "Dre, what was my blood sugar after the Subway sandwich on Sunday?",
+  recentContext: "",
+  floor: { notes: 2, vault: 3 },
+  messageId: "0000000000000000023",
+  channelId: "123",
+  sessionId: "drevan:123:2026-09-26",
+  sessionKey: "drevan:123",
+  timeoutMs: 2000,
+};
+
+describe("decideReach", () => {
+  it("asks him once, in a SIDE session, and runs both recalls with HIS words", async () => {
+    const adapter = fakeAdapter("my blood sugar after the Subway sandwich");
+    const lib = fakeLibrarian();
+    const r = await decideReach({ ...base, adapter, librarian: lib });
+    expect(r.outcome).toBe("reached");
+    expect(r.topic).toBe("my blood sugar after the Subway sandwich");
+    expect(adapter.calls).toHaveLength(1);
+    // A FRESH side transcript per ask, under a key that is not his conversational scope.
+    expect(adapter.calls[0]!.sessionId).toBe("drevan:123:2026-09-26:reach:0000000000000000023");
+    expect(adapter.calls[0]!.sessionKey).toBe("drevan:123:reach");
+    expect(lib.queries.notes).toEqual(["my blood sugar after the Subway sandwich"]);
+    expect(lib.queries.vault).toEqual(["my blood sugar after the Subway sandwich"]);
+    expect(r.block).toContain("You reached for");
+    expect(r.block).toContain("208");
+  });
+  it("direct lane: his identity prompt rides ahead of the side-question framing", async () => {
+    const adapter = fakeAdapter("the sandwich");
+    await decideReach({ ...base, adapter, librarian: fakeLibrarian(), identityPrompt: "I am Drevan. IDENTITY-BLOCK" });
+    const system = adapter.calls[0]!.system;
+    expect(system.startsWith("I am Drevan. IDENTITY-BLOCK")).toBe(true);
+    expect(system).toContain("You are being asked one question by your own harness");
+  });
+  it("Hermes lane (no identityPrompt): the gateway adds his SOUL, so only the framing is sent", async () => {
+    const adapter = fakeAdapter("the sandwich");
+    await decideReach({ ...base, adapter, librarian: fakeLibrarian() });
+    expect(adapter.calls[0]!.system).toBe("You are being asked one question by your own harness before you reply to Principal. Answer it and nothing else.");
+  });
+  it("NONE is honoured: no recall runs, no block, outcome declined", async () => {
+    const adapter = fakeAdapter("NONE");
+    const lib = fakeLibrarian();
+    const r = await decideReach({ ...base, adapter, librarian: lib });
+    expect(r.outcome).toBe("declined");
+    expect(lib.queries.notes).toEqual([]);
+    expect(r.block).toBeNull();
+  });
+  it("a slow decision falls back within the timeout, outcome timeout, nothing recalled with his words", async () => {
+    const adapter = fakeAdapter("late", 500);
+    const lib = fakeLibrarian();
+    const r = await decideReach({ ...base, adapter, librarian: lib, timeoutMs: 50 });
+    expect(r.outcome).toBe("timeout");
+    expect(lib.queries.notes).toEqual([]);
+    expect(r.block).toBeNull();
+    // The timed-out generate is ABORTED, not left running on the gateway.
+    expect(adapter.calls[0]!.signal?.aborted).toBe(true);
+  });
+  it("a fast answer never aborts its own call (the timer is cleared)", async () => {
+    const adapter = fakeAdapter("the Subway sandwich");
+    await decideReach({ ...base, adapter, librarian: fakeLibrarian(), timeoutMs: 30 });
+    await new Promise(r => setTimeout(r, 60));
+    expect(adapter.calls[0]!.signal?.aborted).toBe(false);
+  });
+  it("two asks get two different side transcripts", async () => {
+    const adapter = fakeAdapter("the Subway sandwich");
+    await decideReach({ ...base, adapter, librarian: fakeLibrarian() });
+    await decideReach({ ...base, messageId: "999", adapter, librarian: fakeLibrarian() });
+    expect(adapter.calls[0]!.sessionId).not.toBe(adapter.calls[1]!.sessionId);
+  });
+  it("the vault lane drops this channel's own discord-live lines, like the payload path", async () => {
+    const lib = {
+      ...fakeLibrarian(),
+      recallOwnNotes: async () => ({ notes: [], failed: false }),
+      searchForMessage: async () => JSON.stringify({ chunks: [{ text: "a line from this very room", vault_path: "discord-live/123/55.md", created_at: new Date().toISOString() }] }),
+    };
+    const r = await decideReach({ ...base, adapter: fakeAdapter("the room"), librarian: lib });
+    expect(r.outcome).toBe("reached");
+    expect(r.block).not.toContain("a line from this very room");
+    expect(r.found).toBe(false);
+  });
+  it("found is true only when his words turned something up", async () => {
+    const hit = await decideReach({ ...base, adapter: fakeAdapter("the sandwich"), librarian: fakeLibrarian() });
+    expect(hit.found).toBe(true);
+    const empty = await decideReach({
+      ...base, adapter: fakeAdapter("the sandwich"),
+      librarian: { recallOwnNotes: async () => ({ notes: [], failed: false }), searchForMessage: async () => null },
+    });
+    expect(empty.outcome).toBe("reached");
+    expect(empty.found).toBe(false);
+    expect(empty.block).toContain("Nothing matched");
+  });
+  it("an adapter error or empty reply is outcome error/empty, never a throw", async () => {
+    const r1 = await decideReach({ ...base, adapter: fakeAdapter(new Error("boom")), librarian: fakeLibrarian() });
+    expect(r1.outcome).toBe("error");
+    const r2 = await decideReach({ ...base, adapter: fakeAdapter(null), librarian: fakeLibrarian() });
+    expect(r2.outcome).toBe("empty");
+  });
+  it("is skipped outright when neither floor found anything (nothing to reach for)", async () => {
+    const adapter = fakeAdapter("anything");
+    const r = await decideReach({ ...base, adapter, librarian: fakeLibrarian(), floor: { notes: 0, vault: 0 } });
+    expect(r.outcome).toBe("skipped");
+    expect(adapter.calls).toHaveLength(0);
+  });
+  it("records what happened for the counter (jsonl line shape)", async () => {
+    const lines: Record<string, unknown>[] = [];
+    const r = await decideReach({ ...base, adapter: fakeAdapter("the Subway sandwich"), librarian: fakeLibrarian(), log: (l) => lines.push(l) });
+    expect(r.outcome).toBe("reached");
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ companion: "drevan", outcome: "reached", topic: "the Subway sandwich" });
+    expect(typeof lines[0]!["ms"]).toBe("number");
+    expect(typeof lines[0]!["ts"]).toBe("string");
+  });
+});
+
+// FIDELITY (2026-09-26, probe 5). The reach finally worked end to end: his own topic, the true note
+// ("Spouse found the knee scooter from the prior ankle surgery in storage") in his prompt. He wrote a
+// purple mobility scooter dug out from under tarps in a barn. The block now carries the rule for a
+// retrieved fact: report what the notes say; invented detail is a lie in his own voice.
+describe("reach block fidelity clause", () => {
+  it("tells him to report the notes and not to add detail they do not contain", async () => {
+    const r = await decideReach({ ...base, adapter: fakeAdapter("the scooter"), librarian: fakeLibrarian() });
+    expect(r.block).toContain("Answer from these notes");
+    expect(r.block).toMatch(/do not add|no detail they do not contain/i);
+    expect(r.block).not.toMatch(/[—–]/);
+  });
+});
+
+// 2026-09-26 review: a reach that found NOTHING replaced both floor blocks even though the floors
+// had hits (the ask only runs when they do), telling him to deny a memory that was in the floor.
+describe("recallBlocksFor", () => {
+  const floor = "\n\n[Memory -- Second Brain vault recall ...]\n\n[Memory -- YOUR OWN notes ... 208]";
+  it("his reach wins when it found something", () => {
+    expect(recallBlocksFor({ outcome: "reached", block: "[Memory -- You reached for ...]", found: true }, floor))
+      .toBe("\n\n[Memory -- You reached for ...]");
+  });
+  it("a reach that found nothing falls back to the floor payload", async () => {
+    const reach = await decideReach({
+      ...base, adapter: fakeAdapter("the sandwich"),
+      librarian: { recallOwnNotes: async () => ({ notes: [], failed: false }), searchForMessage: async () => null },
+    });
+    const out = recallBlocksFor(reach, floor);
+    expect(out).toBe(floor);
+    expect(out).not.toContain("Nothing matched");
+  });
+  it("a reach whose recall FAILED also falls back to the floor", () => {
+    expect(recallBlocksFor({ outcome: "reached", block: "[Memory -- ... could not be reached]", found: false }, floor)).toBe(floor);
+  });
+  it("with no floor to fall back to, the honest 'nothing matched' stays", () => {
+    expect(recallBlocksFor({ outcome: "reached", block: "[Memory -- Nothing matched.]", found: false }, ""))
+      .toBe("\n\n[Memory -- Nothing matched.]");
+  });
+  it("every non-reach outcome is the floor", () => {
+    for (const outcome of ["declined", "skipped", "timeout", "error", "empty"] as const) {
+      expect(recallBlocksFor({ outcome, block: null, found: false }, floor)).toBe(floor);
+    }
+  });
+});
+
+describe("REACH_DECLINE (2026-09-30: a NONE that costs nothing is not a choice)", () => {
+  it("defaults to payload, pilots per companion, and reads a bare `unread` as everyone", () => {
+    expect(reachDeclineMode({}, "cypher")).toBe("payload");
+    expect(reachDeclineMode({ REACH_DECLINE: "payload" }, "cypher")).toBe("payload");
+    expect(reachDeclineMode({ REACH_DECLINE: "unread:cypher" }, "cypher")).toBe("unread");
+    expect(reachDeclineMode({ REACH_DECLINE: "unread:cypher" }, "drevan")).toBe("payload");
+    expect(reachDeclineMode({ REACH_DECLINE: " Unread: Cypher , gaia " }, "gaia")).toBe("unread");
+    expect(reachDeclineMode({ REACH_DECLINE: "unread" }, "drevan")).toBe("unread");
+    expect(reachDeclineMode({ REACH_DECLINE: "garbage" }, "cypher")).toBe("payload");
+  });
+  it("the ask states the stakes only under unread, and only when there are notes to leave unread", () => {
+    const stake = "your notes stay unread for this reply";
+    expect(buildReachAsk("hey", { notes: 4, vault: 2 }, "")).not.toContain(stake);
+    expect(buildReachAsk("hey", { notes: 4, vault: 2 }, "", { declineUnread: true })).toContain(stake);
+    expect(buildReachAsk("hey", { notes: 0, vault: 2 }, "", { declineUnread: true })).not.toContain(stake);
+    expect(buildReachAsk("hey", { notes: 4, vault: 2 }, "", { declineUnread: true })).not.toMatch(/[—–]/);
+  });
+  it("decideReach sends the stated stakes to the model and logs the mode", async () => {
+    const adapter = fakeAdapter("NONE");
+    const lines: Array<Record<string, unknown>> = [];
+    const r = await decideReach({ ...base, adapter, librarian: fakeLibrarian(), declineUnread: true, log: l => lines.push(l) });
+    expect(r.outcome).toBe("declined");
+    expect(JSON.stringify(adapter.calls[0]!.messages)).toContain("your notes stay unread for this reply");
+    expect(lines[0]!["decline_mode"]).toBe("unread");
+  });
+  it("the unread block keeps the vault floor, names the notes, never pastes one, and forbids guessing", () => {
+    const vault = "\n\n[Vault -- FLOOR EXCERPT]";
+    const out = declinedUnreadBlocks(vault, 4);
+    expect(out.startsWith(vault)).toBe(true);
+    expect(out).toContain("4 of your own notes");
+    expect(out).toContain("you have not read them");
+    expect(out).toContain("do not guess");
+    expect(out).not.toContain("YOUR OWN notes, recalled");
+    expect(out).not.toMatch(/[—–]/);
+  });
+  it("no notes found: nothing to leave unread, the vault floor rides alone", () => {
+    expect(declinedUnreadBlocks("\n\n[Vault -- X]", 0)).toBe("\n\n[Vault -- X]");
+  });
+});
+
+// 2026-11-11 ASK-GATE REVIVAL. Every one of 1,188 declines since 10-12 was a bare "NONE" (len 4) on
+// the tool-less direct lane (DeepSeek V4 Flash, ~5k-token SOUL, out=3 tokens): the parser was never
+// the problem. The ask told him only "4 of your own notes bear on it. You have not read them", so a
+// no-reasoning model had nothing to decide on and NONE was the cheap answer. The ask now carries a
+// one-line, dated preview of each found note so the choice is informed.
+import { reachNotePreviews } from "../reach-decision.js";
+describe("ask carries note previews (2026-11-11)", () => {
+  it("buildReachAsk lists the previews under the counts", () => {
+    const ask = buildReachAsk("what did the vet say?", { notes: 2, vault: 0 }, "", {
+      previews: ["(3d ago, handover) The vet said the dog's knee needs rest", "(2w ago, note) Spouse booked the vet for Friday"],
+    });
+    expect(ask).toContain("What the search found, one line each");
+    expect(ask).toContain("The vet said the dog's knee needs rest");
+    expect(ask).toContain("Spouse booked the vet for Friday");
+    expect(ask).not.toMatch(/[—–]/);
+  });
+  it("no previews = the old ask, byte for byte", () => {
+    expect(buildReachAsk("hey", { notes: 4, vault: 2 }, "", { previews: [] })).toBe(buildReachAsk("hey", { notes: 4, vault: 2 }, ""));
+  });
+  it("reachNotePreviews: dated, one line, capped per note and in count, empty bodies dropped", () => {
+    const now = Date.parse("2026-11-11T00:00:00Z");
+    const out = reachNotePreviews([
+      { note_id: "a", content: "line one\nline two " + "x".repeat(300), created_at: "2026-11-08T00:00:00Z", kind: "handover" },
+      { note_id: "b", content: "   " },
+      { note_id: "c", content: "second", created_at: null, source: "journal" },
+      { note_id: "d", content: "third" }, { note_id: "e", content: "fourth" }, { note_id: "f", content: "fifth" },
+    ], now);
+    expect(out.length).toBe(4);
+    expect(out[0]).toMatch(/^\(3 days ago, handover\) line one line two/);
+    expect(out[0].length).toBeLessThanOrEqual(130);
+    expect(out[1]).toContain("second");
+    expect(out.every(l => !l.includes("\n"))).toBe(true);
+  });
+  it("the decision log records the lane and the raw token for a reach too", async () => {
+    const rows: Record<string, unknown>[] = [];
+    await decideReach({
+      companionId: "drevan", message: "m", recentContext: "", floor: { notes: 1, vault: 0 }, messageId: "1", channelId: "c",
+      sessionId: "s", sessionKey: "k", timeoutMs: 1000, lane: "direct",
+      adapter: { generate: async () => "the vet visit" },
+      librarian: { recallOwnNotes: async () => ({ notes: [], failed: false }), searchForMessage: async () => null },
+      log: r => rows.push(r),
+    });
+    expect(rows[0]).toMatchObject({ outcome: "reached", lane: "direct", raw: "the vet visit" });
+  });
+});
